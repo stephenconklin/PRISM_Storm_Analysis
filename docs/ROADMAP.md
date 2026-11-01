@@ -53,7 +53,7 @@ gauges whose basins lie mostly outside the study basin are skipped; `--gauge` ru
 ## Suggested order
 
 1. **QC checks and run manifest** (sections 2 and 5). Cheap, and every later feature reports through them.
-2. **Uncertainty: revision and boundary sensitivity** (3.1, 3.2). Uses data already on hand.
+2. ~~**Uncertainty: revision and boundary sensitivity** (3.1, 3.2)~~ — built 1 Nov 2026.
 3. ~~**Station validation** (1.1)~~ — built; follow-ups listed in 1.1.
 4. **Rain/snow partition** (4). Needed before the runoff comparison means anything in mountain basins.
 5. ~~**Streamflow comparison** (1.2)~~ — built; then **multi-product comparison** (1.3) and the **uncertainty roll-up** (3.3).
@@ -227,8 +227,8 @@ prints at the end of each run.
 > `prism_watershed.py --refresh` (`--target-release`, `--refresh-age`) re-downloads, archives superseded
 > zips in `raw_zips/releases/`, re-extracts stale `extracted/` folders, prints per-day changes and keeps
 > `<var>_<res>_release_history.csv`. `validate_runoff.py` recomputes saved gauges' precipitation when
-> releases change. Not built: a window-level comparison from the history (old vs new window volume,
-> spread across releases as an uncertainty term), which can read the history CSV.
+> releases change. `storm_total.py` reports the window volume change from each day's first recorded
+> release to its latest (`revision_change`), which is the revision term for 3.3.
 
 **Goal:** Show how much totals move as PRISM revises the grids (8 releases over ~6 months).
 
@@ -241,7 +241,12 @@ prints at the end of each run.
 
 **Done when:** a window report lists releases, and re-running after a refresh shows the volume change.
 
-### 3.2 Boundary sensitivity — S
+### 3.2 Boundary sensitivity — S (built 1 Nov 2026)
+
+> **Built:** `storm_total.py` reports the window volume by cell center, area-weighted (cell shares from
+> shapely intersections, no `exactextract`) and any cell touched, from the national grids in `extracted/`
+> (`boundary_volumes`). San Juan Oct 20–27: 4.7188 / 4.7194 / 4.7993 km³, range 1.71%.
+
 **Goal:** Report how much the basin definition changes the total.
 
 **Approach:** compute volume three ways from the same grid:

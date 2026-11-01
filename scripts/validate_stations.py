@@ -41,7 +41,7 @@ import numpy as np
 import rasterio
 from shapely.geometry import Point
 
-from storm_total import RES_CODES
+from storm_total import prism_day_files
 
 INCH_MM = 25.4
 STYLE_DIR = Path(__file__).resolve().parents[1] / "styles"
@@ -169,21 +169,6 @@ def stats(pred, obs):
 
 
 # ---------- PRISM grids and station lists on disk ----------
-
-GRID_SUFFIXES = (".tif", ".bil", ".nc", ".asc")  # preference order
-
-
-def prism_day_files(extracted, var, res, day):
-    """(grid path, stn.csv path or None) for one PRISM day and resolution in <out>/extracted."""
-    ymd = day.strftime("%Y%m%d")
-    folders = sorted(Path(extracted).glob(f"*{var}*{RES_CODES[res]}*{ymd}*"))
-    grids = [p for f in folders if f.is_dir() for p in f.iterdir() if p.suffix.lower() in GRID_SUFFIXES]
-    if not grids:
-        return None, None
-    grid = min(grids, key=lambda p: GRID_SUFFIXES.index(p.suffix.lower()))
-    stn = sorted(grid.parent.glob("*.stn.csv"))
-    return grid, (stn[0] if stn else None)
-
 
 def sample_grid(path, lonlat):
     """Grid values (mm, NaN for nodata) at (lon, lat) points; grid is NAD83 lat/lon."""

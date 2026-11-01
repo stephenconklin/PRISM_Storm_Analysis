@@ -361,10 +361,16 @@ def main():
         print("Some days are not final (release 8); PRISM revises them for about 6 months. "
               "Re-run later with --refresh.")
 
+    # Like the cube, the summary covers every day in the folder: this run's days replace earlier rows.
+    kept = []
+    if summary_csv.exists():
+        with open(summary_csv, newline="") as f:
+            done = {r["date"] for r in rows}
+            kept = [r for r in csv.DictReader(f) if r["date"] not in done]
     with open(summary_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=rows[0].keys())
         w.writeheader()
-        w.writerows(rows)
+        w.writerows(sorted(kept + rows, key=lambda r: r["date"]))
 
     tag = f"{rows[0]['date']}_{rows[-1]['date']}".replace("-", "")
     meta.update(dtype="float32")

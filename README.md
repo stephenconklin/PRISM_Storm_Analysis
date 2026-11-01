@@ -126,7 +126,7 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 | `extracted/` | Unzipped PRISM files, including each day's `info.txt` metadata |
 | `wbd_huc<code>.geojson` | Cached basin boundary from USGS WBD (with `--huc`) |
 | `clipped/<var>_<res>_YYYYMMDD_clip.tif` | Each day clipped to the basin (mm for `ppt`), tagged with its PRISM release (`PRISM_DATASET_RELEASE_NUMBER`) |
-| `daily_basin_summary.csv` | Per day: PRISM release number, basin mean and max (mm), basin mean (in) |
+| `daily_basin_summary.csv` | Per day: PRISM release number, basin mean and max (mm), basin mean (in). Covers every day in the folder; a run replaces its own days |
 | `<var>_<res>_release_history.csv` | One row per day and PRISM release seen in this folder: basin mean and max (mm), basin volume (m³), when recorded |
 | `<var>_<res>_total_<start>_<end>.tif` | Sum of the run's days per pixel (mm for `ppt`) |
 | `<var>_<res>_daily_clip.nc` | NetCDF cube: every clipped day in the folder on a time axis (`<var>`, mm) plus `cell_area` (m²) and `release` (PRISM release per day; 0 unknown). Rebuilt on each run, so new days are added automatically |
@@ -152,7 +152,8 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
   use the newest data. The superseded zip moves to `raw_zips/releases/`, and the old and new basin
   mean and volume stay in `<var>_<res>_release_history.csv`. The run prints each revised day, for
   as `<date>: release <old> -> <new>: <old> -> <new> mm, <old> -> <new> m³ (<change>%)`.
-- `storm_total.py` lists each day's release in its report and notes days that are not final.
+- `storm_total.py` lists each day's release in its report, notes days that are not final, and reports
+  how much the window volume has changed since the first releases recorded.
 - Rerun the later steps after a refresh: `storm_total.py` outputs, `subbasin_totals.py`,
   `validate_stations.py` and `validate_runoff.py`. `validate_runoff.py` notices the new releases and
   recomputes each saved gauge's precipitation and runoff ratio from the saved basin and flow, with no
@@ -176,9 +177,10 @@ python scripts/storm_total.py --out data/huc14080104 --start 2026-10-20 --end 20
 | `--tif` | — | Write total depth per pixel (mm) to this GeoTIFF |
 | `--volume-tif` | — | Write water volume per pixel (m³ = depth × cell area) to this GeoTIFF; its sum is the basin volume |
 | `--volume-nc` | — | Write a NetCDF with `volume` (m³ per pixel per day), `volume_total` (window total), and `cell_area` |
+| `--boundary` | the `wbd_huc*.geojson` in `--out` | Basin polygon for the boundary check (needed for `--boundary` runs) |
 
 It prints the basin area, area-weighted mean depth, max depth, and the total water volume in m³, km³
-and acre-feet, for example:
+and acre-feet, then each day's PRISM release, the revision change and the boundary check, for example:
 
 ```
 PRISM days 2026-10-20 to 2026-10-27 (8 days; each ends 12:00 UTC on its date)
@@ -186,7 +188,21 @@ Basin area:  64,558 km²
 Mean depth:  73.1 mm (2.88 in)
 Max depth:   254.3 mm (10.01 in)
 Volume:      4.719e+09 m³ = 4.719 km³ = 3,825,561 acre-ft
+Releases:    r2 Oct 20-Oct 25, r1 Oct 26-Oct 27
+             Release 8 is final; earlier releases change for about 6 months. To pick up revisions, re-run prism_watershed.py with --refresh.
+Revisions:   none recorded yet for these days (ppt_800m_release_history.csv)
+Boundary:    cell centers 4.7188 km³, area-weighted 4.7194, any cell touched 4.7993 (range 1.71% of area-weighted)
 ```
+
+- **Revisions:** from `ppt_<res>_release_history.csv`, the change in window volume from each day's
+  first recorded release to its latest, and which days were revised (for example
+  `window volume +2.3% since the first releases recorded (...); revised: Oct 26 r1->r2`). This is how
+  much PRISM's revisions have moved the total so far, one part of its uncertainty.
+- **Boundary:** the window volume counted three ways from the national grids in `extracted/`: cells
+  whose centers fall in the basin (the rule the cube and every other total use), every cell weighted by
+  its share inside the basin, and every cell the basin touches. The range shows how much the basin edge
+  matters; it is small for large basins (1.7% for the San Juan, mostly from the "touched" rule) and
+  grows for small ones. Skipped, with a note, when the boundary or a day's national grid is missing.
 
 Cell areas are computed on the NAD83 (GRS80) ellipsoid for each row of PRISM's native grid, so no
 reprojection or resampling is needed and volumes add up exactly.

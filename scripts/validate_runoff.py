@@ -62,8 +62,8 @@ import requests
 from shapely.geometry import Point
 import xarray as xr
 
-from storm_total import cell_area_m2
-from validate_stations import load_basin, prism_day_files, write_layer
+from storm_total import cell_area_m2, prism_day_files
+from validate_stations import load_basin, write_layer
 
 CFS_TO_M3S = 0.028316846592
 M3_PER_ACRE_FT = 1233.48184

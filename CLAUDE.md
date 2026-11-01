@@ -13,8 +13,10 @@ That run's outputs (HUC 1408, PRISM days Oct 20–27) are in
 ## Layout
 - `scripts/find_huc.py` — look up WBD HUC codes by name (network only)
 - `scripts/prism_watershed.py` — download → unzip → clip → daily CSV + event-total raster + daily NetCDF cube
-- `scripts/storm_total.py` — `build_cube`, ellipsoidal `cell_area_m2`, and a CLI that totals depth/volume for any
-  date range from the cube. Volumes use per-row GRS80 cell areas on the native grid; don't reproject or resample.
+- `scripts/storm_total.py` — `build_cube`, ellipsoidal `cell_area_m2`, `prism_day_files` (national grid lookup in
+  `extracted/`), and a CLI that totals depth/volume for any date range from the cube, with releases, revision
+  change (from the release history) and boundary sensitivity (centers / area-weighted / touched, from the national
+  grids). Volumes use per-row GRS80 cell areas on the native grid; don't reproject or resample.
 - `scripts/observations.py` — all network access for validation (RCC-ACIS stations, USGS Water Data API, NLDI,
   National Inventory of Dams); `_get` retries 429/503 and raises `RateLimited` on long waits
 - `scripts/validate_stations.py` — gauge vs PRISM comparison; pure functions for ACIS parsing, day alignment,
@@ -39,7 +41,7 @@ That run's outputs (HUC 1408, PRISM days Oct 20–27) are in
 
 `prism_watershed.py` requires `--start`, `--end`, and one of `--huc`/`--boundary`.
 Outputs (default `--out data/huc<code>` or `data/<boundary stem>`): `raw_zips/`, `extracted/`, `clipped/<var>_<res>_YYYYMMDD_clip.tif`,
-`daily_basin_summary.csv`, `<var>_<res>_total_<start>_<end>.tif`, `<var>_<res>_daily_clip.nc` (rebuilt each run
+`daily_basin_summary.csv` (every day in the folder; a run replaces its own days), `<var>_<res>_total_<start>_<end>.tif`, `<var>_<res>_daily_clip.nc` (rebuilt each run
 from every tif in `clipped/`, so one `--out` folder = one basin), `<var>_<res>_release_history.csv`. `--end` is capped at yesterday.
 
 Releases: the release is read from the zip's info.txt; clipped tifs carry it as tag `PRISM_DATASET_RELEASE_NUMBER`

@@ -19,7 +19,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 SCRIPT = SCRIPTS / "prism_watershed.py"
 sys.path.insert(0, str(SCRIPTS))
 from find_huc import build_where  # noqa: E402
-from storm_total import cell_area_m2, window_total  # noqa: E402
+from storm_total import boundary_volumes, cell_area_m2, cell_fractions, revision_change, window_total  # noqa: E402
 
 
 def make_zip(raw_dir, ymd, value, release=2):
@@ -69,10 +69,12 @@ def test_pipeline(tmp_path):
     tif, vol_tif = tmp_path / "window.tif", tmp_path / "volume.tif"
     res = subprocess.run([sys.executable, str(SCRIPTS / "storm_total.py"), "--out", str(out),
                           "--start", "2026-10-22", "--end", "2026-10-22", "--tif", str(tif),
-                          "--volume-tif", str(vol_tif), "--volume-nc", str(tmp_path / "volume.nc")],
+                          "--volume-tif", str(vol_tif), "--volume-nc", str(tmp_path / "volume.nc"),
+                          "--boundary", str(boundary)],
                          check=True, capture_output=True, text=True)
     assert "30.0 mm" in res.stdout
     assert "r2 Oct 22" in res.stdout and "--refresh" in res.stdout
+    assert "Boundary:    cell centers" in res.stdout  # national grids are in extracted/
     with rasterio.open(tif) as src:
         assert np.isclose(src.read(1, masked=True).mean(), 30.0)
     with rasterio.open(vol_tif) as src:
@@ -110,6 +112,11 @@ def test_new_release_replaces_day_and_keeps_history(tmp_path):
 
     rows = list(csv.DictReader(open(out / "daily_basin_summary.csv")))
     assert [(r["release"], r["basin_mean_mm"]) for r in rows] == [("1", "10.0"), ("2", "33.0")]
+
+    one_day = cmd[:3] + ["2026-10-22", "--end", "2026-10-22"] + cmd[6:]  # earlier days stay in the summary
+    subprocess.run(one_day, check=True, capture_output=True)
+    rows = list(csv.DictReader(open(out / "daily_basin_summary.csv")))
+    assert [r["date"] for r in rows] == ["2026-10-21", "2026-10-22"]
     history = list(csv.DictReader(open(out / "ppt_800m_release_history.csv")))
     assert [(r["date"], r["release"], r["basin_mean_mm"]) for r in history] == [
         ("2026-10-21", "1", "10.0"), ("2026-10-22", "1", "30.0"), ("2026-10-22", "2", "33.0")]
@@ -172,6 +179,36 @@ def test_refresh_skips_recent_zips(tmp_path):
                           "--boundary", str(boundary), "--out", str(out), "--pause", "0", "--refresh"],
                          check=True, capture_output=True, text=True, env={**os.environ, "HTTPS_PROXY": "http://127.0.0.1:9"})
     assert "release 2" in res.stdout and "Re-run later with --refresh" in res.stdout
+
+
+def test_revision_change():
+    history = [{"date": "2026-10-21", "release": "2", "basin_volume_m3": "100"},
+               {"date": "2026-10-22", "release": "1", "basin_volume_m3": "200"},
+               {"date": "2026-10-22", "release": "3", "basin_volume_m3": "230"},
+               {"date": "2026-10-22", "release": "2", "basin_volume_m3": "250"}]
+    days = [dt.date(2026, 10, 21), dt.date(2026, 10, 22)]
+    rc = revision_change(history, days)
+    assert (rc["first_m3"], rc["latest_m3"]) == (300, 330)  # releases ordered by number, not by row
+    assert np.isclose(rc["change_pct"], 10.0) and rc["revised"] == [(days[1], "1", "3")]
+    assert revision_change(history, [dt.date(2026, 10, 23)]) is None
+
+
+def test_boundary_volumes_three_ways():
+    transform = from_origin(-108.0, 38.0, 0.1, 0.1)
+    # A 4x4 grid of 10 mm; the basin covers rows 1-2 of columns 0-2 and 40% of column 3 (center outside).
+    geom = box(-108.0, 37.7, -107.66, 37.9)
+    frac = cell_fractions(geom, transform, (4, 4))
+    assert np.allclose(frac[1:3, :3], 1) and np.allclose(frac[1:3, 3], 0.4)
+    assert frac[0].sum() == 0 and frac[3].sum() == 0
+    total = np.full((4, 4), 10.0)
+    total[2, 0] = np.nan  # no PRISM data in one cell: left out of every rule
+    v = boundary_volumes(total, transform, geom)
+    area = cell_area_m2(transform, 4)
+    centers = 0.010 * (3 * area[1] + 2 * area[2])
+    weighted = 0.010 * (3.4 * area[1] + 2.4 * area[2])
+    touched = 0.010 * (4 * area[1] + 3 * area[2])
+    assert np.isclose(v["weighted"], weighted) and np.isclose(v["touched"], touched)
+    assert np.isclose(v["centers"], centers)
 
 
 def test_cell_area_matches_pyproj():
