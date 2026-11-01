@@ -73,6 +73,9 @@ except ImportError:
     pass
 
 PRISM_URL = "https://services.nacse.org/prism/data/get/{region}/{res}/{var}/{date}"
+# Release numbers per day without downloading (checked 1 Nov 2026): one request covers a date range;
+# rows are [data date, release date, element, grid count (= release 1-8), data URL].
+RELEASE_URL = "https://services.nacse.org/prism/data/get/releaseDate/{region}/{res}/{var}/{start}/{end}"
 WBD_URL = "https://hydro.nationalmap.gov/arcgis/rest/services/wbd/MapServer/{layer}/query"
 
 
@@ -196,10 +199,41 @@ def folder_release(folder):
     return ""
 
 
-def due_for_refresh(release, last_downloaded, today, target, age_days):
-    """True if a cached day is below the target release and was last downloaded age_days or more ago."""
+def available_releases(var, res, region, start, end, session):
+    """{date: release number} PRISM currently has for each day, from the releaseDate service (no grids
+    downloaded), or None if the service can't be reached."""
+    url = RELEASE_URL.format(region=region, res=res, var=var, start=start.strftime("%Y%m%d"),
+                             end=end.strftime("%Y%m%d"))
+    try:
+        r = session.get(url, params={"json": "true"}, timeout=60)
+        r.raise_for_status()
+        return parse_release_rows(r.json())
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def parse_release_rows(rows):
+    """{date: release} from releaseDate rows [data date, release date, element, grid count, URL]."""
+    out = {}
+    for row in rows or []:
+        try:
+            out[dt.date.fromisoformat(row[0])] = int(row[3])
+        except (IndexError, TypeError, ValueError):
+            continue
+    return out
+
+
+def due_for_refresh(release, last_downloaded, today, target, age_days, available=None):
+    """True if a cached day should be downloaded again.
+
+    With available (the release PRISM has now, from the releaseDate service): only when it is newer than
+    the cached release, up to target. Without it: when the cached day is below target and was last
+    downloaded age_days or more ago.
+    """
     if release.isdigit() and int(release) >= target:
         return False
+    if available is not None:
+        return available > (int(release) if release.isdigit() else 0)
     return (today - last_downloaded).days >= age_days
 
 
@@ -379,10 +413,11 @@ def main():
     ap.add_argument("--out", help="output folder (default data/huc<code> or data/<boundary name>)")
     ap.add_argument("--pause", type=float, default=2.0, help="seconds between requests")
     ap.add_argument("--refresh", action="store_true",
-                    help="re-download cached days below --target-release to pick up PRISM's revisions")
+                    help="re-download cached days that PRISM has a newer release of (up to --target-release)")
     ap.add_argument("--target-release", type=int, default=8, help="release to refresh up to (default 8, final)")
     ap.add_argument("--refresh-age", type=float, default=7,
-                    help="only re-download zips last downloaded at least this many days ago (default 7)")
+                    help="when PRISM's release service can't be reached: only re-download zips last downloaded "
+                         "at least this many days ago (default 7)")
     ap.add_argument("--qc-strict", action="store_true", help="treat QC warnings as failures")
     ap.add_argument("--qc-max-daily-mm", type=float, default=400.0,
                     help="flag daily precipitation in any cell above this (default 400 mm)")
@@ -412,6 +447,7 @@ def main():
     station_zone = basin.to_crs(utm).buffer(a.qc_station_buffer_km * 1000).to_crs(4269).union_all()
     session = requests.Session()
     session.headers["User-Agent"] = "prism-data-wrangler"
+    available = available_releases(a.var, a.res, a.region, start, end, session)
 
     summary_csv = out / summary_name(a.var, a.res)
     ppt = a.var == "ppt"
@@ -419,6 +455,7 @@ def main():
     rows, history, changes, total, meta = [], [], [], None, None
     errors, downloads, grids, stations, day_min, day_max, missing_m2, day_m3 = {}, [], [], {}, {}, {}, {}, []
     inside = area = always_missing = grid_bounds = None
+    newer_available = []  # cached days that are due for a refresh
     requested = list(daterange(start, end))
     for day in requested:
         ymd = day.strftime("%Y%m%d")
@@ -427,9 +464,11 @@ def main():
         before = clipped_day(clip_path, summary_csv, a.var)  # what this folder held before this run
         if before:
             history.append({"date": day.isoformat(), "release": before[0], **before[1], "recorded": recorded})
-        if (a.refresh and cached.exists() and not zip_problem(cached) and due_for_refresh(
+        if cached.exists() and not zip_problem(cached) and due_for_refresh(
                 zip_release(cached), dt.date.fromtimestamp(cached.stat().st_mtime), today,
-                a.target_release, a.refresh_age)):
+                a.target_release, a.refresh_age, None if available is None else available.get(day, 0)):
+            newer_available.append(day)
+        if a.refresh and day in newer_available:
             change = refresh_day(a.var, a.res, a.region, day, a.format, raw, session, errors)
             time.sleep(a.pause)
             if change:
@@ -511,7 +550,10 @@ def main():
             print(f"  {day}: release {old_rel or '?'} -> {new_rel}: {old['basin_mean_mm']} -> "
                   f"{new['basin_mean_mm']} mm, {old['basin_volume_m3']:.4g} -> {new['basin_volume_m3']:.4g} m³{pct}")
         print(f"All releases seen per day: {history_csv.name}")
-    if any(r["release"].isdigit() and int(r["release"]) < 8 for r in rows):
+    if not a.refresh and available is not None and newer_available:
+        print(f"PRISM has a newer release for {len(newer_available)} cached day(s) ("
+              + ", ".join(f"{d:%b} {d.day} r{available[d]}" for d in newer_available) + "): rerun with --refresh.")
+    elif any(r["release"].isdigit() and int(r["release"]) < 8 for r in rows):
         print("Some days are not final (release 8); PRISM revises them for about 6 months. "
               "Re-run later with --refresh.")
 
@@ -585,6 +627,7 @@ def main():
     print("\n" + "\n".join(qc.report(checks)))
 
     run.update(window={"start": str(start), "end": str(end)}, days=downloads, qc=checks,
+               available_releases=None if available is None else {str(d): r for d, r in available.items()},
                outputs=manifest.files_entry([cube, total_tif, summary_csv, history_csv]
                                             + [clipped / f"{a.var}_{a.res}_{d.strftime('%Y%m%d')}_clip.tif"
                                                for d in run_days], out))

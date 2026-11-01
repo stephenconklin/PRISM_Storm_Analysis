@@ -70,8 +70,8 @@ Outputs (default `--out data/huc<code>` or `data/<boundary stem>`): `raw_zips/`,
 from every tif in `clipped/`, so one `--out` folder = one basin), `<var>_<res>_release_history.csv`. `--end` is capped at yesterday.
 
 Releases: the release is read from the zip's info.txt; clipped tifs carry it as tag `PRISM_DATASET_RELEASE_NUMBER`
-and the cube as `release` (0 unknown). `--refresh` re-downloads days below `--target-release` whose zip is at
-least `--refresh-age` days old (file mtime = last checked) and moves a superseded zip to
+and the cube as `release` (0 unknown). `--refresh` re-downloads days whose release PRISM's releaseDate service reports as newer
+(`available_releases`; if unreachable, zips at least `--refresh-age` days old, file mtime = last checked) and moves a superseded zip to
 `raw_zips/releases/<stem>_r<n>.zip`. `extract_grid` re-extracts when `extracted/` holds another release. A newer
 release replaces the day everywhere; older values live only in the history CSV and archived zips. Other event-total
 tifs covering a revised day are reported as out of date (`stale_totals`).
@@ -126,6 +126,10 @@ The script calls `truststore.inject_into_ssl()` to use the OS trust store; never
 - Stability is no longer in filenames or labeled early/provisional/stable. The zip's `*.info.txt` has
   `PRISM_DATASET_RELEASE_NUMBER` (1–8): daily grids are released at D+1, D+5, then ~monthly for 6 months.
   Recent days are remodeled for ~6 months, so re-pull later for final numbers with `--refresh`.
+- Release numbers without downloading (checked 1 Nov 2026): `.../get/releaseDate/<region>/<res>/<var>/<start>/<end>?json=true`
+  returns rows [data date, release date, element, grid count = release, URL]; `.../get/gridCount/<region>/<var>/<date>`
+  returns one integer. These don't count toward the download limit. 30-year normals are NOT on the web service
+  (FTP or website only).
 - Filenames use resolution codes: `30s` = 800m, `25m` = 4km, `15s` = 400m. Native CRS NAD83 (EPSG:4269), units mm.
 - A PRISM "day" ends at 12:00 UTC, so pad event windows by a day on each side.
 

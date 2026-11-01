@@ -184,6 +184,11 @@ def test_refresh_day_archives_superseded_zip(tmp_path):
     assert len(list((raw / "releases").iterdir())) == 1 and not list(raw.glob("*.part"))
 
     today = dt.date(2026, 11, 20)
+    # With PRISM's release service: refresh exactly when it has a newer release, whatever the zip's age.
+    assert due_for_refresh("2", dt.date(2026, 11, 19), today, 8, 7, available=3)
+    assert not due_for_refresh("2", dt.date(2026, 10, 1), today, 8, 7, available=2)
+    assert not due_for_refresh("2", dt.date(2026, 10, 1), today, 8, 7, available=0)  # day not listed
+    # Without it: the age rule.
     assert due_for_refresh("2", dt.date(2026, 11, 1), today, 8, 7)
     assert not due_for_refresh("2", dt.date(2026, 11, 15), today, 8, 7)  # checked recently
     assert not due_for_refresh("8", dt.date(2026, 11, 1), today, 8, 7)   # final
@@ -414,3 +419,10 @@ def test_requires_basin_and_valid_huc(tmp_path):
     assert missing.returncode == 2 and "one of the arguments --huc --boundary is required" in missing.stderr
     bad = run("--huc", "140")
     assert bad.returncode != 0 and "--huc must be" in bad.stderr
+
+
+def test_parse_release_rows():
+    from prism_watershed import parse_release_rows
+    rows = [["2026-10-26", "2026-10-31", "ppt", "2", "https://services.nacse.org/prism/data/get/us/800m/ppt/20261026"],
+            ["2026-10-28", "2026-10-29", "ppt", "1", "url"], ["bad"], None]
+    assert parse_release_rows(rows) == {dt.date(2026, 10, 26): 2, dt.date(2026, 10, 28): 1}

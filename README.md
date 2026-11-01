@@ -129,9 +129,9 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 | `--region` | `us` | PRISM region |
 | `--format` | COG GeoTIFF | `nc`, `bil`, `asc` |
 | `--pause` | `2.0` | Seconds between download requests |
-| `--refresh` | off | Re-download cached days below `--target-release` to pick up PRISM's revisions (see Updating to newer PRISM releases) |
+| `--refresh` | off | Re-download cached days that PRISM has a newer release of, up to `--target-release` (see Updating to newer PRISM releases) |
 | `--target-release` | `8` | Release to refresh up to (8 is final) |
-| `--refresh-age` | `7` | Only re-download a zip last downloaded at least this many days ago |
+| `--refresh-age` | `7` | Only when PRISM's release service can't be reached: re-download zips last downloaded at least this many days ago |
 | `--qc-strict` | off | Treat QC warnings as failures (see QC checks and run manifest) |
 | `--qc-max-daily-mm` | `400` | Flag a daily cell above this much precipitation |
 | `--qc-station-buffer-km` | `10` | Count PRISM input stations this far outside the basin |
@@ -207,10 +207,13 @@ same command with `--refresh`:
 python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27 --out /path/to/My_Basin --refresh
 ```
 
-- Each cached day below `--target-release` whose zip was downloaded at least `--refresh-age` days ago
-  is downloaded again. PRISM's service doesn't say which release it has without a download, so a
-  re-download may bring back the same release; the zip's date then records when it was last checked.
-  Each re-download counts toward PRISM's limit of two downloads of a file per 24 hours.
+- Every run asks PRISM's release service which release it has for each day (one small request, no
+  grids downloaded). With `--refresh`, only cached days with a newer release (up to `--target-release`)
+  are downloaded again; without it, the run tells you how many days have a newer release. Each
+  re-download counts toward PRISM's limit of two downloads of a file per 24 hours.
+- If the release service can't be reached, `--refresh` falls back to re-downloading days whose zip is at
+  least `--refresh-age` days old; a re-download may then bring back the same release, and the zip's
+  date records when it was last checked.
 - A newer release **replaces** the day in `clipped/`, the cube and the summary CSV, so all later steps
   use the newest data. Event-total rasters from other windows that include a revised day are listed as
   out of date, with the command to update them. The superseded zip moves to `raw_zips/releases/`, and the old and new basin
