@@ -55,7 +55,7 @@ gauges whose basins lie mostly outside the study basin are skipped; `--gauge` ru
 1. ~~**QC checks and run manifest** (sections 2 and 5.1)~~ — built 1 Nov 2026.
 2. ~~**Uncertainty: revision and boundary sensitivity** (3.1, 3.2)~~ — built 1 Nov 2026.
 3. ~~**Station validation** (1.1)~~ — built; follow-ups listed in 1.1.
-4. ~~**Rain/snow partition** (4)~~ — built 1 Nov 2026; SNOTEL check still open.
+4. ~~**Rain/snow partition** (4)~~ — built 1 Nov 2026, with the SNOTEL check.
 5. ~~**Streamflow comparison** (1.2)~~ — built; then **multi-product comparison** (1.3) and the **uncertainty roll-up** (3.3).
 6. **Storm context** (6) and **reports** (7).
 7. **Engineering** (8). Start version control and CI at any point; the rest as the tool grows.
@@ -291,8 +291,9 @@ written up in `docs/`.
 > ramp (`--all-snow-c` 0, `--all-rain-c` 3), reports both, writes `--rain-tif`, `--snow-tif`,
 > `--rain-snow-nc`, and QC checks rain + snow = precipitation; `validate_runoff.py` adds a rain-only
 > ratio and snow share per gauge. San Juan Oct 20–27: 3.8% snow basin-wide; 64–76% at the high Animas
-> gauges, whose rain-only ratios reach 1.06–1.17. Not built: the SNOTEL SWE check (next step: it would
-> show whether the high-elevation snow share is plausible), and rain/snow layers in the QGIS project.
+> gauges, whose rain-only ratios reach 1.06–1.17. SNOTEL check built as `validate_snow.py` (NRCS AWDB):
+> over 23 stations PRISM's snow is 1.16× the observed SWE gain with 0–3 °C (0.9× with −1–3 °C; ramps ending
+> at 2 °C give ≤0.7×); near Silverton the split is ~2× observed. Keep 0–3 °C until more storms are checked.
 
 **Goal:** Split each cell's daily precipitation into rain and snow-water.
 

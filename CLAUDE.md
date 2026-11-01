@@ -29,6 +29,8 @@ That run's outputs (HUC 1408, PRISM days Oct 20–27) are in
   `--gauge` sites or `--all-gauges`; gauge-basin precipitation from the national grids in `extracted/` (not the
   clipped cube, so NLDI basins may extend past the study basin); regulation class from upstream NID storage depth; per-gauge results cached
   in `validation/runoff_<site>.json` (keyed by window settings) so rate-limited runs resume
+- `scripts/validate_snow.py` — rain/snow split vs SNOTEL SWE gain (observed, station-data split, PRISM split) per
+  station; `validation/snotel.csv`, `snotel_summary.json`, layer `snotel`; pure functions `snotel_window`, `prism_split`
 - `scripts/subbasin_totals.py` — basin and subbasin (HUC10/12) depth and volume from the cube (`zone_totals` in
   `storm_total.py`) to `<out>/totals.gpkg` (`basin_total`, `subbasins`); WBD units via `observations.wbd_units`
 - `scripts/build_qgis_project.py` — builds `<out>/QGIS/<name>.qgz` from a folder's outputs (found by standard
@@ -83,6 +85,7 @@ python scripts/storm_total.py --out DIR [--start ... --end ...] [--tif depth_mm.
 python scripts/validate_stations.py --out DIR [--start ... --end ...] [--buffer-km 10]
 python scripts/validate_runoff.py --out DIR --all-gauges [--after-days 7] [--refresh]
 python scripts/validate_runoff.py --out DIR --gauge 09342500 09361500
+python scripts/validate_snow.py --out DIR [--start ... --end ...] [--all-snow-c 0 --all-rain-c 3]
 python scripts/subbasin_totals.py --out DIR [--digits 10|12] [--start ... --end ...]
 python scripts/build_qgis_project.py --out DIR [--name NAME] [--qgis-python PATH]
 python -m pytest tests -q
@@ -128,6 +131,9 @@ Example HUCs: 1408 San Juan basin; 14080101 Upper San Juan; 14080104 Animas.
   and gets its own 1,000/hour allowance, separate from the per-IP one. Never write the key into repo files.
 - Gauge discovery: `time-series-metadata` with `bbox`, `parameter_code=00060`, `computation_period_identifier=Points`;
   site metadata in bulk from `monitoring-locations` (`bbox`, `site_type_code=ST`).
+- SNOTEL: NRCS AWDB REST (`wcc.sc.egov.usda.gov/awdbRestApi/services/v1`, no key) `stations` (`*:*:SNTL`, elevation
+  in ft) and `data` (WTEQ, PREC, PRCP, TAVG; in, degF). Days are PST calendar days, WTEQ/PREC end-of-day:
+  AWDB day D = PRISM day D+1 (lagged correlation 0.95–0.998). ACIS SNOTEL dates align the same way.
 - Dams: NID ArcGIS service (`NORMAL_STORAGE`, `NID_STORAGE` in acre-ft). Drop `IS_ASSOCIATED_STRUCTURE='Yes'`
   (dikes repeat the reservoir's storage) and dedupe same-storage entries by base name or <2 km (e.g. Narraguinnep).
   NLDI `ref_dams` lacks storage and missed Navajo and Vallecito; NLDI `GRAND` returned nothing here.

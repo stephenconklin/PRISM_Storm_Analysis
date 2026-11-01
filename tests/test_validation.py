@@ -297,3 +297,25 @@ def test_basin_precip_rain_by_cell(tmp_path):
     area = cell_area_m2(from_origin(-108.0, 38.0, 0.1, 0.1), 2)
     assert rows[0]["rain_mm"] == pytest.approx(20 * area[1] / area.sum())
     assert rows[0]["depth_mm"] == pytest.approx((10 * area[0] + 20 * area[1]) / area.sum())
+
+
+def test_snotel_window_alignment_and_shares():
+    """PRISM days Oct 22-23 use AWDB days Oct 21-22, with SWE before the window from Oct 20."""
+    from validate_snow import prism_split, snotel_window, summarize
+    series = {"PRCP": {"2026-10-21": 1.0, "2026-10-22": 1.0, "2026-10-23": 9.0},
+              "WTEQ": {"2026-10-20": 0.5, "2026-10-21": 1.0, "2026-10-22": 0.8, "2026-10-23": 5.0},
+              "TAVG": {"2026-10-21": 50.0, "2026-10-22": 30.2}}  # 10 °C (rain), -1 °C (snow)
+    w = snotel_window(series, dt.date(2026, 10, 22), dt.date(2026, 10, 23))
+    assert w["precip_mm"] == pytest.approx(50.8)                  # Oct 23's 9 in is outside the window
+    assert w["swe_gain_mm"] == pytest.approx(0.5 * 25.4)          # peak 1.0 minus 0.5 before
+    assert w["swe_net_mm"] == pytest.approx(0.3 * 25.4)
+    assert w["station_split_snow_mm"] == pytest.approx(25.4)      # only the cold day's inch
+    with pytest.raises(ValueError, match="precipitation missing"):
+        snotel_window({"PRCP": {"2026-10-21": 1.0}}, dt.date(2026, 10, 22), dt.date(2026, 10, 23))
+    assert prism_split([10, 20], [5.0, 1.5]) == (30.0, pytest.approx(10.0))
+    rows = [{"status": "ok", "precip_mm": 50, "swe_gain_mm": 10, "prism_snow_mm": 12, "observed_snow_pct": 20,
+             "station_split_snow_pct": 30, "prism_snow_pct": 24},
+            {"status": "ok", "precip_mm": 5, "swe_gain_mm": 5, "prism_snow_mm": 0, "observed_snow_pct": 100,
+             "station_split_snow_pct": 0, "prism_snow_pct": 0}]
+    s = summarize(rows, min_precip_mm=10)
+    assert s["stations"] == 1 and s["observed_snow_pct"] == 20 and s["prism_over_observed_snow"] == 1.2

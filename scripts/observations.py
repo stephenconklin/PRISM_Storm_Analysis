@@ -18,6 +18,12 @@ Sources (checked October 2026):
         https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/NID_v1/FeatureServer/0
         Dam locations and storage (acre-ft). NLDI's ref_dams list was checked and rejected:
         it has no storage and missed Navajo and Vallecito dams.
+    NRCS AWDB REST API  https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/ (checked 1 Nov 2026, no key)
+        stations (SNOTEL metadata: triplet, lat/lon, elevation in ft) and data (daily WTEQ snow-water
+        equivalent, PREC accumulated precipitation, PRCP daily precipitation, TAVG; inches and degF).
+        Daily values are Pacific Standard Time calendar days for every station; WTEQ and PREC are
+        end-of-day readings. Lagged correlation against PRISM (0.95-0.998 at four San Juan sites) put
+        AWDB day D in PRISM day D+1.
 
 Rate limits: the USGS Water Data API allows 1,000 requests per hour per IP without a key
 (HTTP 429 with Retry-After when exceeded). Set USGS_API_KEY to an api.data.gov key; it is
@@ -42,6 +48,8 @@ NLDI_BASIN_URL = "https://api.water.usgs.gov/nldi/linked-data/nwissite/USGS-{sit
 NID_URL = ("https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/"
            "NID_v1/FeatureServer/0/query")
 WBD_URL = "https://hydro.nationalmap.gov/arcgis/rest/services/wbd/MapServer/{layer}/query"
+AWDB_URL = "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1"
+FT_TO_M = 0.3048
 HEADERS = {"User-Agent": "prism-data-wrangler"}
 MAX_WAIT_S = 900  # longest Retry-After to wait out before giving up (callers may change it)
 
@@ -238,3 +246,31 @@ def usgs_continuous(site, start_utc, end_utc, parameter="00060"):
 def nldi_basin(site):
     """GeoJSON FeatureCollection of the drainage basin upstream of a USGS gauge."""
     return _get(NLDI_BASIN_URL.format(site=site), {"simplified": "false"}).json()
+
+
+def snotel_stations(bbox):
+    """Active SNOTEL stations in bbox (west, south, east, north): [{triplet, name, lon, lat, elevation_m, huc}]."""
+    r = _get(f"{AWDB_URL}/stations", params={
+        "stationTriplets": "*:*:SNTL", "activeOnly": "true", "returnForecastPointMetadata": "false",
+        "returnReservoirMetadata": "false", "returnStationElements": "false"})
+    w, s, e, n = bbox
+    return [{"triplet": st["stationTriplet"], "name": st["name"], "lon": st["longitude"], "lat": st["latitude"],
+             "elevation_m": round(st["elevation"] * FT_TO_M, 1) if st.get("elevation") is not None else None,
+             "huc": st.get("huc")}
+            for st in r.json() if w <= st["longitude"] <= e and s <= st["latitude"] <= n]
+
+
+def snotel_daily(triplets, begin, end, elements=("WTEQ", "PRCP", "TAVG")):
+    """Daily SNOTEL values: {triplet: {element: {'YYYY-MM-DD': value or None}}}, inches and degF,
+    Pacific Standard Time calendar days (WTEQ is the end-of-day reading)."""
+    out = {}
+    for i in range(0, len(triplets), 50):
+        r = _get(f"{AWDB_URL}/data", params={"stationTriplets": ",".join(triplets[i:i + 50]),
+                                             "elements": ",".join(elements), "duration": "DAILY",
+                                             "beginDate": str(begin), "endDate": str(end)})
+        for st in r.json():
+            series = out.setdefault(st["stationTriplet"], {})
+            for block in st.get("data", []):
+                series[block["stationElement"]["elementCode"]] = {v["date"][:10]: v.get("value")
+                                                                  for v in block.get("values", [])}
+    return out

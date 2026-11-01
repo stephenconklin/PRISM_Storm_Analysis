@@ -315,7 +315,7 @@ Largest by volume:
 ```
 
 ## Validation against observations
-Both commands read the folder `prism_watershed.py` wrote and add a `validation/` subfolder.
+These commands read the folder `prism_watershed.py` wrote and add a `validation/` subfolder.
 Window dates are PRISM days and default to every day in the cube.
 
 ### `validate_stations.py`: rain gauges
@@ -386,17 +386,66 @@ python scripts/validate_runoff.py --out data/huc<HUC> --gauge <site> [<site> ...
 - **Checks printed:** basin area three ways (PRISM cells, NLDI polygon, USGS published drainage area),
   hours interpolated, and USGS approval status (provisional or approved).
 
+### `validate_snow.py`: snow at SNOTEL stations
+
+Checks the rain/snow split (see Rain and snow) against snow-water equivalent measured at SNOTEL
+stations. Needs `ppt` and `tmean` runs over the window in the folder.
+
+```bash
+python scripts/validate_snow.py --out data/huc<HUC>
+python scripts/validate_snow.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD> --all-snow-c -1 --all-rain-c 3
+```
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--start` / `--end` | first / last day in the cube | PRISM days |
+| `--buffer-km` | `10` | Also use stations this far outside the basin |
+| `--all-snow-c` / `--all-rain-c` | `0` / `3` | The ramp to test, as in `storm_total.py` |
+| `--min-precip-mm` | `10` | Leave stations with less precipitation out of the average |
+
+For each active SNOTEL station it reports, as a share of precipitation over the window:
+- **observed:** snow-water gained by the snow pillow (peak in the window minus the day before).
+  A lower bound on snow that fell, since rain and warm spells melt some within the window.
+- **station split:** the station's own precipitation split by its own daily mean temperature with
+  the ramp. Tests the method without PRISM.
+- **PRISM split:** PRISM precipitation and `tmean` at the station's cell, split with the ramp. This
+  is what `storm_total.py` and `validate_runoff.py` use.
+
+Station data come from the NRCS AWDB web service (no key needed). SNOTEL stations are PRISM inputs,
+so PRISM precipitation at a station is close to the gauge by construction; the snow share is the
+independent test. AWDB days are Pacific Standard Time calendar days, so PRISM day *D* is AWDB day
+*D*−1 (checked by lagged correlation, 0.95–0.998).
+
+Example (San Juan, PRISM days Oct 20–27, excerpt):
+```
+SNOTEL station           elev m  precip SWE gain   snow % of precip: observed  station split  PRISM split
+Red Mountain Pass          3371    140mm     69mm                        49             85           54
+Wolf Creek Summit          3332    226mm     81mm                        36             36           35
+Molas Lake                 3234    132mm     23mm                        17             48           36
+Mineral Creek              3057    132mm     30mm                        23             57           46
+Cascade #2                 2740    130mm      8mm                         6              9            0
+
+Average over 23 stations with >= 10 mm: observed 18.1%, station split 29.3%, PRISM split 23.1%; PRISM snow / observed SWE gain = 1.16
+```
+Read as: with the default 0–3 °C ramp, PRISM's snow is 1.16 times the snow the pillows kept, which
+fits observed snow being a lower bound. Ramps that end at 2 °C give half the observed snow or less;
+−1 to 3 °C gives 0.9 times. Around Silverton (Molas Lake, Mineral Creek) the PRISM split is about
+twice the observed share, so the high Animas gauges' rain-only runoff ratios are too high. The
+station split runs higher still, likely because a station's daily mean misses warm hours when the
+rain fell.
+
 ### Outputs (in `--out/validation/`)
 
 | File | Contents |
 |---|---|
-| `validation.gpkg` | Layers `stations`, `station_days`, `gauge_basins`, `gauges`, `dams`, each with a default QGIS style stored in the GeoPackage |
+| `validation.gpkg` | Layers `stations`, `station_days`, `gauge_basins`, `gauges`, `dams`, each with a default QGIS style stored in the GeoPackage, and `snotel` (unstyled) |
 | `stations.csv`, `station_days.csv` | Same data as the station layers |
 | `stations_summary.json` | All statistics, counts, settings and exclusion reasons |
 | `runoff_summary.csv` | One row per gauge in the study basin: status, regulation, volumes, ratios |
 | `runoff_<site>.json` | Areas, daily basin precipitation, flow volumes, peak, gaps, approval, runoff ratios, regulation (or the skip reason) |
 | `runoff_<site>_flow.csv` | 15-minute flow, interpolated flag, both baseflow lines |
 | `runoff_<site>_basin.geojson` | The gauge's NLDI basin, saved so later runs can reuse it |
+| `snotel.csv`, `snotel_summary.json` | Per SNOTEL station: precipitation, SWE gain, the three snow shares (or the skip reason); the averages |
 
 `--all-gauges` replaces the gauge layers; `--gauge` adds or replaces just those gauges' rows.
 
