@@ -1,0 +1,198 @@
+"""Offline end-to-end test: synthetic PRISM-like zips + boundary, no network."""
+import csv
+import datetime as dt
+import os
+import subprocess
+import sys
+import zipfile
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from pyproj import Geod
+from shapely.geometry import box
+import xarray as xr
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+SCRIPT = SCRIPTS / "prism_watershed.py"
+sys.path.insert(0, str(SCRIPTS))
+from find_huc import build_where  # noqa: E402
+from storm_total import cell_area_m2, window_total  # noqa: E402
+
+
+def make_zip(raw_dir, ymd, value, release=2):
+    tif = raw_dir / f"prism_ppt_us_30s_{ymd}.tif"
+    with rasterio.open(tif, "w", driver="GTiff", height=100, width=100, count=1,
+                       dtype="float32", crs="EPSG:4269",
+                       transform=from_origin(-108.5, 37.8, 1 / 120, 1 / 120),
+                       nodata=-9999) as dst:
+        dst.write(np.full((100, 100), value, dtype="float32"), 1)
+    info = raw_dir / f"prism_ppt_us_30s_{ymd}.info.txt"
+    info.write_text(f"PRISM_DATASET_VERSION: D2\nPRISM_DATASET_RELEASE_NUMBER: {release}\n")
+    with zipfile.ZipFile(raw_dir / f"prism_ppt_us_30s_{ymd}.zip", "w") as z:
+        z.write(tif, tif.name)
+        z.write(info, info.name)
+    tif.unlink()
+    info.unlink()
+
+
+def test_pipeline(tmp_path):
+    out = tmp_path / "run"
+    raw = out / "raw_zips"
+    raw.mkdir(parents=True)
+    make_zip(raw, "20261021", 10.0)
+    make_zip(raw, "20261022", 30.0)
+    boundary = tmp_path / "basin.geojson"
+    gpd.GeoDataFrame(geometry=[box(-108.4, 37.5, -108.0, 37.7)], crs="EPSG:4326").to_file(boundary)
+
+    subprocess.run([sys.executable, str(SCRIPT), "--start", "2026-10-21", "--end", "2026-10-22",
+                    "--boundary", str(boundary), "--out", str(out), "--pause", "0"], check=True)
+
+    rows = list(csv.DictReader(open(out / "daily_basin_summary.csv")))
+    assert [r["basin_mean_mm"] for r in rows] == ["10.0", "30.0"]
+    assert all(r["release"] == "2" for r in rows)
+    with rasterio.open(out / "ppt_800m_total_20261021_20261022.tif") as src:
+        data = src.read(1, masked=True)
+    assert np.isclose(data.mean(), 40.0)
+
+    with xr.open_dataset(out / "ppt_800m_daily_clip.nc") as ds:
+        assert ds.sizes["time"] == 2
+        assert list(ds.release.values) == [2, 2]
+        r = window_total(ds, "2026-10-21", "2026-10-22")
+        expected = 0.040 * float(ds.cell_area.where(ds.ppt.isel(time=0).notnull()).sum())
+        assert np.isclose(r["volume_m3"], expected)
+        assert np.isclose(r["mean_mm"], 40.0)
+        assert np.isclose(float(window_total(ds, "2026-10-22", "2026-10-22")["mean_mm"]), 30.0)
+
+    tif, vol_tif = tmp_path / "window.tif", tmp_path / "volume.tif"
+    res = subprocess.run([sys.executable, str(SCRIPTS / "storm_total.py"), "--out", str(out),
+                          "--start", "2026-10-22", "--end", "2026-10-22", "--tif", str(tif),
+                          "--volume-tif", str(vol_tif), "--volume-nc", str(tmp_path / "volume.nc")],
+                         check=True, capture_output=True, text=True)
+    assert "30.0 mm" in res.stdout
+    assert "r2 Oct 22" in res.stdout and "--refresh" in res.stdout
+    with rasterio.open(tif) as src:
+        assert np.isclose(src.read(1, masked=True).mean(), 30.0)
+    with rasterio.open(vol_tif) as src:
+        assert src.units == ("m3",)
+        cells = src.read(1, masked=True)
+    window = window_total(xr.open_dataset(out / "ppt_800m_daily_clip.nc"), "2026-10-22", "2026-10-22")
+    assert np.isclose(float(cells.sum()), window["volume_m3"], rtol=1e-5)
+    with xr.open_dataset(tmp_path / "volume.nc") as vol:
+        assert vol.volume.sizes["time"] == 1 and vol.volume.attrs["units"] == "m3"
+        assert np.isclose(float(vol.volume.sum()), window["volume_m3"])
+        assert np.isclose(float(vol.volume_total.sum()), window["volume_m3"])
+
+    missing = subprocess.run([sys.executable, str(SCRIPTS / "storm_total.py"), "--out", str(out),
+                              "--start", "2026-10-20", "--end", "2026-10-22"],
+                             capture_output=True, text=True)
+    assert missing.returncode != 0 and "2026-10-20" in missing.stderr
+
+
+def test_new_release_replaces_day_and_keeps_history(tmp_path):
+    """A newer zip for a day (as --refresh leaves it) is re-extracted, re-clipped and logged with the old one."""
+    out = tmp_path / "run"
+    raw = out / "raw_zips"
+    raw.mkdir(parents=True)
+    make_zip(raw, "20261021", 10.0, release=1)
+    make_zip(raw, "20261022", 30.0, release=1)
+    boundary = tmp_path / "basin.geojson"
+    gpd.GeoDataFrame(geometry=[box(-108.4, 37.5, -108.0, 37.7)], crs="EPSG:4326").to_file(boundary)
+    cmd = [sys.executable, str(SCRIPT), "--start", "2026-10-21", "--end", "2026-10-22",
+           "--boundary", str(boundary), "--out", str(out), "--pause", "0"]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+    make_zip(raw, "20261022", 33.0, release=2)  # extracted/ still holds release 1 of this day
+    res = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    assert "2026-10-22: release 1 -> 2: 30.0 -> 33.0 mm" in res.stdout
+
+    rows = list(csv.DictReader(open(out / "daily_basin_summary.csv")))
+    assert [(r["release"], r["basin_mean_mm"]) for r in rows] == [("1", "10.0"), ("2", "33.0")]
+    history = list(csv.DictReader(open(out / "ppt_800m_release_history.csv")))
+    assert [(r["date"], r["release"], r["basin_mean_mm"]) for r in history] == [
+        ("2026-10-21", "1", "10.0"), ("2026-10-22", "1", "30.0"), ("2026-10-22", "2", "33.0")]
+    v1, v2 = (float(r["basin_volume_m3"]) for r in history[1:])
+    assert np.isclose(v2 / v1, 1.1, rtol=1e-4)
+    with xr.open_dataset(out / "ppt_800m_daily_clip.nc") as ds:
+        assert list(ds.release.values) == [1, 2]
+        assert np.isclose(window_total(ds, "2026-10-22", "2026-10-22")["mean_mm"], 33.0)
+
+
+class FakeResponse:
+    def __init__(self, content):
+        self.status_code, self.content, self.text = 200, content, ""
+        self.headers = {"Content-Type": "application/zip"}
+
+
+class FakeSession:
+    def __init__(self, content):
+        self.content, self.calls = content, 0
+
+    def get(self, url, params=None, timeout=None):
+        self.calls += 1
+        return FakeResponse(self.content)
+
+
+def test_refresh_day_archives_superseded_zip(tmp_path):
+    from prism_watershed import due_for_refresh, refresh_day, zip_release
+    raw, newer = tmp_path / "raw_zips", tmp_path / "newer"
+    raw.mkdir()
+    newer.mkdir()
+    make_zip(raw, "20261022", 30.0, release=1)
+    make_zip(newer, "20261022", 33.0, release=2)
+    day = dt.date(2026, 10, 22)
+
+    session = FakeSession((newer / "prism_ppt_us_30s_20261022.zip").read_bytes())
+    assert refresh_day("ppt", "800m", "us", day, "", raw, session) == ("1", "2")
+    assert zip_release(raw / "prism_ppt_us_30s_20261022.zip") == "2"
+    assert zip_release(raw / "releases" / "prism_ppt_us_30s_20261022_r1.zip") == "1"
+
+    # Same release again: nothing archived, the zip is just replaced.
+    assert refresh_day("ppt", "800m", "us", day, "", raw, session) == ("2", "2")
+    assert len(list((raw / "releases").iterdir())) == 1 and not list(raw.glob("*.part"))
+
+    today = dt.date(2026, 11, 20)
+    assert due_for_refresh("2", dt.date(2026, 11, 1), today, 8, 7)
+    assert not due_for_refresh("2", dt.date(2026, 11, 15), today, 8, 7)  # checked recently
+    assert not due_for_refresh("8", dt.date(2026, 11, 1), today, 8, 7)   # final
+    assert due_for_refresh("", dt.date(2026, 11, 1), today, 8, 7)        # unknown release
+
+
+def test_refresh_skips_recent_zips(tmp_path):
+    """--refresh makes no request for a zip downloaded within --refresh-age (the offline pipeline still runs)."""
+    out = tmp_path / "run"
+    raw = out / "raw_zips"
+    raw.mkdir(parents=True)
+    make_zip(raw, "20261022", 30.0, release=2)
+    boundary = tmp_path / "basin.geojson"
+    gpd.GeoDataFrame(geometry=[box(-108.4, 37.5, -108.0, 37.7)], crs="EPSG:4326").to_file(boundary)
+    res = subprocess.run([sys.executable, str(SCRIPT), "--start", "2026-10-22", "--end", "2026-10-22",
+                          "--boundary", str(boundary), "--out", str(out), "--pause", "0", "--refresh"],
+                         check=True, capture_output=True, text=True, env={**os.environ, "HTTPS_PROXY": "http://127.0.0.1:9"})
+    assert "release 2" in res.stdout and "Re-run later with --refresh" in res.stdout
+
+
+def test_cell_area_matches_pyproj():
+    transform = from_origin(-108.5, 37.8, 1 / 120, 1 / 120)
+    areas = cell_area_m2(transform, 3)
+    g = Geod(ellps="GRS80")
+    for row, area in enumerate(areas):
+        top = 37.8 - row / 120
+        ref, _ = g.polygon_area_perimeter([0, 1 / 120, 1 / 120, 0], [top - 1 / 120] * 2 + [top] * 2)
+        assert np.isclose(area, abs(ref), rtol=1e-6)
+
+
+def test_find_huc_where_clause():
+    assert build_where("san juan") == "UPPER(name) LIKE '%SAN JUAN%'"
+    assert build_where("o'neill", "co") == "UPPER(name) LIKE '%O''NEILL%' AND states LIKE '%CO%'"
+
+
+def test_requires_basin_and_valid_huc(tmp_path):
+    def run(*args):
+        return subprocess.run([sys.executable, str(SCRIPT), "--start", "2026-10-21", "--end", "2026-10-21",
+                               "--out", str(tmp_path), *args], capture_output=True, text=True)
+    assert run().returncode != 0
+    bad = run("--huc", "140")
+    assert bad.returncode != 0 and "--huc must be" in bad.stderr
