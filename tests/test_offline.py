@@ -298,6 +298,25 @@ def test_clip_keeps_the_right_cells(tmp_path):
     assert (out / "boundary.geojson").exists()  # --boundary is copied into the folder
 
 
+def test_cube_coverage_uses_every_day(tmp_path):
+    """A cell missing on one day is not 'outside PRISM coverage'; a cell missing on every day is."""
+    out = tmp_path / "run"
+    (out / "raw_zips").mkdir(parents=True)
+    day1 = np.full((100, 100), 5.0, dtype="float32")
+    day1[20:30, 30:40] = -9999          # no data on every day: 100 cells
+    day2 = day1.copy()
+    day2[40:45, 30:40] = -9999          # one-day gap: 50 more cells
+    make_zip(out / "raw_zips", "20261021", day1)
+    make_zip(out / "raw_zips", "20261022", day2)
+    geom = box(-108.5 + 20 / 120, 37.8 - 50 / 120, -108.5 + 60 / 120, 37.8 - 10 / 120)  # 40 x 40 cells
+    res = run_wrangler(out, basin_file(tmp_path, geom), "2026-10-21", "2026-10-22")
+    assert "WARN  nodata_inside" in res.stdout or "FAIL  nodata_inside" in res.stdout
+    area = np.repeat(cell_area_m2(GRID, 100)[:, None], 100, axis=1)
+    expected = float(area[20:30, 30:40].sum() / area[10:50, 20:60].sum() * 100)
+    with xr.open_dataset(out / "ppt_800m_daily_clip.nc") as ds:
+        assert ds.attrs["basin_without_prism_pct"] == pytest.approx(expected, abs=0.01)
+
+
 def test_coverage_counts_basin_beyond_grid_edge():
     from prism_watershed import prism_coverage
     from storm_total import geodesic_km2

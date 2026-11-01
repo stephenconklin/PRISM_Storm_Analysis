@@ -50,6 +50,7 @@ import zipfile
 from pathlib import Path
 
 import geopandas as gpd
+import netCDF4
 import numpy as np
 import pandas as pd
 import rasterio
@@ -537,14 +538,18 @@ def main():
               f"max {total.max():.1f} mm ({total.max()/25.4:.2f} in)")
     elif ppt:
         print(f"\nEvent total not written: {len(requested) - len(rows)} of {len(requested)} days missing.")
-    missing_pct, missing_km2, basin_km2 = prism_coverage(total, meta["transform"], basin, grid_bounds)
+    # The cube holds every clipped day in this --out folder, not just this run's window. Its coverage note
+    # comes from all of them: a cell is outside PRISM coverage only if it has no data on any day.
+    cube = build_cube(clipped, a.var, a.res, out / f"{a.var}_{a.res}_daily_clip.nc")
+    with xr.open_dataset(cube) as ds:
+        has_data = ds[a.var].notnull().any("time").values
+    missing_pct, missing_km2, basin_km2 = prism_coverage(np.ma.masked_array(np.zeros(has_data.shape), mask=~has_data),
+                                                         meta["transform"], basin, grid_bounds)
+    with netCDF4.Dataset(cube, "a") as nc:
+        nc.setncatts({"basin_area_km2": round(basin_km2, 1), "basin_without_prism_pct": round(missing_pct, 2)})
     if missing_pct > 0.5:
         print(f"WARNING: {missing_pct:.1f}% of the basin ({missing_km2:,.0f} of {basin_km2:,.0f} km²) has no PRISM "
               "data, usually because it lies outside the conterminous US. Totals and volumes cover only the rest.")
-    # The cube holds every clipped day in this --out folder, not just this run's window.
-    cube = build_cube(clipped, a.var, a.res, out / f"{a.var}_{a.res}_daily_clip.nc",
-                      attrs={"basin_area_km2": round(basin_km2, 1),
-                             "basin_without_prism_pct": round(missing_pct, 2)})
     print(f"Daily cube: {cube.name} (use storm_total.py for any date range)")
     for name in stale_totals(out, a.var, a.res, [c[0] for c in changes], total_tif.name):
         span = name.rsplit("_", 2)[-2:]
