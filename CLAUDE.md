@@ -39,6 +39,8 @@ That run's outputs (HUC 1408; ppt and tmean for PRISM days Oct 20–31) are in
   request errors are never cached. `--gauge` updates only its own gauges in the layers
 - `scripts/validate_snow.py` — rain/snow split vs SNOTEL SWE gain (observed, station-data split, PRISM split) per
   station; `validation/snotel.csv`, `snotel_summary.json`, layer `snotel`; pure functions `snotel_window`, `prism_split`
+- `scripts/storm_context.py` — storm vs PRISM 1991–2020 normals (prorated monthly, or `--daily-normals`); normals
+  cached in `<out>/normals_zips/`; `ppt_<res>_normals_<start>_<end>.json` feeds the report tile; `--pct-tif` map
 - `scripts/subbasin_totals.py` — basin and subbasin (HUC10/12) depth and volume from the cube (`zone_totals` in
   `storm_total.py`) to `<out>/totals.gpkg` (`basin_total`, `subbasins`); WBD units via `observations.wbd_units`
 - `scripts/build_qgis_project.py` — builds `<out>/QGIS/<name>.qgz` from a folder's outputs (found by standard
@@ -103,6 +105,7 @@ python scripts/validate_stations.py --out DIR [--start ... --end ...] [--buffer-
 python scripts/validate_runoff.py --out DIR --all-gauges [--after-days 7] [--refresh]
 python scripts/validate_runoff.py --out DIR --gauge 09342500 09361500
 python scripts/validate_snow.py --out DIR [--start ... --end ...] [--all-snow-c 0 --all-rain-c 3]
+python scripts/storm_context.py --out DIR [--start ... --end ...] [--daily-normals] [--pct-tif DIR/pct_of_normal.tif]
 python scripts/subbasin_totals.py --out DIR [--digits 10|12] [--start ... --end ...]
 python scripts/build_qgis_project.py --out DIR [--name NAME] [--qgis-python PATH]
 python scripts/report.py --out DIR [--start ... --end ...] [--gauges SITE ...]
@@ -128,8 +131,9 @@ The script calls `truststore.inject_into_ssl()` to use the OS trust store; never
   Recent days are remodeled for ~6 months, so re-pull later for final numbers with `--refresh`.
 - Release numbers without downloading (checked 1 Nov 2026): `.../get/releaseDate/<region>/<res>/<var>/<start>/<end>?json=true`
   returns rows [data date, release date, element, grid count = release, URL]; `.../get/gridCount/<region>/<var>/<date>`
-  returns one integer. These don't count toward the download limit. 30-year normals are NOT on the web service
-  (FTP or website only).
+  returns one integer. These don't count toward the download limit. 30-year normals are NOT on the web service:
+  `https://data.prism.oregonstate.edu/normals/<region>/<res>/<var>/<monthly|daily>/prism_<var>_<region>_<code>_2020MM[DD]_avg_30y.zip`
+  (1991–2020; ~58 MB monthly, ~67 MB daily at 800 m; anonymous FTP at prism.oregonstate.edu has the same tree).
 - Filenames use resolution codes: `30s` = 800m, `25m` = 4km, `15s` = 400m. Native CRS NAD83 (EPSG:4269), units mm.
 - A PRISM "day" ends at 12:00 UTC, so pad event windows by a day on each side.
 

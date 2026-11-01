@@ -54,7 +54,8 @@ gauges whose basins lie mostly outside the study basin are skipped; `--gauge` ru
 4. ~~**Rain/snow partition** (4)~~ — built 1 Nov 2026, with the SNOTEL check.
 5. ~~**Streamflow comparison** (1.2)~~ — built; ~~**uncertainty roll-up** (3.3)~~ — built 1 Nov 2026 without
    product spread; next **multi-product comparison** (1.3), which feeds 3.3.
-6. **Storm context** (6) and ~~**reports** (7)~~ (built 1 Nov 2026; maps and PDF still open).
+6. **Storm context** (6): ~~percent of normal (6.2)~~ built; return period (6.1) open. ~~**Reports** (7)~~ built
+   (maps and PDF still open).
 7. **Engineering** (8). Git, a first tag and a CI workflow are in place (CI runs once the repo has a GitHub
    remote); packaging and logging as the tool grows.
 
@@ -378,6 +379,8 @@ and still open in QGIS and xarray.
 ## 6. Storm context
 
 ### 6.1 Return period (precipitation frequency) — M
+> **Status: not started.** Needs NOAA Atlas 14/15 gridded frequency estimates (verify the current service and
+> whether Atlas 15 covers the region) and rolling 1–3-day sums; deliberately left for its own session.
 **Goal:** State how rare the storm was, for example "the 48-hour basin-average depth is about the
 25-year value".
 
@@ -391,6 +394,11 @@ for the basin average. Note the mismatch between PRISM days (fixed 12:00 UTC) an
 (any 24-hour period).
 
 ### 6.2 Percent of normal — S
+> **Status: built 1 Nov 2026** as `scripts/storm_context.py`. Normals are not on the data web service; they come
+> from `https://data.prism.oregonstate.edu/normals/<region>/<res>/ppt/<monthly|daily>/prism_ppt_<region>_<code>_2020MM[DD]_avg_30y.zip`
+> (1991–2020, `normals/9120`, version M4). Default prorates monthly normals over the window; `--daily-normals`
+> sums daily ones. Report tile and QGIS "Percent of normal" theme. San Juan Oct 20–27: 944% of normal for those
+> days, 244% of a normal October.
 **Goal:** Compare the storm with PRISM 30-year normals (1991–2020), for example "the event equals X% of
 normal October precipitation".
 

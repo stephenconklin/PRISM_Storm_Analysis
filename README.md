@@ -11,6 +11,7 @@ Commands:
 | `scripts/find_huc.py` | Looks up USGS watershed (HUC) codes by name |
 | `scripts/prism_watershed.py` | Downloads daily PRISM grids, clips them to a watershed, writes daily rasters, a summary CSV, an event-total raster, and a daily NetCDF cube |
 | `scripts/storm_total.py` | Reads the cube and reports depth and water volume for any date range, with optional depth and volume rasters / NetCDF |
+| `scripts/storm_context.py` | Compares the storm with PRISM's 1991–2020 normals (percent of normal, with an optional map) |
 | `scripts/subbasin_totals.py` | Storm depth and water volume for the whole basin and each subbasin (HUC10/HUC12), as map layers |
 | `scripts/validate_stations.py` | Compares PRISM with rain gauges (COOP, CoCoRaHS, airports, SNOTEL) in and around the basin; writes a styled GeoPackage for QGIS |
 | `scripts/validate_runoff.py` | Compares PRISM precipitation volume with streamflow at every USGS gauge in the basin (runoff ratio), flagging gauges regulated by dams |
@@ -64,6 +65,7 @@ python scripts/prism_watershed.py --huc <HUC> --start <YYYY-MM-DD> --end <YYYY-M
 python scripts/validate_stations.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD>
 python scripts/storm_total.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD>
 python scripts/subbasin_totals.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD>
+python scripts/storm_context.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD>
 python scripts/validate_runoff.py --out data/huc<HUC> --all-gauges --start <YYYY-MM-DD> --end <YYYY-MM-DD>
 python scripts/validate_snow.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD>
 python scripts/build_qgis_project.py --out data/huc<HUC>
@@ -147,6 +149,7 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 | `clipped/<var>_<res>_YYYYMMDD_clip.tif` | Each day clipped to the basin (mm for `ppt`), tagged with its PRISM release (`PRISM_DATASET_RELEASE_NUMBER`) |
 | `daily_basin_summary.csv` | Per day: PRISM release number, area-weighted basin mean and max (mm), basin mean (in). Covers every day in the folder; a run replaces its own days. Named `<var>_<res>_daily_basin_summary.csv` for other variables or 4 km |
 | `boundary.geojson` | With `--boundary`: the basin polygon, kept so later steps and the QGIS project find it |
+| `normals_zips/`, `normals/`, `ppt_<res>_normals_<start>_<end>.json` | From `storm_context.py`: cached PRISM normals and the percent-of-normal results |
 | `run_manifest.json` | One entry per run of `prism_watershed.py` or `storm_total.py`: command, versions, inputs, outputs with checksums, QC results |
 | `<var>_<res>_release_history.csv` | One row per day and PRISM release seen in this folder: basin mean and max (mm) and volume (m³) for `ppt`; mean, min and max for other variables; when recorded |
 | `<var>_<res>_total_<start>_<end>.tif` | Sum of the run's days per pixel (mm for `ppt`) |
@@ -330,6 +333,30 @@ Rain/snow:   rain 70.0 mm, 4.521 km³ (96.5%); snow 2.5 mm, 0.164 km³ (3.5%) [a
 
 Cell areas are computed on the NAD83 (GRS80) ellipsoid for each row of PRISM's native grid, so no
 reprojection or resampling is needed and volumes add up exactly.
+
+## `storm_context.py`: percent of normal
+
+```bash
+python scripts/storm_context.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD>
+python scripts/storm_context.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD> \
+    --pct-tif data/huc<HUC>/pct_of_normal.tif
+```
+```
+PRISM days 2026-10-20 to 2026-10-27: basin 72.6 mm vs a normal of 7.7 mm for these days (monthly normals prorated by days in the window): 944% of normal
+  = 244% of the normal October total (30 mm)
+```
+Compares the storm with PRISM's 1991–2020 normals over the same basin cells (area-weighted):
+- **Normal for these days:** each month's normal times the share of that month's days in the window
+  (October × 8/31 above), or with `--daily-normals` the sum of PRISM's daily normals for those dates.
+  Daily normals change smoothly within a month, so the two agree closely; daily ones are larger downloads.
+- **Month:** the storm as a share of each touched month's whole normal total.
+- **Map:** `--pct-tif` writes percent of normal per cell (name it with `normal` or `pct` so the QGIS
+  project maps it, with a diverging scale around 100% and a "Percent of normal" theme).
+
+Normals aren't on PRISM's data web service; they come from PRISM's file server
+(`data.prism.oregonstate.edu/normals/...`) and are cached in `normals_zips/` (a monthly 800 m normal is
+about 58 MB, a daily one about 67 MB; 4 km ones are about 2.5 MB). Writes
+`ppt_<res>_normals_<start>_<end>.json`, which `report.py` shows as a headline tile.
 
 ## `subbasin_totals.py`: storm volume for the basin and each subbasin
 ```bash
@@ -753,7 +780,7 @@ has a data table under each chart.
 
 | Section | Shows | Needs (same window) |
 |---|---|---|
-| Headline tiles | Storm volume with its range, basin mean and max, PRISM releases, snow share, QC status | `storm_total.py` (range), `tmean` (snow) |
+| Headline tiles | Storm volume with its range, basin mean and max, PRISM releases, percent of normal, snow share, QC status | `storm_total.py` (range), `storm_context.py` (normal), `tmean` (snow) |
 | Storm timeline | Basin precipitation per PRISM day (rain and snow) above 15-minute discharge at the chosen gauges, event runoff shaded above the baseflow line | `validate_runoff.py` for the gauges |
 | PRISM vs rain gauges | Storm totals, PRISM vs gauge, with a 1:1 line; PRISM inputs and independent gauges marked; bias, r and RMSE | `validate_stations.py` |
 | Where the water went | Runoff ratio range per gauge, largest basin first, colored by regulation, with the rain-only ratio | `validate_runoff.py` |

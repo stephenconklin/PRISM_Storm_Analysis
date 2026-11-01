@@ -549,6 +549,14 @@ def main():
              ("Basin mean", f"{basin['mean_mm']:.1f} mm", f"max {basin['max_mm']:.0f} mm in one cell"),
              ("PRISM releases", ", ".join(f"r{r}" for r in rel if r) or "unknown",
               "final" if rel and min(rel) >= 8 else "not final: revised for ~6 months")]
+    norm_path = out / f"ppt_{a.res}_normals_{span}.json"
+    if norm_path.exists():
+        nj = json.loads(norm_path.read_text())
+        if nj.get("percent_of_normal") is not None:
+            months = "; ".join(f"{m['storm_pct_of_month']:.0f}% of a normal {m['month']}" for m in nj["months"]
+                               if m.get("storm_pct_of_month") is not None)
+            tiles.append(("Vs. 1991–2020 normal", f"{nj['percent_of_normal']:,.0f}%",
+                          f"of normal for these days ({nj['window_normal_mm']:.1f} mm); {months}"))
     if basin["rain"] is not None:
         snow = sum(basin["snow"]) / max(sum(basin["ppt"]), 1e-9) * 100
         tiles.append(("Snow share", f"{snow:.1f}%", "of precipitation (0–3 °C ramp)"))

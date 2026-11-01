@@ -99,11 +99,14 @@ def diff_breaks(abs_diffs):
 
 
 def tif_kind(stem):
-    """What a GeoTIFF in the folder holds, from the words in its name: 'volume', 'rain', 'snow', 'depth',
+    """What a GeoTIFF in the folder holds, from the words in its name: 'volume', 'percent' (of normal), 'rain',
+    'snow', 'depth',
     or None for anything else (a DEM, hillshade, ...), which is not mapped."""
     words = set(re.split(r"[^a-z0-9]+", stem.lower()))
     if words & {"volume", "m3"}:
         return "volume"
+    if "normal" in words or "pct" in words:
+        return "percent"
     if "snow" in words:
         return "snow"
     if "rain" in words:
@@ -390,6 +393,19 @@ def _build_project(a):
         renderer = QgsSingleBandPseudoColorRenderer(lyr.dataProvider(), 1, shader)
         lyr.setRenderer(renderer)
 
+    def percent_renderer(lyr, vmax):
+        """Diverging classes around 100% of normal: brown below, teal above (DIFF_COLORS, low to high)."""
+        edges = [50, 80, 120, 200, 400, max(800, nice_round(vmax))]
+        labels = ["< 50%", "50–80%", "80–120% (near normal)", "120–200%", "200–400%", f"400–{edges[-1]:g}%"]
+        colors = [DIFF_COLORS[0], DIFF_COLORS[1], DIFF_COLORS[3], DIFF_COLORS[4], DIFF_COLORS[5], DIFF_COLORS[6]]
+        items = [QgsColorRampShader.ColorRampItem(e, QColor(c), lab) for e, c, lab in zip(edges, colors, labels)]
+        fn = QgsColorRampShader(0, edges[-1])
+        fn.setColorRampType(Qgis.ShaderInterpolationMethod.Discrete)
+        fn.setColorRampItemList(items)
+        shader = QgsRasterShader()
+        shader.setRasterShaderFunction(fn)
+        lyr.setRenderer(QgsSingleBandPseudoColorRenderer(lyr.dataProvider(), 1, shader))
+
     rel_note = ("PRISM releases: " + ", ".join(f"{day_label(d)} r{rel[d]}" for d in days if rel.get(d))) if rel else ""
     totals = [QgsRasterLayer(str(p), p.stem) for p in f["totals"]]
     tranges = [raster_minmax(p) for p in f["totals"]]
@@ -416,6 +432,13 @@ def _build_project(a):
             print(f"Not mapped (name doesn't say what it holds): {p.name}")
             continue
         lyr = QgsRasterLayer(str(p), p.stem)
+        if kind == "percent":
+            lyr.setName(f"Percent of 1991–2020 normal: {p.stem}")
+            percent_renderer(lyr, raster_minmax(p)[1])
+            tag(lyr, "percent_normal", "Storm total as a percent of PRISM's 1991-2020 normal for the same days "
+                                       "(storm_context.py --pct-tif).")
+            add(lyr, g_tot, visible=False)
+            continue
         if kind in ("rain", "snow"):
             label = "Rain depth (mm)" if kind == "rain" else "Snow-water (mm)"
             lyr.setName(f"{label}: {p.stem}")
@@ -716,6 +739,7 @@ def _build_project(a):
           {g_val, g_bnd, g_base})
     theme("Volume by subbasin", {"subbasin_totals", "study_basin", "basemap"}, {g_tot, g_bnd, g_base})
     theme("Rain and snow", {"rain", "snow", "snotel", "study_basin", "basemap"}, {g_tot, g_val, g_bnd, g_base})
+    theme("Percent of normal", {"percent_normal", "study_basin", "basemap"}, {g_tot, g_bnd, g_base})
     theme("Daily animation (Temporal Controller)", {"daily_precip", "station_days", "study_basin", "basemap"},
           {g_day, g_val, g_bnd, g_base})
     for lyr in managed:

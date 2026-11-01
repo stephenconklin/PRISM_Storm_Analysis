@@ -71,6 +71,7 @@ def test_tif_kind():
     assert tif_kind("volume_m3") == "volume" and tif_kind("ppt_800m_volume_m3_20261020_20261027") == "volume"
     assert tif_kind("rain_mm_20261020_20261027") == "rain" and tif_kind("snow_mm_20261020_20261027") == "snow"
     assert tif_kind("depth_mm") == "depth"
+    assert tif_kind("pct_of_normal_20261020_20261027") == "percent"
 
 
 def test_volume_range_km3(tmp_path):
