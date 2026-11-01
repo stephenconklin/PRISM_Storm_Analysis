@@ -13,8 +13,9 @@ Commands:
 | `scripts/storm_total.py` | Reads the cube and reports depth and water volume for any date range, with optional depth and volume rasters / NetCDF |
 | `scripts/subbasin_totals.py` | Storm depth and water volume for the whole basin and each subbasin (HUC10/HUC12), as map layers |
 | `scripts/validate_stations.py` | Compares PRISM with rain gauges (COOP, CoCoRaHS, airports, SNOTEL) in and around the basin; writes a styled GeoPackage for QGIS |
-| `scripts/build_qgis_project.py` | Builds an organized, styled QGIS project from a folder's outputs |
 | `scripts/validate_runoff.py` | Compares PRISM precipitation volume with streamflow at every USGS gauge in the basin (runoff ratio), flagging gauges regulated by dams |
+| `scripts/validate_snow.py` | Checks the rain/snow split against snow-water gained at SNOTEL stations |
+| `scripts/build_qgis_project.py` | Builds an organized, styled QGIS project from a folder's outputs (run last) |
 
 ## Setup
 
@@ -53,6 +54,18 @@ python scripts/prism_watershed.py --huc <HUC> --start <YYYY-MM-DD> --end <YYYY-M
 
 # 3. Total rainfall and water volume for any window inside it
 python scripts/storm_total.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD>
+```
+Optional, in this order (each reads what the earlier steps wrote; use the same dates):
+```bash
+# daily mean temperature, for the rain/snow split and rain-only runoff ratios
+python scripts/prism_watershed.py --huc <HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD> --var tmean
+# gauges first, so storm_total.py's uncertainty includes the gauge comparison
+python scripts/validate_stations.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD>
+python scripts/storm_total.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD>
+python scripts/subbasin_totals.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD>
+python scripts/validate_runoff.py --out data/huc<HUC> --all-gauges --start <YYYY-MM-DD> --end <YYYY-MM-DD>
+python scripts/validate_snow.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD>
+python scripts/build_qgis_project.py --out data/huc<HUC>
 ```
 
 ## Choosing a watershed
@@ -130,9 +143,10 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 | `extracted/` | Unzipped PRISM files, including each day's `info.txt` metadata |
 | `wbd_huc<code>.geojson` | Cached basin boundary from USGS WBD (with `--huc`) |
 | `clipped/<var>_<res>_YYYYMMDD_clip.tif` | Each day clipped to the basin (mm for `ppt`), tagged with its PRISM release (`PRISM_DATASET_RELEASE_NUMBER`) |
-| `daily_basin_summary.csv` | Per day: PRISM release number, basin mean and max (mm), basin mean (in). Covers every day in the folder; a run replaces its own days |
+| `daily_basin_summary.csv` | Per day: PRISM release number, area-weighted basin mean and max (mm), basin mean (in). Covers every day in the folder; a run replaces its own days. Named `<var>_<res>_daily_basin_summary.csv` for other variables or 4 km |
+| `boundary.geojson` | With `--boundary`: the basin polygon, kept so later steps and the QGIS project find it |
 | `run_manifest.json` | One entry per run of `prism_watershed.py` or `storm_total.py`: command, versions, inputs, outputs with checksums, QC results |
-| `<var>_<res>_release_history.csv` | One row per day and PRISM release seen in this folder: basin mean and max (mm), basin volume (m³), when recorded |
+| `<var>_<res>_release_history.csv` | One row per day and PRISM release seen in this folder: basin mean and max (mm) and volume (m³) for `ppt`; mean, min and max for other variables; when recorded |
 | `<var>_<res>_total_<start>_<end>.tif` | Sum of the run's days per pixel (mm for `ppt`) |
 | `<var>_<res>_daily_clip.nc` | NetCDF cube: every clipped day in the folder on a time axis (`<var>`, mm) plus `cell_area` (m²) and `release` (PRISM release per day; 0 unknown). Rebuilt on each run, so new days are added automatically |
 
@@ -141,35 +155,37 @@ outside the basin.
 
 ### QC checks and run manifest
 
-Each run of `prism_watershed.py` and `storm_total.py` ends with a QC block, for example:
+Each run of `prism_watershed.py` and `storm_total.py` ends with a QC block, for example (San Juan,
+PRISM days Oct 20–27):
 
 ```
 QC: WARN
-  PASS  completeness         all 12 days present
-  PASS  download_integrity   12 zips open; SHA-256 recorded
-  PASS  grid_consistency     12 days on one grid (292 x 518 cells)
+  PASS  completeness         all 8 days present
+  PASS  download_integrity   8 zips open; SHA-256 recorded
+  PASS  grid_consistency     8 days on one grid (292 x 518 cells)
   PASS  nodata_inside        no nodata inside the basin
   PASS  physical_limits      no negatives; largest daily cell 101.7 mm (limit 400)
-  PASS  totals_reconcile     cube sum = event-total raster agree
-  WARN  release_mix          12 days at release 1-2 (PRISM revises them within weeks); mixed releases r1, r2
-  PASS  station_density      116 stations in the basin or within 10 km of it on 2026-10-30 (1.80 per 1,000 km²; warn below 0.5)
+  PASS  totals_reconcile     daily clip volumes = cube volumes agree
+  WARN  release_mix          8 days at release 1-2 (PRISM revises them within weeks)
+  PASS  station_density      137 stations in the basin or within 10 km of it on 2026-10-21 (2.12 per 1,000 km²; warn below 0.5)
   PASS  boundary_agreement   grid 64,558.0 km² vs polygon 64,569.1 km² (-0.02%; warn beyond 1%)
 ```
 
 | Check | Fails or warns when |
 |---|---|
 | `completeness` | A requested day was not downloaded or is not in the cube (fail) |
-| `download_integrity` | A download returned no zip (PRISM's message is quoted) or a zip is corrupt (fail). A corrupt cached zip is renamed `.bad` so the next run downloads it again |
+| `download_integrity` | A download returned no zip (PRISM's message is quoted), a request failed, or a zip is corrupt (fail). A corrupt cached zip is renamed `.bad` so the next run downloads it again. A failed `--refresh` is recorded in the manifest (`refresh_error`) but doesn't fail the check, since the cached zip is used |
 | `grid_consistency` | Days differ in transform, shape or CRS (fail) |
-| `nodata_inside` | Basin cells lack data on some days only: above 0 (warn) or 1% (fail). A gap that is the same every day, such as the part of a basin in Canada, is a warning |
+| `nodata_inside` | Basin cells lack data on some days only: above 0 (warn) or 1% (fail). A gap that is the same every day, such as the part of a basin in Canada or beyond PRISM's grid, warns above 0.5% of the basin |
 | `physical_limits` | Negative precipitation (fail) or a daily cell above `--qc-max-daily-mm` (warn). `ppt` only |
-| `totals_reconcile` | The cube's sum differs from the event-total raster; in `storm_total.py`, the volume raster or the national-grid volume differs from the reported volume (fail) |
+| `totals_reconcile` | The volumes computed from each day's clip differ from the cube's, read back; in `storm_total.py`, the volume raster, the national-grid volume by cell center, or rain + snow differ from the reported volume (fail) |
 | `release_mix` | The window has release 1–2 days, unknown releases, or a mix of releases (warn) |
 | `station_density` | Fewer than `--qc-min-stations` PRISM input stations (from each day's `stn.csv`) per 1,000 km² in the basin plus `--qc-station-buffer-km` (warn) |
 | `boundary_agreement` | The area of the cells counted as the basin differs from the polygon's ellipsoidal area by more than 1% (warn) |
 
-`storm_total.py` runs the checks that apply to a window (no completeness, download or grid checks,
-since the cube is one grid and missing days are already an error). `--qc-strict` turns warnings into
+`storm_total.py` runs the checks that apply to a window: `nodata_inside`, `physical_limits`,
+`totals_reconcile`, `release_mix` and `boundary_agreement` (the cube is one grid, missing days are
+already an error, and station density comes from the zips). `--qc-strict` turns warnings into
 failures. If any check fails, the script still writes its outputs, then exits with status 1.
 
 `run_manifest.json` keeps one entry per run, so a folder refreshed over months keeps its whole history.
@@ -196,17 +212,18 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 - A newer release **replaces** the day in `clipped/`, the cube and the summary CSV, so all later steps
   use the newest data. Event-total rasters from other windows that include a revised day are listed as
   out of date, with the command to update them. The superseded zip moves to `raw_zips/releases/`, and the old and new basin
-  mean and volume stay in `<var>_<res>_release_history.csv`. The run prints each revised day, for
-  as `<date>: release <old> -> <new>: <old> -> <new> mm, <old> -> <new> m³ (<change>%)`.
+  mean and volume stay in `<var>_<res>_release_history.csv`. The run prints each revised day as
+  `<date>: release <old> -> <new>: <old> -> <new> mm, <old> -> <new> m³ (<change>%)`.
 - `storm_total.py` lists each day's release in its report, notes days that are not final, and reports
   how much the window volume has changed since the first releases recorded.
 - First real refresh (San Juan, 1 Nov 2026): Oct 26–27 went from release 1 to 2, Oct 26's basin volume
   fell 18.9%, and the Oct 20–27 window volume fell 0.7% (4.719 to 4.685 km³).
-- Rerun the later steps after a refresh: `storm_total.py` outputs, `subbasin_totals.py`,
-  `validate_stations.py`, `validate_runoff.py` and `validate_snow.py`. `validate_runoff.py` notices the new releases and
-  recomputes each saved gauge's precipitation and runoff ratio from the saved basin and flow, with no
-  new requests per gauge. Run `build_qgis_project.py` again to update the release numbers in the layer
-  metadata.
+- `tmean` has its own releases: refresh it too (`--var tmean --refresh`) if you use the rain/snow split.
+- Then rerun the later steps in this order, for the same window: `validate_stations.py`, then
+  `storm_total.py` (its uncertainty reads the station comparison), then `subbasin_totals.py`,
+  `validate_runoff.py` and `validate_snow.py`, and last `build_qgis_project.py` (its basin label reads
+  the uncertainty). `validate_runoff.py` notices the new releases and recomputes each saved gauge's
+  precipitation and runoff ratio from the saved basin and flow, with no new requests per gauge.
 
 ## `storm_total.py`: depth and water volume for any date range
 
@@ -214,8 +231,10 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 python scripts/storm_total.py --out data/huc14080104                                  # whole cube
 python scripts/storm_total.py --out data/huc14080104 --start 2026-10-22 --end 2026-10-23
 python scripts/storm_total.py --out data/huc14080104 --start 2026-10-20 --end 2026-10-27 \
-    --tif depth_mm.tif --volume-tif volume_m3.tif --volume-nc volume_m3.nc
+    --tif data/huc14080104/depth_mm.tif --volume-tif data/huc14080104/volume_m3.tif --volume-nc volume_m3.nc
 ```
+Output paths are relative to where you run the command. Put rasters in the `--out` folder, named for what
+they hold (`depth`, `volume`/`m3`, `rain`, `snow`), so `build_qgis_project.py` finds and styles them.
 
 | Flag | Default | Notes |
 |---|---|---|
@@ -225,22 +244,35 @@ python scripts/storm_total.py --out data/huc14080104 --start 2026-10-20 --end 20
 | `--tif` | — | Write total depth per pixel (mm) to this GeoTIFF |
 | `--volume-tif` | — | Write water volume per pixel (m³ = depth × cell area) to this GeoTIFF; its sum is the basin volume |
 | `--volume-nc` | — | Write a NetCDF with `volume` (m³ per pixel per day), `volume_total` (window total), and `cell_area` |
-| `--boundary` | the `wbd_huc*.geojson` in `--out` | Basin polygon for the boundary check (needed for `--boundary` runs) |
+| `--boundary` | the `wbd_huc*.geojson` (or `boundary.geojson`) in `--out` | Basin polygon for the boundary check |
 | `--ramp-alternatives` | `-1,3 1,1` | Other rain/snow ramps (°C pairs) for the rain volume range |
+| `--all-snow-c` / `--all-rain-c` | `0` / `3` | Rain/snow ramp (see Rain and snow) |
+| `--rain-tif` / `--snow-tif` / `--rain-snow-nc` | — | Rain/snow outputs (see Rain and snow) |
+| `--qc-strict` | off | Treat QC warnings as failures |
+| `--qc-max-daily-mm` | `400` | Flag a daily cell above this much precipitation |
 
 It prints the basin area, area-weighted mean depth, max depth, and the total water volume in m³, km³
-and acre-feet, then each day's PRISM release, the revision change and the boundary check, for example:
+and acre-feet, then each day's PRISM release, the revision change, the rain/snow split (with a `tmean`
+cube), the boundary check, the uncertainty and a QC block. San Juan, PRISM days Oct 20–27, after the
+Oct 26–27 refresh to release 2:
 
 ```
 PRISM days 2026-10-20 to 2026-10-27 (8 days; each ends 12:00 UTC on its date)
 Basin area:  64,558 km²
-Mean depth:  73.1 mm (2.88 in)
-Max depth:   254.3 mm (10.01 in)
-Volume:      4.719e+09 m³ = 4.719 km³ = 3,825,561 acre-ft
-Releases:    r2 Oct 20-Oct 25, r1 Oct 26-Oct 27
+Mean depth:  72.6 mm (2.86 in)
+Max depth:   228.5 mm (9.00 in)
+Volume:      4.685e+09 m³ = 4.685 km³ = 3,797,849 acre-ft
+Releases:    r2 Oct 20-Oct 27
              Release 8 is final; earlier releases change for about 6 months. To pick up revisions, re-run prism_watershed.py with --refresh.
-Revisions:   none recorded yet for these days (ppt_800m_release_history.csv)
-Boundary:    cell centers 4.7188 km³, area-weighted 4.7194, any cell touched 4.7993 (range 1.71% of area-weighted)
+Revisions:   window volume -0.7% since the first releases recorded (4.719e+09 -> 4.685e+09 m³); revised: Oct 26 r1->r2, Oct 27 r1->r2
+Rain/snow:   rain 70.0 mm, 4.521 km³ (96.5%); snow 2.5 mm, 0.164 km³ (3.5%) [all snow at or below 0 °C, all rain at or above 3 °C, daily mean temperature]
+Boundary:    cell centers 4.6846 km³, area-weighted 4.6852, any cell touched 4.7634 (range 1.68% of area-weighted)
+Uncertainty: 4.685 km³, range 4.625-4.916 km³ (-1.3% to +4.9%; components added, see docs/UNCERTAINTY.md)
+  gauges     -0.5% to +4.2%   all gauges (n=88) PRISM -4.0% -> volume +4.2%; independent gauges (n=7) PRISM +0.5% -> volume -0.5%. ...
+  boundary   +0.0% to +0.0%   area-weighted +0.01% (any cell touched +1.68%, not used: it counts land outside the basin)
+  revisions  -0.7% to +0.7%   window volume changed -0.72% from first recorded to latest releases; 8 of 8 days not final (release 2), ...
+  products   not assessed     comparison with other precipitation products (roadmap 1.3) not built
+  rain       4.521-4.573 km³ across ramps 0,3 (used) and -1,3, 1,1 °C; shifts water between rain and snow, not the total
 ```
 
 - **Uncertainty:** the volume with a bounding range and its components: gauge comparison
@@ -252,7 +284,7 @@ Boundary:    cell centers 4.7188 km³, area-weighted 4.7194, any cell touched 4.
   4.625–4.916 km³ (−1.3% to +4.9%).
 - **Revisions:** from `ppt_<res>_release_history.csv`, the change in window volume from each day's
   first recorded release to its latest, and which days were revised (for example
-  `window volume +2.3% since the first releases recorded (...); revised: Oct 26 r1->r2`). This is how
+  `window volume -0.7% since the first releases recorded (...); revised: Oct 26 r1->r2, Oct 27 r1->r2`). This is how
   much PRISM's revisions have moved the total so far, one part of its uncertainty.
 - **Boundary:** the window volume counted three ways from the national grids in `extracted/`: cells
   whose centers fall in the basin (the rule the cube and every other total use), every cell weighted by
@@ -268,10 +300,10 @@ days and folder, then rerun `storm_total.py`:
 ```bash
 python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27 --out /path/to/My_Basin --var tmean
 python scripts/storm_total.py --out /path/to/My_Basin --start 2026-10-20 --end 2026-10-27 \
-    --rain-tif rain_mm.tif --snow-tif snow_mm.tif --rain-snow-nc rain_snow.nc
+    --rain-tif /path/to/My_Basin/rain_mm.tif --snow-tif /path/to/My_Basin/snow_mm.tif --rain-snow-nc rain_snow.nc
 ```
 ```
-Rain/snow:   rain 70.3 mm, 4.541 km³ (96.2%); snow 2.8 mm, 0.178 km³ (3.8%) [all snow at or below 0 °C, all rain at or above 3 °C, daily mean temperature]
+Rain/snow:   rain 70.0 mm, 4.521 km³ (96.5%); snow 2.5 mm, 0.164 km³ (3.5%) [all snow at or below 0 °C, all rain at or above 3 °C, daily mean temperature]
 ```
 
 | Flag | Default | Notes |
@@ -287,8 +319,8 @@ Rain/snow:   rain 70.3 mm, 4.541 km³ (96.2%); snow 2.8 mm, 0.178 km³ (3.8%) [a
   precipitation. A daily mean is a rough guide to the temperature when precipitation fell: a warm
   afternoon shower on a day with a cold night can be classed as snow, and the reverse. Try other
   thresholds (for example `--all-snow-c -1 --all-rain-c 3`, or `1` and `1`) to see how sensitive the
-  split is. For the San Juan, Oct 20–27, snow was 3.8% of the basin's precipitation by default, 2.6% with
-  a single 1 °C threshold and 3.1% with a −1 to 3 °C ramp.
+  split is. For the San Juan, Oct 20–27, snow was 3.5% of the basin's precipitation by default, 2.4% with
+  a single 1 °C threshold and 2.8% with a −1 to 3 °C ramp.
 - Without a `tmean` cube the report says the split was skipped and how to enable it.
 
 Cell areas are computed on the NAD83 (GRS80) ellipsoid for each row of PRISM's native grid, so no
@@ -309,7 +341,7 @@ Puts the storm's water volume on the map. Writes `<out>/totals.gpkg` with two la
 
 - **Subbasin level:** `--digits`, or by default the first level below the study basin with at least
   20 units: HUC10 in a HUC4 (117 in the San Juan), HUC12 in a HUC8 (57 in the Upper Skagit).
-  With `--boundary` (no HUC), WBD units at least half inside the boundary are used.
+  With `--boundary` (no HUC), HUC12 units (unless `--digits`) at least half inside the boundary are used.
 - **Same numbers as `storm_total.py`:** cells count when their centers fall in a unit, using the same
   ellipsoidal cell areas, so subbasin volumes add up to the basin total (100.0% for the San Juan).
 - **Coverage:** cells without PRISM data (for example in Canada) are left out of depth and volume and
@@ -317,12 +349,12 @@ Puts the storm's water volume on the map. Writes `<out>/totals.gpkg` with two la
 
 Example (San Juan, PRISM days Oct 20–27):
 ```
-Basin: 64,558 km² with PRISM data (100.0% coverage), mean 73.1 mm, max 254.3 mm, 4.719 km³ = 3,825,561 acre-ft
+Basin: 64,558 km² with PRISM data (100.0% coverage), mean 72.6 mm, max 228.5 mm, 4.685 km³ = 3,797,849 acre-ft
 117 HUC10 subbasins; their volumes add up to 100.0% of the basin total
 Largest by volume:
-    1. Navajo River                                  779 km²   173.7 mm     109,633 acre-ft    2.9%
-    2. La Jara Creek                                 749 km²   124.2 mm      75,466 acre-ft    2.0%
-    3. Pagosa Springs-San Juan River                 536 km²   159.6 mm      69,334 acre-ft    1.8%
+    1. Navajo River                                  779 km²   170.4 mm     107,565 acre-ft    2.8%
+    2. La Jara Creek                                 749 km²   122.5 mm      74,395 acre-ft    2.0%
+    3. Pagosa Springs-San Juan River                 536 km²   157.7 mm      68,480 acre-ft    1.8%
 ```
 
 ## Validation against observations
@@ -339,6 +371,8 @@ python scripts/validate_stations.py --out data/huc<HUC> --start <YYYY-MM-DD> --e
 - **Day matching:** gauges report 24-hour totals ending at their observation hour (CoCoRaHS ~7 AM,
   SNOTEL and airports midnight). Each is matched to the PRISM day whose 12:00 UTC end is closest;
   days more than `--max-offset` hours apart (default 6) are kept but left out of the statistics.
+  Midnight observers are 5 hours from 12:00 UTC in Mountain time but 7 in Eastern time, so in Eastern
+  time they drop out of the statistics unless you raise `--max-offset`.
 - **In-sample flag:** gauges within `--match-km` (default 0.5) of a station PRISM used that day
   (from the zip's `*.stn.csv`) are marked `in_sample`. PRISM was fitted to those, so their agreement
   is optimistic; `independent` gauges are the fairer test.
@@ -400,7 +434,7 @@ python scripts/validate_runoff.py --out data/huc<HUC> --gauge <site> [<site> ...
 ### `validate_snow.py`: snow at SNOTEL stations
 
 Checks the rain/snow split (see Rain and snow) against snow-water equivalent measured at SNOTEL
-stations. Needs `ppt` and `tmean` runs over the window in the folder.
+stations. Needs a `ppt` run over the window in the folder; without a `tmean` run, the PRISM split is skipped.
 
 ```bash
 python scripts/validate_snow.py --out data/huc<HUC>
@@ -481,7 +515,7 @@ G the gauge value, n the number of pairs.
   whole window against PRISM's total at that cell. This is the main test: totals are what volumes are
   built from, and day-boundary timing differences mostly cancel out.
 - **Daily values** (`daily`, the `station_days` layer): each day separately. Expect these to look
-  worse than storm totals. A gauge read at 7 AM and a PRISM day ending at 5 AM split a storm's rain
+  worse than storm totals. A gauge read at 7 AM and a PRISM day ending at 5–8 AM (by time zone) split a storm's rain
   across days differently, so heavy days produce large daily differences that net out over the storm.
 
 **Groups:**
@@ -561,19 +595,21 @@ is weaker, as expected from the day-boundary offsets. 46 stations had gaps and w
 Example (`--all-gauges` on the San Juan, excerpt):
 ```
 47 gauges with 15-minute discharge in the study area's bounding box; 144 NID dams in the study basin
-  09342500 SAN JUAN RIVER AT PAGOSA SPRINGS, CO            727 km²   182.1 mm  ratio 0.34–0.40 (rain-only 0.42–0.50, 20% snow)  unregulated (0.2 mm storage, 0% of precip)
-  09355500 SAN JUAN RIVER NEAR ARCHULETA, NM             8,379 km²   139.6 mm  ratio 0.01–0.01 (rain-only 0.01–0.01, 8% snow)  regulated (274.3 mm storage, 196% of precip)
-  09358000 ANIMAS RIVER AT SILVERTON, CO.                  182 km²   139.9 mm  ratio 0.26–0.29 (rain-only 1.06–1.17, 76% snow)  minor (1.1 mm storage, 1% of precip)
-  09361500 ANIMAS RIVER AT DURANGO, CO                   1,765 km²   126.8 mm  ratio 0.26–0.30 (rain-only 0.39–0.44, 33% snow)  regulated (16.8 mm storage, 13% of precip)
+  09342500 SAN JUAN RIVER AT PAGOSA SPRINGS, CO            727 km²   174.9 mm  ratio 0.35–0.42 (rain-only 0.43–0.50, 17% snow)  unregulated (0.2 mm storage, 0% of precip)
+  09355500 SAN JUAN RIVER NEAR ARCHULETA, NM             8,379 km²   137.1 mm  ratio 0.01–0.01 (rain-only 0.01–0.01, 7% snow)  regulated (274.3 mm storage, 200% of precip)
+  09358000 ANIMAS RIVER AT SILVERTON, CO.                  182 km²   136.3 mm  ratio 0.27–0.29 (rain-only 1.06–1.17, 75% snow)  minor (1.1 mm storage, 1% of precip)
+  09361500 ANIMAS RIVER AT DURANGO, CO                   1,765 km²   124.7 mm  ratio 0.26–0.30 (rain-only 0.39–0.45, 32% snow)  regulated (16.8 mm storage, 13% of precip)
   09365000 skipped: discharge gap of 50.2 h (limit 12 h)
 PRISM days 2026-10-20 to 2026-10-27: 29 gauges compared {'regulated': 13, 'unregulated': 12, 'minor': 4}; 10 skipped (reasons in runoff_summary.csv)
 ```
-Read as: at Pagosa Springs (unregulated, a clean PRISM check) about a third of the storm's 182 mm had
-passed the gauge by the end of the record, which ended at the time of the run (Oct 31) before the full
-recession, and 20% of the basin's precipitation was snow by the default split, so the true ratio is
-likely between 0.34 and 0.50. At Silverton, 76% of the precipitation is classed as snow, and the rain-only
-ratio above 1 says either part of it fell as rain or rain melted earlier snow. Below Navajo Dam
-(Archuleta), reservoir storage is twice the storm and the ratio is ~0: the dam held the flood. Durango is
+(Release-2 precipitation; flow recorded to Oct 31, before the end of the 7-day recession window, which
+later runs fill in.) Read as: at Pagosa Springs (unregulated, a clean PRISM check) about a third of the
+storm's 175 mm had passed the gauge by the end of the record, and 17% of the basin's precipitation was
+snow by the default split, so the true ratio is likely between 0.35 and 0.50. At Silverton, 75% of the
+precipitation is classed as snow, and the rain-only ratio above 1 says part of it fell as rain or rain
+melted earlier snow; `validate_snow.py` finds the split runs about twice the observed snow near
+Silverton. Below Navajo Dam (Archuleta), reservoir storage is twice the storm and the ratio is ~0: the
+dam held the flood. Durango is
 labeled regulated, but storage is only 13% of the storm and its ratio matches the unregulated Animas
 gauges upstream. Farmington's record has a 50-hour gap during the flood, so it is skipped. Each gauge's
 `runoff_<site>.json` has the full detail: the three basin areas, daily precipitation, flow volumes,
@@ -638,8 +674,12 @@ peak time, interpolated hours and approval status.
 | ratio_low, ratio_high | Runoff ratio range, low to high |
 | ratio_line, ratio_const | Runoff ratio with each baseline (the line baseline gives the lower value unless flow was falling at the start of the window) |
 | peak_cfs, peak_utc | Peak 15-minute discharge and its time |
-| interp_h | Hours of discharge interpolated |
+| rain_mm, snow_pct | With `tmean`: basin rain depth and the share of precipitation classed as snow |
+| rain_ratio_low, rain_ratio_high | With `tmean`: runoff ÷ rain volume (empty when all of it was snow) |
+| interp_h | Hours of the 15-minute grid with no reading within 7.5 minutes (an hourly gauge shows 3 of every 4 steps) |
 | flow_end_utc | End of the flow record used (earlier than requested if the run came before `--after-days` had passed) |
+| flow_complete | False when the flow record ends before the requested window does; later runs refetch it once more flow exists |
+| lon, lat | Gauge location |
 
 **`status` values for gauges:**
 | Status | Meaning |
@@ -649,7 +689,9 @@ peak time, interpolated hours and approval status.
 | No discharge values in the flow window | USGS returned no readings for the window |
 | gauge basin lies mostly outside the study basin | Less than half of the gauge's drainage basin is in the study basin (a gauge just over the divide) |
 | N% of the gauge basin is outside PRISM coverage | Part of the gauge basin is in Canada or Mexico (more than `--max-missing-pct`) |
-| no NLDI basin / request failed | A USGS service error; rerun later |
+| no NLDI basin | NLDI has no basin for the site (saved; a request that fails is not saved and is retried next run) |
+| request failed | A USGS service error; rerun later |
+| no precipitation over the gauge basin in the window | Nothing to compare runoff with (a dry window) |
 | site type is …, not a stream | A canal, ditch or other non-stream site |
 
 **`dams`** (NID dams in the study basin): `nidid`, `name`, `river`, `normal_storage_af`,
@@ -657,7 +699,13 @@ peak time, interpolated hours and approval status.
 
 **`totals.gpkg` › `basin_total`** (one row): `name`, `huc`, `prism_start`, `prism_end`, `area_km2` (with
 PRISM data), `basin_cells_km2` (all cells in the basin), `coverage_pct`, `mean_mm`, `max_mm`, `volume_m3`,
-`volume_km3`, `volume_acre_ft`, `subbasin_level`, `subbasins`.
+`volume_km3`, `volume_acre_ft`, `subbasin_level`, `subbasins`, `res` (cube resolution).
+
+**`snotel.csv` / `snotel` layer** (one row per SNOTEL station): `triplet`, `name`, `elevation_m`,
+`inside_basin`, `lon`, `lat`, `status` (`ok` or why skipped), `precip_mm` (station), `prism_precip_mm`
+(at the station's cell), `swe_before_mm`, `swe_gain_mm` (peak in the window minus before), `swe_net_mm`
+(end minus before), `station_split_snow_mm`, `prism_snow_mm`, `observed_snow_pct`,
+`station_split_snow_pct`, `prism_snow_pct`, `station_mean_tavg_c`.
 
 **`totals.gpkg` › `subbasins`** (one row per unit; also `subbasin_totals.csv`): `huc`, `level` (e.g.
 HUC10), `name`, `states`, `area_km2` (with PRISM data), `coverage_pct`, `mean_mm`, `max_mm`, `volume_m3`,
@@ -695,6 +743,9 @@ Finds the outputs in `--out` by their standard names and writes a styled, organi
 - **Colors:** daily rasters share one scale and storm totals another, with round-number classes spread
   on a log scale from the data's minimum to its maximum; areas below the first class are transparent. Station difference classes are also
   set from the data, so small storms aren't all one color.
+- **One event total shown:** the one for the subbasin totals' window (else the longest); other event
+  totals are added switched off. Only one resolution is mapped (800 m if present), only precipitation
+  (not `tmean`), and only tifs whose names say what they hold (`depth`, `volume`/`m3`, `rain`, `snow`).
 - **Map themes:** Storm total; Validation (rain gauges and river gauges over the storm total); Rivers and
   dams (gauges, their drainage basins and dams); Volume by subbasin; Rain and snow (rain and snow-water
   rasters with the SNOTEL comparison); Daily animation (Temporal Controller). Pick one from the
@@ -819,9 +870,11 @@ gauges, terrain and climate patterns. Everything else on the map is there to che
 - Attributes include all three shares (`observed_snow_pct`, `station_split_snow_pct`, `prism_snow_pct`).
 
 ### Total volume: study basin label and subbasins
-- **The study basin label** gives the storm's headline numbers, for example *"San Juan: 4.72 km³ = 3.83
-  million acre-ft; mean 73 mm, max 254 mm, PRISM days 2026-10-20 to 2026-10-27"*, plus the share of the
-  basin without PRISM data when there is any (14.3% for the Upper Skagit, in Canada).
+- **The study basin label** gives the storm's headline numbers on separate lines, for example *"San Juan:
+  4.68 km³ = 3.80 million acre-ft / mean 73 mm, max 228 mm, PRISM days 2026-10-20 to 2026-10-27 / range
+  4.63–4.92 km³"*, plus the share of the basin without PRISM data when there is any (14.3% for the Upper
+  Skagit, in Canada). The range appears when `storm_total.py` has written the uncertainty for the same
+  window and resolution.
 - **Subbasins are colored by depth, not volume.** Volume grows with area, so coloring by volume would
   mostly show which units are biggest. Depth (mm) shows how wet each subbasin was; the labels give the
   volume. A large, moderately wet subbasin can hold more water than a small, very wet one.
@@ -874,8 +927,8 @@ gauges, terrain and climate patterns. Everything else on the map is there to che
   As a one-off workaround, prefix commands with `env -u PROJ_DATA`.
 
 ## Roadmap
-Planned work (validation, QC checks, uncertainty, rain/snow split, provenance, storm context, reports,
-packaging) is described in [docs/ROADMAP.md](docs/ROADMAP.md).
+Built so far and planned next (comparison with other precipitation products, CF-compliant NetCDF, storm
+context, reports, packaging) are described in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Tests
 ```bash

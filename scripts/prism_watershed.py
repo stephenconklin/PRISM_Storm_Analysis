@@ -38,7 +38,7 @@ Each run ends with QC checks (qc.py; --qc-strict turns warnings into failures, a
 failure gives exit status 1) and appends a record of the run, with per-day zip checksums,
 releases and info.txt fields, to <out>/run_manifest.json.
 
-Requires: pip install requests numpy rasterio geopandas xarray netCDF4  (optional: truststore)
+Requires the packages in environment.yml / requirements.txt (truststore is needed to reach PRISM).
 """
 import argparse
 import csv
@@ -371,9 +371,9 @@ def main():
     basin_src = ap.add_mutually_exclusive_group(required=True)
     basin_src.add_argument("--huc", help="WBD hydrologic unit code, 2-16 digits (see find_huc.py)")
     basin_src.add_argument("--boundary", help="your own boundary polygon file instead of WBD")
-    ap.add_argument("--var", default="ppt")
-    ap.add_argument("--res", default="800m", choices=["800m", "4km"])
-    ap.add_argument("--region", default="us")
+    ap.add_argument("--var", default="ppt", help="PRISM variable: ppt (default), tmin, tmax, tmean, tdmean, vpdmin, vpdmax")
+    ap.add_argument("--res", default="800m", choices=["800m", "4km"], help="grid resolution (default 800m)")
+    ap.add_argument("--region", default="us", help="PRISM region (default us, the conterminous US)")
     ap.add_argument("--format", default="", help="blank = COG GeoTIFF (default); or nc, bil, asc")
     ap.add_argument("--out", help="output folder (default data/huc<code> or data/<boundary name>)")
     ap.add_argument("--pause", type=float, default=2.0, help="seconds between requests")

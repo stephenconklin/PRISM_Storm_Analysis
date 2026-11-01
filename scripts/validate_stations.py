@@ -257,10 +257,10 @@ def main():
     ap.add_argument("--start", help="first PRISM day (default: first day in the cube)")
     ap.add_argument("--end", help="last PRISM day (default: last day in the cube)")
     ap.add_argument("--boundary", help="basin polygon (default: the wbd_huc*.geojson in --out)")
-    ap.add_argument("--buffer-km", type=float, default=10.0, help="also compare stations this far outside the basin")
+    ap.add_argument("--buffer-km", type=float, default=10.0, help="also compare stations this far outside the basin (default 10)")
     ap.add_argument("--max-offset", type=float, default=6.0,
                     help="hours between station and PRISM day ends allowed in the statistics (default 6)")
-    ap.add_argument("--match-km", type=float, default=0.5, help="distance to a PRISM input station for in_sample")
+    ap.add_argument("--match-km", type=float, default=0.5, help="distance to a PRISM input station for in_sample (default 0.5)")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"])
     a = ap.parse_args()
 

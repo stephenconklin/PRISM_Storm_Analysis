@@ -114,7 +114,7 @@ def main():
     ap.add_argument("--start", help="first PRISM day (default: first day in the cube)")
     ap.add_argument("--end", help="last PRISM day (default: last day in the cube)")
     ap.add_argument("--boundary", help="basin polygon (default: the wbd_huc*.geojson in --out)")
-    ap.add_argument("--buffer-km", type=float, default=10.0, help="also use stations this far outside the basin")
+    ap.add_argument("--buffer-km", type=float, default=10.0, help="also use stations this far outside the basin (default 10)")
     ap.add_argument("--all-snow-c", type=float, default=0.0, help="all snow at or below this daily mean (default 0 °C)")
     ap.add_argument("--all-rain-c", type=float, default=3.0, help="all rain at or above this daily mean (default 3 °C)")
     ap.add_argument("--min-precip-mm", type=float, default=10.0,

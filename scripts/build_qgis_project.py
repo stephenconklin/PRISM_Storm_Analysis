@@ -2,8 +2,9 @@
 """
 Build an organized, styled QGIS project from a PRISM Data Wrangler output folder.
 
-Finds the outputs in --out by their standard names (prism_watershed.py, storm_total.py,
-validate_stations.py, validate_runoff.py) and writes <out>/QGIS/<folder name>.qgz with:
+Finds the outputs in --out by their standard names (prism_watershed.py, storm_total.py and its
+uncertainty file, subbasin_totals.py, validate_stations.py, validate_runoff.py, validate_snow.py) and
+writes <out>/QGIS/<folder name>.qgz with:
     - groups: Validation, Storm totals, Daily precipitation, Boundaries, Basemap
     - readable layer names with units and dates; provenance in each layer's metadata
     - one shared color scale for daily precipitation and one for storm totals, with

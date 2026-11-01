@@ -16,7 +16,8 @@ range on the study basin label. Code: `scripts/uncertainty.py`.
 
 ## What the range means
 
-It is a **bounding range**, not a confidence interval. Each component says how far below and above the
+It is a **bounding range**, not a confidence interval. Each component's range always includes 0 (no
+change), so a component with one estimate, say +4.2%, contributes 0 to +4.2%. Each component says how far below and above the
 reported volume one source of error could plausibly put it. The overall range adds the components'
 lows and their highs. That is deliberately wide in one sense: the components are not independent
 (PRISM is built from many of the same gauges used to check it) and PRISM's errors are spatially

@@ -8,18 +8,18 @@ Per `CLAUDE.md`, check every external endpoint before building on it.
 
 Effort: **S** (an afternoon), **M** (a few days), **L** (a week or more).
 
-## Where the tool stands (October 2026)
+## Where the tool stands (1 Nov 2026)
 
 | Area | Today |
 |---|---|
-| Download / clip | `prism_watershed.py`: any HUC or polygon, cached zips, `--refresh` to newer PRISM releases with a per-release history |
-| Totals / volume | `storm_total.py`: any date window; depth, ellipsoidal per-cell volume, GeoTIFF / NetCDF outputs |
+| Download / clip | `prism_watershed.py`: any HUC or polygon, any PRISM variable, cached zips, `--refresh` to newer PRISM releases with a per-release history |
+| Totals / volume | `storm_total.py`: any date window; depth, ellipsoidal per-cell volume, rain/snow split, revision change, boundary sensitivity; GeoTIFF / NetCDF outputs; `subbasin_totals.py` per HUC10/12 |
 | Lookup | `find_huc.py`: WBD name search |
-| QC | `qc.py`: nine checks at the end of every `prism_watershed.py` and `storm_total.py` run, `--qc-strict` |
-| Uncertainty | None reported; totals are single numbers |
-| Validation | `validate_stations.py` (gauges, 1.1) and `validate_runoff.py` (streamflow, 1.2) built 31 Oct 2026; 1.3 not started |
+| QC | `qc.py`: nine checks after `prism_watershed.py`, five after `storm_total.py`; `--qc-strict` |
+| Uncertainty | `uncertainty.py`: volume with a bounding range (gauges, boundary, revisions); other products not yet assessed |
+| Validation | `validate_stations.py` (1.1), `validate_runoff.py` (1.2, with rain-only ratios), `validate_snow.py` (SNOTEL check of the rain/snow split); 1.3 not started |
 | Provenance | `run_manifest.json` (one entry per run); releases in the CSV, clipped tifs and cube; release history CSV |
-| Engineering | Scripts plus offline pytest; no packaging, logging, CI or git |
+| Engineering | Git (no tags yet); offline pytest, including a real QGIS build when QGIS is installed; no packaging, logging or CI |
 
 ## Multi-basin test (31 Oct 2026)
 
@@ -39,13 +39,9 @@ no PRISM data (Skagit: 14%, in Canada), with clear skip reasons; runoff ratio ra
 gauges whose basins lie mostly outside the study basin are skipped; `--gauge` runs merge into
 `runoff_summary.csv`.
 
+**Done since:** data-driven map classes (in the QGIS builder) and region-aware runoff guidance (README).
+
 **Still open:**
-- Map classes are fixed for a big storm (±3/10/25 mm station differences; symbol sizes up to 150 mm), so
-  for 10–30 mm storms nearly every station is near-white. Set breaks from the data (percent difference,
-  or quantiles), ideally in the QGIS project builder (7a).
-- Runoff ratios of ~0.00–0.01 in the Elkhorn (sandy Plains soils) and Upper St. Johns (wetland storage)
-  look physically plausible but are below the "0.1–0.5 typical" guidance in the README, which is written
-  for mountain storms. Make that guidance region-aware or drop the range.
 - SNOTEL lag in ACIS removes SNOTEL from windows ending within a few days of the run (Skagit had none).
 
 ---
@@ -59,7 +55,7 @@ gauges whose basins lie mostly outside the study basin are skipped; `--gauge` ru
 5. ~~**Streamflow comparison** (1.2)~~ — built; ~~**uncertainty roll-up** (3.3)~~ — built 1 Nov 2026 without
    product spread; next **multi-product comparison** (1.3), which feeds 3.3.
 6. **Storm context** (6) and **reports** (7).
-7. **Engineering** (8). Start version control and CI at any point; the rest as the tool grows.
+7. **Engineering** (8). Git is started; add CI and release tags at any point, the rest as the tool grows.
 
 ---
 
@@ -111,7 +107,7 @@ nationally for 2026-10-23). It does **not** include observed values. It is still
    optimistic; label it that way. A fairer check uses stations PRISM did not use (in a network but
    missing from that day's `stn.csv`). Re-running PRISM without a station (leave-one-out) isn't possible here.
 
-**Outputs:** `validation/stations.csv` (per station, per day), `validation/summary.json`, and a
+**Outputs (as planned; built as `stations.csv`, `station_days.csv`, `stations_summary.json`):** `validation/stations.csv` (per station, per day), `validation/summary.json`, and a
 map of station bias.
 
 **Done when:** a run prints N stations, bias, RMSE and the event-total ratio, and writes the files
@@ -121,7 +117,8 @@ above. Tests use a synthetic grid plus fake station data.
 > **Status: built 31 Oct 2026** as `scripts/validate_runoff.py`. Decisions: USGS Water Data API
 > 15-minute `continuous` values (daily values were null on the peak days, qualifier `EQUIP`, while the
 > 15-minute record had all but 4.75 h); NLDI basin (no split catchment); PRISM over the gauge basin from
-> the cube, filling up to 1% of edge cells with the basin mean; baseflow bracketed by a constant line and
+> the national grids in `extracted/` (changed from the cube on 31 Oct), filling up to 1% of edge cells
+> with the basin mean; baseflow bracketed by a constant line and
 > a straight start-to-end line instead of a Lyne–Hollick filter.
 >
 > First results (PRISM days Oct 20–27, flow to Oct 31): Pagosa Springs 09342500, 727 km², 182 mm,
@@ -144,7 +141,8 @@ above. Tests use a synthetic grid plus fake station data.
 >   when USGS publishes estimated or revised values, or allow a gap-filling method with explicit flags.
 > - Hydrograph plus basin hyetograph plot (PNG), from `runoff_<site>_flow.csv` and the daily precipitation.
 > - Lyne–Hollick filter as a third baseflow estimate; tune for 15-minute data.
-> - Rain-only ratio once section 4 lands.
+> - ~~Rain-only ratio once section 4 lands~~ (done 1 Nov 2026). Outputs are `runoff_<site>.json` and
+>   `runoff_summary.csv`, not the `validation/runoff.json` planned below.
 > - Hand-check one runoff volume against USGS daily means on days with complete records (the done criterion).
 > - Rerun with `--after-days` 7+ once the recession data exists (flow was cut off at the time of the run).
 
@@ -253,7 +251,7 @@ prints at the end of each run.
 
 > **Built:** `storm_total.py` reports the window volume by cell center, area-weighted (cell shares from
 > shapely intersections, no `exactextract`) and any cell touched, from the national grids in `extracted/`
-> (`boundary_volumes`). San Juan Oct 20–27: 4.7188 / 4.7194 / 4.7993 km³, range 1.71%.
+> (`boundary_volumes`). San Juan Oct 20–27 (release 2): 4.6846 / 4.6852 / 4.7634 km³, range 1.68%.
 
 **Goal:** Report how much the basin definition changes the total.
 
@@ -277,6 +275,7 @@ small basins will differ far more.
 > shown only); revision term = observed change so far, both directions, flagged while releases < 8, no
 > allowance for future revisions; rain/snow is a separate rain-volume range, not part of the total.
 > San Juan Oct 20–27: 4.685 km³, 4.625–4.916 (−1.3% to +4.9%). Add product spread when 1.3 lands.
+
 **Goal:** Report volume as a value with a range, not a bare number like 4.719 km³.
 
 **Approach:** treat sources separately and document the combination:
@@ -299,7 +298,7 @@ written up in `docs/`.
 > and summary CSV, no event total); `storm_total.py` splits rain and snow per cell and day with a linear
 > ramp (`--all-snow-c` 0, `--all-rain-c` 3), reports both, writes `--rain-tif`, `--snow-tif`,
 > `--rain-snow-nc`, and QC checks rain + snow = precipitation; `validate_runoff.py` adds a rain-only
-> ratio and snow share per gauge. San Juan Oct 20–27: 3.8% snow basin-wide; 64–76% at the high Animas
+> ratio and snow share per gauge. San Juan Oct 20–27: 3.5% snow basin-wide (release 2); 64–76% at the high Animas
 > gauges, whose rain-only ratios reach 1.06–1.17. SNOTEL check built as `validate_snow.py` (NRCS AWDB):
 > over 23 stations PRISM's snow is 1.16× the observed SWE gain with 0–3 °C (0.9× with −1–3 °C; ramps ending
 > at 2 °C give ≤0.7×); near Silverton the split is ~2× observed. Keep 0–3 °C until more storms are checked.
@@ -333,6 +332,7 @@ rain/snow maps.
 > one entry appended per run (folders are refreshed over time, so entries are never overwritten). The
 > validation and subbasin scripts don't write entries yet. Tool version is the git commit until there
 > are tagged releases.
+
 **Goal:** A `run_manifest.json` in each output folder recording how the outputs were made.
 
 **Contents:** command line and parsed arguments; start and end time; tool version and git commit;
@@ -356,6 +356,9 @@ query URL, or boundary file path and checksum); per day: PRISM URL, zip SHA-256,
 and still open in QGIS and xarray.
 
 ### 5.3 Version control — S
+> **Status: started 1 Nov 2026.** Git repository with history; the manifest records the commit (with
+> `-dirty`). Not yet: tagged releases and a remote.
+
 `git init`, a first commit, tagged releases, and the commit recorded in the manifest. The
 `.gitignore` already excludes data and rasters.
 
@@ -416,7 +419,10 @@ Built from the manifest and outputs, so a report can be regenerated without re-r
 > data-driven precipitation and station-difference classes. Not yet: the layer catalog, `--qgis`/
 > `--qgis-project`/`--qlr` options on each tool, incremental updates that keep user edits (it rebuilds and
 > keeps a `.bak`), the daily NetCDF as a mesh layer, print layouts, 3D view, atlas. Projects for the
-> three test basins are in each test folder's `QGIS/` (built with QGIS 3.44.10).
+> three test basins are in each test folder's `QGIS/` (built with QGIS 3.44.10). Also built: map themes,
+> a basin bookmark, Temporal Controller settings, rain/snow and SNOTEL layers, the uncertainty range on the
+> basin label, and a test that builds a real project. The project is written to `<out>/QGIS/<name>.qgz`,
+> not `<out>/<basin>.qgz` as planned below.
 
 **Goal:** Any tool can build or update a logically organized, styled QGIS project from its outputs,
 when asked. Without the option, tools behave as now.
@@ -497,7 +503,6 @@ builder headless when PyQGIS is available and are skipped otherwise.
 ---
 
 ## Open questions
-- Which streamflow gauges matter for the first validation (outlet vs headwater gauges)?
 - Which second precipitation product to support first (Stage IV for timing, AORC for resolution)?
 - Report format: HTML only, or also PDF for distribution?
 - ~~QGIS project builder (7a): which QGIS version to target?~~ Decided: build with QGIS 3.x (3.44 LTR here);

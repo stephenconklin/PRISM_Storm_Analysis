@@ -1,8 +1,8 @@
 """
 Network access for independent observations used to validate PRISM.
 
-Kept separate from the processing in validate_stations.py / validate_runoff.py so that
-processing stays testable offline. Every function here makes HTTP requests.
+Kept separate from the processing in validate_stations.py, validate_runoff.py, validate_snow.py and
+subbasin_totals.py so that processing stays testable offline. Every function here makes HTTP requests.
 
 Sources (checked October 2026):
     RCC-ACIS  https://data.rcc-acis.org/MultiStnData

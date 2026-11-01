@@ -7,7 +7,7 @@ Keep code, CLI defaults and docs watershed-agnostic; specific basins appear only
 First use case (example only): the late-October 2026 San Juan River floods (remnants of
 Hurricane Trudy; rain began ~Oct 21, San Juan at Pagosa Springs crested
 15.02 ft ~Oct 22–23, showers cleared by ~Oct 26; another storm Oct 30–Nov 1).
-That run's outputs (HUC 1408, PRISM days Oct 20–27) are in
+That run's outputs (HUC 1408; ppt and tmean for PRISM days Oct 20–31) are in
 `/Volumes/ConklinGeospatialData/Data/PRISM_data/San_Juan_Watershed`.
 
 ## Layout
@@ -25,19 +25,23 @@ That run's outputs (HUC 1408, PRISM days Oct 20–27) are in
 - `scripts/manifest.py` — appends one entry per run to `<out>/run_manifest.json` (`runs` list): command, git
   commit, versions, basin source, per-day URL/SHA-256/release/info.txt fields, outputs with SHA-256, QC
 - `scripts/observations.py` — all network access for validation (RCC-ACIS stations, USGS Water Data API, NLDI,
-  National Inventory of Dams); `_get` retries 429/503 and raises `RateLimited` on long waits
+  National Inventory of Dams, WBD units, NRCS AWDB SNOTEL); `_get` retries 429/503 and raises `RateLimited` on long waits
 - `scripts/validate_stations.py` — gauge vs PRISM comparison; pure functions for ACIS parsing, day alignment,
   event totals and stats; writes `validation/validation.gpkg` with styles from `styles/*.qml`
 - `scripts/validate_runoff.py` — gauge-basin precipitation volume vs 15-minute streamflow, runoff ratio, for
   `--gauge` sites or `--all-gauges`; gauge-basin precipitation from the national grids in `extracted/` (not the
-  clipped cube, so NLDI basins may extend past the study basin); regulation class from upstream NID storage depth; per-gauge results cached
-  in `validation/runoff_<site>.json` (keyed by window settings) so rate-limited runs resume
+  clipped cube, so NLDI basins may extend past the study basin); regulation class from NID storage over the whole gauge basin; per-gauge results cached
+  in `validation/runoff_<site>.json` so rate-limited runs resume. Cache rules (`load_cached`): a change in
+  `PRECIP_KEYS` (res, max_missing_pct, releases, rain/snow, tmean releases) recomputes precipitation offline;
+  results or skips whose flow window was cut short by the run time are refetched (`flow_stale`); transient
+  request errors are never cached. `--gauge` updates only its own gauges in the layers
 - `scripts/validate_snow.py` — rain/snow split vs SNOTEL SWE gain (observed, station-data split, PRISM split) per
   station; `validation/snotel.csv`, `snotel_summary.json`, layer `snotel`; pure functions `snotel_window`, `prism_split`
 - `scripts/subbasin_totals.py` — basin and subbasin (HUC10/12) depth and volume from the cube (`zone_totals` in
   `storm_total.py`) to `<out>/totals.gpkg` (`basin_total`, `subbasins`); WBD units via `observations.wbd_units`
 - `scripts/build_qgis_project.py` — builds `<out>/QGIS/<name>.qgz` from a folder's outputs (found by standard
-  names; extra tifs classed by `tif_kind`: volume/m3, rain, snow, depth). Runs under QGIS's Python; relaunches itself there (newest QGIS 3.x app by plist version, so projects open in
+  names; one resolution, 800m preferred; one event total shown; extra tifs mapped only if `tif_kind` recognizes the
+  name). Errors are caught in `build()` and the traceback freed before `exitQgis()`. Runs under QGIS's Python; relaunches itself there (newest QGIS 3.x app by plist version, so projects open in
   QGIS 3 and 4; else newest QGIS; or `--qgis-python`/`QGIS_PYTHON`) with Anaconda's PROJ/GDAL/PDAL env vars cleared. Pure helpers are testable without
   QGIS. In GDAL Python keep the dataset referenced while using its band (a temporary dataset frees the band).
 - PyQGIS returns a NULL object (not None) for empty fields: filter with `is_number()`. Build inside an inner
@@ -45,11 +49,14 @@ That run's outputs (HUC 1408, PRISM days Oct 20–27) are in
 - `styles/` — QGIS QML styles embedded into GeoPackages (`layer_styles` table) by `write_default_style`
 - `docs/ROADMAP.md` — planned features with approach and done-criteria; read it before starting new feature work
   and update it as items land
-- `tests/test_offline.py` — offline test using synthetic rasters (no network); `tests/test_qc.py` — QC and manifest
+- `tests/` — offline only (synthetic rasters; requests go to a closed local port via `OFFLINE` env). `test_offline.py`
+  runs `prism_watershed.py` end to end; `test_build_qgis_project.py` builds a real project when QGIS is installed
 - `data/` — all downloads and outputs (git-ignored; never commit rasters)
 
 `prism_watershed.py` requires `--start`, `--end`, and one of `--huc`/`--boundary`. `--var tmean` (etc.) can share a
-`ppt` folder: own cube and `<var>_<res>_daily_basin_summary.csv`, no event total. `storm_total.py` splits rain/snow
+`ppt` folder: own cube and `<var>_<res>_daily_basin_summary.csv`, no event total (ppt at 4km also gets the
+`<var>_<res>_` summary name; 800m ppt keeps `daily_basin_summary.csv`). `--boundary` runs save `boundary.geojson`,
+which later steps use like `wbd_huc*.geojson`. Basin means are area-weighted everywhere. `storm_total.py` splits rain/snow
 from the `tmean` cube (`snow_fraction`, `rain_snow`); `validate_runoff.py` adds rain-only ratios from national
 `tmean` grids in `extracted/`. Discovery globs that mean precipitation must say `ppt_` (e.g. QGIS `discover`).
 Outputs (default `--out data/huc<code>` or `data/<boundary stem>`): `raw_zips/`, `extracted/`, `clipped/<var>_<res>_YYYYMMDD_clip.tif`,
@@ -97,8 +104,6 @@ python -m pytest tests -q
 On this Mac the shell sets `PROJ_DATA=/opt/anaconda3/share/proj`, an old `proj.db` that breaks pip
 rasterio ("EPSG code is unknown … comes from another PROJ installation"). Use the activated
 `prism-data-wrangler` env (or `conda run -n prism-data-wrangler`), `.venv`, or prefix with `env -u PROJ_DATA`.
-The shell is zsh: a variable holding a command with spaces isn't word-split (`$P args` fails; write the command out
-or use `${=P}`), and `echo ===` errors (`=word` expansion), which stops a `;` chain silently.
 
 `services.nacse.org` chains to emSign Root CA - G1, which certifi's bundle lacks (CERTIFICATE_VERIFY_FAILED).
 The script calls `truststore.inject_into_ssl()` to use the OS trust store; never use `verify=False`.
@@ -122,7 +127,7 @@ USGS WBD REST: `https://hydro.nationalmap.gov/arcgis/rest/services/wbd/MapServer
 with layer = HUC digits / 2 (1→HUC2 … 8→HUC16), field `huc2`…`huc16`, plus `name`, `states`, `areasqkm`.
 Example HUCs: 1408 San Juan basin; 14080101 Upper San Juan; 14080104 Animas.
 
-## Validation data facts (checked 31 Oct 2026)
+## Validation data facts (checked 31 Oct 2026; AWDB 1 Nov)
 - RCC-ACIS `MultiStnData` (POST JSON, bbox) covers COOP, CoCoRaHS, ASOS and SNOTEL (GHCN ids `USS…`).
   Values in inches; `T` trace, `M` missing, `S` part of a later `…A` accumulated total.
   Observation hour: 1–24 local standard time (24 = midnight); **0 or -1 mean not recorded**, not midnight.
