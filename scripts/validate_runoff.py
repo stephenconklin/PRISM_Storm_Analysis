@@ -185,23 +185,48 @@ def runoff_volumes(q_cfs):
     return out, base_const / CFS_TO_M3S, base_line / CFS_TO_M3S
 
 
-def regulation(basin, dams, area_m2, minor_mm=1.0, regulated_mm=10.0):
+def regulation(basin, dams, area_m2, minor_mm=1.0, regulated_mm=10.0, precip_mm=None):
     """Upstream dam storage for a gauge basin and its regulation class.
 
-    dams: list of dicts from observations.nid_dams. Storage uses normal storage, else NID
-    storage, in acre-ft. Returns a dict with n_dams, storage_af, storage_mm, class and the
-    largest dams.
+    dams: list of dicts from observations.nid_dams. Capacity is normal storage, else NID storage, in
+    acre-ft. A reservoir can hold back no more than the storm's precipitation over its own drainage area
+    (NID DRAINAGE_AREA), so with precip_mm (the gauge basin's mean depth for the window) each dam's
+    effective storage is min(capacity, precip_mm x its drainage area); dams with no drainage area keep
+    their full capacity (conservative). The class uses effective storage as a depth over the gauge basin.
+    Returns a dict with n_dams, storage_af/mm (capacity), effective_af/mm, class, the largest dams and
+    the full list (so the class can be recomputed when the precipitation changes).
     """
     poly = basin.to_crs(4269).geometry.iloc[0]
-    inside = [d for d in dams if poly.contains(Point(d["lon"], d["lat"]))]
+    inside = [{"name": d["name"], "nidid": d["nidid"],
+               "capacity_af": float(d.get("normal_storage_af") or d.get("nid_storage_af") or 0.0),
+               "drainage_area_mi2": d.get("drainage_area_mi2")}
+              for d in dams if poly.contains(Point(d["lon"], d["lat"]))]
+    return regulation_from(inside, area_m2, minor_mm, regulated_mm, precip_mm)
+
+
+def regulation_from(inside, area_m2, minor_mm=1.0, regulated_mm=10.0, precip_mm=None):
+    """regulation() from the list of upstream dams it saved."""
     for d in inside:
-        d["_af"] = d.get("normal_storage_af") or d.get("nid_storage_af") or 0.0
-    storage_af = float(sum(d["_af"] for d in inside))
-    storage_mm = storage_af * M3_PER_ACRE_FT / area_m2 * 1000 if area_m2 else 0.0
-    cls = "regulated" if storage_mm >= regulated_mm else "minor" if storage_mm >= minor_mm else "unregulated"
-    top = sorted(inside, key=lambda d: -d["_af"])[:3]
-    return {"n_dams": len(inside), "storage_af": storage_af, "storage_mm": storage_mm, "class": cls,
-            "largest": [{"name": d["name"], "nidid": d["nidid"], "storage_af": d["_af"]} for d in top if d["_af"]]}
+        da = d.get("drainage_area_mi2")
+        if precip_mm is not None and da:
+            inflow_af = precip_mm / 1000 * da * KM2_PER_MI2 * 1e6 / M3_PER_ACRE_FT
+            d["effective_af"] = min(d["capacity_af"], inflow_af)
+        else:
+            d["effective_af"] = d["capacity_af"]
+
+    def depth(af):
+        return af * M3_PER_ACRE_FT / area_m2 * 1000 if area_m2 else 0.0
+    storage_af = float(sum(d["capacity_af"] for d in inside))
+    effective_af = float(sum(d["effective_af"] for d in inside))
+    effective_mm = depth(effective_af)
+    cls = "regulated" if effective_mm >= regulated_mm else "minor" if effective_mm >= minor_mm else "unregulated"
+    top = sorted(inside, key=lambda d: -d["effective_af"])[:3]
+    return {"n_dams": len(inside), "storage_af": storage_af, "storage_mm": depth(storage_af),
+            "effective_af": effective_af, "effective_mm": effective_mm, "class": cls,
+            "n_no_drainage_area": sum(1 for d in inside if not d.get("drainage_area_mi2")),
+            "largest": [{"name": d["name"], "nidid": d["nidid"], "storage_af": d["capacity_af"],
+                         "effective_af": round(d["effective_af"])} for d in top if d["capacity_af"]],
+            "dams": inside}
 
 
 def basin_share_inside(basin, study_poly):
@@ -269,8 +294,9 @@ def run_gauge(site_no, site, grids, study_poly, dams_for, a, vdir, tmean=None):
         raise GaugeSkipped(f"discharge gap of {worst:.1f} h (limit {a.max_gap_hours:g} h)", site, "flow")
     q = q.ffill().bfill()  # only the window edges, already checked against --max-gap-hours
     vols, base_c, base_l = runoff_volumes(q)
+    p_depth = sum(r["volume_m3"] for r in precip) / grid_area_m2 * 1000
     reg = regulation(basin, dams_for(tuple(basin.to_crs(4269).total_bounds)), grid_area_m2, a.minor_mm,
-                     a.regulated_mm)
+                     a.regulated_mm, p_depth)
 
     peak_t = q.idxmax()
     result = {
@@ -329,6 +355,9 @@ def update_precip(result, basin, grids, a, tmean=None):
     if not sum(r["volume_m3"] for r in precip):
         raise GaugeSkipped("no precipitation over the gauge basin in the window", result["gauge"], "precip")
     result.update(precip_and_ratios(precip, missing_pct, grid_area_m2, result["flow"]))
+    if "dams" in result.get("regulation", {}):  # effective storage depends on the precipitation
+        result["regulation"] = regulation_from(result["regulation"]["dams"], grid_area_m2, a.minor_mm,
+                                               a.regulated_mm, result["precip"]["depth_mm"])
     return result
 
 
@@ -341,9 +370,13 @@ def summary_row(site_no, result=None, site=None, reason=None):
     rr, fl, reg = result["runoff_ratio"], result["flow"], result["regulation"]
     return {"site": site_no, "name": result["gauge"]["name"], "status": "ok", "regulation": reg["class"],
             "dam_storage_mm": round(reg["storage_mm"], 1), "dam_storage_af": round(reg["storage_af"]),
-            "storage_pct_of_precip": round(reg["storage_mm"] / result["precip"]["depth_mm"] * 100, 1),
-            "n_dams": reg["n_dams"], "largest_dams": "; ".join(f"{d['name']} ({d['storage_af']:,.0f} af)"
-                                                               for d in reg["largest"]),
+            "dam_effective_mm": round(reg.get("effective_mm", reg["storage_mm"]), 1),
+            "storage_pct_of_precip": round(reg.get("effective_mm", reg["storage_mm"]) / result["precip"]["depth_mm"]
+                                           * 100, 1),
+            "n_dams": reg["n_dams"],
+            "largest_dams": "; ".join(f"{d['name']} ({d['storage_af']:,.0f} af"
+                                      + (f", {d['effective_af']:,.0f} effective)" if "effective_af" in d else ")")
+                                      for d in reg["largest"]),
             "area_km2": result["basin_area_km2"]["prism_cells"],
             "usgs_area_km2": result["basin_area_km2"]["usgs_drainage_area"],
             "prism_start": result["prism_window"]["start"], "prism_end": result["prism_window"]["end"],
@@ -369,6 +402,7 @@ def window_key(days, a, releases=(), rain_snow=None, tmean_releases=()):
     return {"start": str(days[0]), "end": str(days[-1]), "after_days": a.after_days, "precip": "national grids",
             "max_gap_hours": a.max_gap_hours, "minor_mm": a.minor_mm, "regulated_mm": a.regulated_mm,
             "res": a.res, "max_missing_pct": a.max_missing_pct, "releases": list(releases),
+            "regulation": "effective storage (capped by precipitation over each dam's drainage area)",
             "rain_snow": rain_snow, "tmean_releases": list(tmean_releases)}
 
 
@@ -570,7 +604,8 @@ def main():
                      if row.get("rain_ratio_low") is not None else
                      f" ({row['snow_pct']:.0f}% snow)" if "snow_pct" in row else "")
                   + f"  {row['regulation']}"
-                  f" ({row['dam_storage_mm']:.1f} mm storage, {row['storage_pct_of_precip']:.0f}% of precip)"
+                  f" ({row['dam_effective_mm']:.1f} mm effective of {row['dam_storage_mm']:.1f} mm capacity,"
+                  f" {row['storage_pct_of_precip']:.0f}% of precip)"
                   + (f"  [{cached}]" if isinstance(cached, str) else "  [saved]" if cached else "")
                   + ("" if row["flow_complete"] else "  [flow window not over yet]"))
 

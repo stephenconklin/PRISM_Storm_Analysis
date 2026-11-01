@@ -403,15 +403,21 @@ python scripts/validate_runoff.py --out data/huc<HUC> --gauge <site> [<site> ...
   Short gaps are interpolated and reported; a gauge with a gap over `--max-gap-hours` (default 12) is
   skipped. Daily values are not used because USGS can withhold a whole day around a short equipment
   problem, often at the flood peak.
-- **Regulation:** dams from the National Inventory of Dams inside each gauge's basin are added up
-  (normal storage, else NID storage) and spread over the basin as a depth in mm, directly comparable
-  with the storm's precipitation depth. Under `--minor-mm` (default 1 mm) the gauge is **unregulated**,
-  up to `--regulated-mm` (default 10 mm) **minor**, above that **regulated**. `storage_pct_of_precip`
-  shows how that storage compares with this storm. A regulated gauge's runoff ratio reflects reservoir
-  operations as much as precipitation, so read it as a check on the water budget, not on PRISM.
-  Storage is capacity, not how full the reservoirs were. Off-channel reservoirs (for example Lake
-  Nighthorse, filled by pumping) and transbasin diversions (for example the San Juan–Chama Project)
-  are not distinguished. Dikes listed with their reservoir's storage are counted once.
+- **Regulation:** dams from the National Inventory of Dams anywhere in each gauge's basin are counted.
+  A reservoir can hold back no more than the storm's precipitation over its own drainage area, so each
+  dam's **effective storage** is the smaller of its capacity (normal storage, else NID storage) and the
+  basin's storm depth over the dam's NID drainage area; dams without a drainage area in the NID keep
+  their full capacity. Effective storage is spread over the gauge basin as a depth in mm. Under
+  `--minor-mm` (default 1 mm) the gauge is **unregulated**, up to `--regulated-mm` (default 10 mm)
+  **minor**, above that **regulated**. Capacity is reported too. Example: Electra Lake (Terminal Dam,
+  22,000 acre-ft) sits on Elbert Creek with a 26 mi² drainage area, so above Durango it can hold at most
+  about 6,800 acre-ft of this storm: 6.2 mm effective of 16.8 mm capacity, **minor**, where counting
+  capacity alone called the free-flowing Animas regulated. A regulated gauge's runoff ratio reflects
+  reservoir operations as much as precipitation, so read it as a check on the water budget, not on
+  PRISM. Not modeled: how full reservoirs were, diversions into a reservoir from outside its drainage
+  area (Electra Lake also takes Cascade Creek water), off-channel reservoirs filled by pumping (Lake
+  Nighthorse) and transbasin diversions (the San Juan–Chama Project). Dikes listed with their
+  reservoir's storage are counted once.
 - **Rate limits and resuming:** the USGS Water Data API allows 1,000 requests per hour per IP; a full
   run uses roughly two per gauge plus a few. When USGS asks the tool to pause, it waits (printing how
   long) for up to `--max-wait-min` (default 15). For a longer pause, the run stops, writes what it has,
@@ -611,8 +617,8 @@ snow by the default split, so the true ratio is likely between 0.35 and 0.50. At
 precipitation is classed as snow, and the rain-only ratio above 1 says part of it fell as rain or rain
 melted earlier snow; `validate_snow.py` finds the split runs about twice the observed snow near
 Silverton. Below Navajo Dam (Archuleta), reservoir storage is twice the storm and the ratio is ~0: the
-dam held the flood. Durango is
-labeled regulated, but storage is only 13% of the storm and its ratio matches the unregulated Animas
+dam held the flood. Durango was labeled regulated in this run by capacity alone (Electra Lake); with
+effective storage (added since) it is minor, 6.2 mm, and its ratio matches the unregulated Animas
 gauges upstream. Farmington's record has a 50-hour gap during the flood, so it is skipped. Each gauge's
 `runoff_<site>.json` has the full detail: the three basin areas, daily precipitation, flow volumes,
 peak time, interpolated hours and approval status.
@@ -665,8 +671,9 @@ peak time, interpolated hours and approval status.
 | site, name | USGS site number and name |
 | status | `ok`, or why the gauge was not compared (see below) |
 | regulation | `unregulated`, `minor` or `regulated` (empty when not compared) |
-| dam_storage_mm, dam_storage_af | Upstream NID storage as a depth over the basin, and in acre-ft |
-| storage_pct_of_precip | dam_storage_mm as a percentage of the storm's precipitation depth |
+| dam_storage_mm, dam_storage_af | Upstream NID capacity as a depth over the basin, and in acre-ft |
+| dam_effective_mm | Effective storage as a depth over the basin: each dam's capacity capped by the storm over its own drainage area; sets the class |
+| storage_pct_of_precip | dam_effective_mm as a percentage of the storm's precipitation depth |
 | n_dams, largest_dams | Number of upstream NID dams; the three largest with storage |
 | prism_start, prism_end | PRISM days of the precipitation window |
 | area_km2, usgs_area_km2 | Basin area from PRISM cells; USGS published drainage area |

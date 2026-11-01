@@ -153,6 +153,9 @@ Example HUCs: 1408 San Juan basin; 14080101 Upper San Juan; 14080104 Animas.
 - Dams: NID ArcGIS service (`NORMAL_STORAGE`, `NID_STORAGE` in acre-ft). Drop `IS_ASSOCIATED_STRUCTURE='Yes'`
   (dikes repeat the reservoir's storage) and dedupe same-storage entries by base name or <2 km (e.g. Narraguinnep).
   NLDI `ref_dams` lacks storage and missed Navajo and Vallecito; NLDI `GRAND` returned nothing here.
+  `DRAINAGE_AREA` (mi², checked 1 Nov 2026; null for some dams) caps each dam's effective storage at the storm
+  depth over its own drainage area (`regulation_from`); the class uses effective storage. NIDIDs are not unique
+  (CO00895 is both Terminal/Electra Lake and Stagecoach), so key dams by location, not NIDID.
 
 ## Conventions
 - Python 3.10+, standard argparse CLIs, no notebooks in `scripts/`.

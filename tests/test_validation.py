@@ -172,6 +172,32 @@ def test_regulation_classes():
     assert regulation(basin, [big], area, regulated_mm=30)["class"] == "minor"
 
 
+
+def test_regulation_caps_storage_by_dam_drainage_area():
+    """A big reservoir on a small side creek (Electra Lake above Durango) can only hold what falls on its own
+    catchment; a main-stem reservoir with a large drainage area keeps its capacity."""
+    from validate_runoff import KM2_PER_MI2, regulation, regulation_from
+    basin = gpd.GeoDataFrame(geometry=[box(-108.0, 37.0, -107.0, 38.0)], crs=4269)
+    area = 1765e6  # Animas at Durango
+    side = {"name": "Terminal", "nidid": "CO00895", "normal_storage_af": 22000, "nid_storage_af": 22500,
+            "drainage_area_mi2": 26, "lon": -107.8, "lat": 37.5}
+    r = regulation(basin, [side], area)  # no precipitation given: capacity, as before
+    assert r["class"] == "regulated" and r["effective_mm"] == pytest.approx(r["storage_mm"])
+    r = regulation(basin, [side], area, precip_mm=125)
+    inflow_af = 0.125 * 26 * KM2_PER_MI2 * 1e6 / M3_PER_ACRE_FT  # ~6,800 acre-ft
+    assert r["effective_af"] == pytest.approx(inflow_af) and r["class"] == "minor"
+    assert r["storage_af"] == 22000 and r["largest"][0]["effective_af"] == round(inflow_af)
+    main = {"name": "Navajo", "nidid": "NM00120", "normal_storage_af": 1708600, "nid_storage_af": 1708600,
+            "drainage_area_mi2": 3206, "lon": -107.5, "lat": 37.2}
+    nodata = {"name": "Unknown", "nidid": "X9", "normal_storage_af": 900, "nid_storage_af": 900,
+              "drainage_area_mi2": None, "lon": -107.4, "lat": 37.3}
+    r = regulation(basin, [main, nodata], 8379e6, precip_mm=137)
+    assert r["class"] == "regulated" and r["n_no_drainage_area"] == 1
+    assert r["dams"][1]["effective_af"] == 900  # no drainage area: full capacity
+    # Recomputed offline from the saved list when the precipitation changes.
+    assert regulation_from(r["dams"], 8379e6, precip_mm=0.0)["effective_af"] == 900
+
+
 def test_dedupe_dams():
     from observations import dedupe_dams
     d = lambda name, af, lon, lat: {"name": name, "normal_storage_af": af, "nid_storage_af": af, "lon": lon, "lat": lat}

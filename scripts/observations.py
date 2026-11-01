@@ -202,7 +202,7 @@ def nid_dams(bbox):
     params = {"where": "IS_ASSOCIATED_STRUCTURE IS NULL OR IS_ASSOCIATED_STRUCTURE <> 'Yes'",
               "geometry": f"{w},{s},{e},{n}", "geometryType": "esriGeometryEnvelope",
               "inSR": 4326, "spatialRel": "esriSpatialRelIntersects", "outSR": 4326, "f": "json",
-              "outFields": "NIDID,NAME,RIVER_OR_STREAM,NORMAL_STORAGE,NID_STORAGE,PURPOSES,YEAR_COMPLETED",
+              "outFields": "NIDID,NAME,RIVER_OR_STREAM,NORMAL_STORAGE,NID_STORAGE,DRAINAGE_AREA,PURPOSES,YEAR_COMPLETED",
               "resultOffset": 0}
     dams = []
     while True:
@@ -217,6 +217,7 @@ def nid_dams(bbox):
                 continue
             dams.append({"nidid": a["NIDID"], "name": a["NAME"], "river": a["RIVER_OR_STREAM"],
                          "normal_storage_af": a["NORMAL_STORAGE"], "nid_storage_af": a["NID_STORAGE"],
+                         "drainage_area_mi2": a.get("DRAINAGE_AREA"),
                          "purposes": a["PURPOSES"], "year": a["YEAR_COMPLETED"], "lon": g["x"], "lat": g["y"]})
         if not js.get("exceededTransferLimit"):
             return dedupe_dams(dams)

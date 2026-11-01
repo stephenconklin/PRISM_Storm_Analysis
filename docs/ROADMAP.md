@@ -120,6 +120,8 @@ above. Tests use a synthetic grid plus fake station data.
 > the national grids in `extracted/` (changed from the cube on 31 Oct), filling up to 1% of edge cells
 > with the basin mean; baseflow bracketed by a constant line and
 > a straight start-to-end line instead of a Lyne–Hollick filter.
+> Regulation (1 Nov 2026): effective storage, each dam's capacity capped by the storm over its NID drainage
+> area; Animas at Durango, Mancos and McElmo moved from regulated to minor.
 >
 > First results (PRISM days Oct 20–27, flow to Oct 31): Pagosa Springs 09342500, 727 km², 182 mm,
 > peak 9,230 cfs, runoff ratio 0.33–0.40; Animas at Durango 09361500, 1,765 km², 127 mm, peak
