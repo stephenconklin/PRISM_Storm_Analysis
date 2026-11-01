@@ -977,6 +977,8 @@ context, reports, packaging) are described in [docs/ROADMAP.md](docs/ROADMAP.md)
 ```bash
 python -m pytest tests -q
 ```
-Offline only: synthetic rasters stand in for PRISM downloads.
+Offline only: synthetic rasters stand in for PRISM downloads, and any request goes to a closed local
+port. `test_build_qgis_project.py` also builds a real project when QGIS is installed (skipped otherwise).
+`.github/workflows/tests.yml` runs the suite on GitHub once the repository is pushed there.
 
 Data: PRISM Group, Oregon State University, https://prism.oregonstate.edu

@@ -19,7 +19,7 @@ Effort: **S** (an afternoon), **M** (a few days), **L** (a week or more).
 | Uncertainty | `uncertainty.py`: volume with a bounding range (gauges, boundary, revisions); other products not yet assessed |
 | Validation | `validate_stations.py` (1.1), `validate_runoff.py` (1.2, with rain-only ratios), `validate_snow.py` (SNOTEL check of the rain/snow split); 1.3 not started |
 | Provenance | `run_manifest.json` (one entry per run); releases in the CSV, clipped tifs and cube; release history CSV |
-| Engineering | Git (no tags yet); offline pytest, including a real QGIS build when QGIS is installed; no packaging, logging or CI |
+| Engineering | Git (tag `v0.1.0`); offline pytest, including a real QGIS build when QGIS is installed; GitHub Actions workflow (runs once pushed); no packaging or logging |
 
 ## Multi-basin test (31 Oct 2026)
 
@@ -55,7 +55,8 @@ gauges whose basins lie mostly outside the study basin are skipped; `--gauge` ru
 5. ~~**Streamflow comparison** (1.2)~~ — built; ~~**uncertainty roll-up** (3.3)~~ — built 1 Nov 2026 without
    product spread; next **multi-product comparison** (1.3), which feeds 3.3.
 6. **Storm context** (6) and ~~**reports** (7)~~ (built 1 Nov 2026; maps and PDF still open).
-7. **Engineering** (8). Git is started; add CI and release tags at any point, the rest as the tool grows.
+7. **Engineering** (8). Git, a first tag and a CI workflow are in place (CI runs once the repo has a GitHub
+   remote); packaging and logging as the tool grows.
 
 ---
 
@@ -366,7 +367,8 @@ and still open in QGIS and xarray.
 
 ### 5.3 Version control — S
 > **Status: started 1 Nov 2026.** Git repository with history; the manifest records the commit (with
-> `-dirty`). Not yet: tagged releases and a remote.
+> `-dirty`); first tag `v0.1.0`; `.github/workflows/tests.yml` runs the offline tests with micromamba
+> (written but not yet run: there is no remote). Not yet: a remote.
 
 `git init`, a first commit, tagged releases, and the commit recorded in the manifest. The
 `.gitignore` already excludes data and rasters.

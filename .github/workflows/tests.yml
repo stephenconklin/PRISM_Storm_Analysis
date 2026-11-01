@@ -1,0 +1,17 @@
+# Offline test suite on every push and pull request. Tests never touch the network (requests go to a
+# closed local port); the QGIS project test is skipped because QGIS isn't installed here.
+name: tests
+on: [push, pull_request]
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          cache-environment: true
+      - run: python -m pytest tests -q
