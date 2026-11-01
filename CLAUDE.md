@@ -44,6 +44,10 @@ That run's outputs (HUC 1408; ppt and tmean for PRISM days Oct 20–31) are in
   name). Errors are caught in `build()` and the traceback freed before `exitQgis()`. Runs under QGIS's Python; relaunches itself there (newest QGIS 3.x app by plist version, so projects open in
   QGIS 3 and 4; else newest QGIS; or `--qgis-python`/`QGIS_PYTHON`) with Anaconda's PROJ/GDAL/PDAL env vars cleared. Pure helpers are testable without
   QGIS. In GDAL Python keep the dataset referenced while using its band (a temporary dataset frees the band).
+- `scripts/report.py` — `<out>/report/storm_report_<start>_<end>.html` (self-contained: hand-built SVG charts, CSS
+  light/dark tokens, no external resources) and `report/figures/*.svg`. Colors are the dataviz skill's validated
+  slots 1–3; check charts by screenshot (headless Chrome) after layout changes. Sections skip with a note when
+  their inputs are missing or for another window
 - PyQGIS returns a NULL object (not None) for empty fields: filter with `is_number()`. Build inside an inner
   function so layer objects are freed before `exitQgis()` (else a segfault on exit).
 - `styles/` — QGIS QML styles embedded into GeoPackages (`layer_styles` table) by `write_default_style`
@@ -99,6 +103,7 @@ python scripts/validate_runoff.py --out DIR --gauge 09342500 09361500
 python scripts/validate_snow.py --out DIR [--start ... --end ...] [--all-snow-c 0 --all-rain-c 3]
 python scripts/subbasin_totals.py --out DIR [--digits 10|12] [--start ... --end ...]
 python scripts/build_qgis_project.py --out DIR [--name NAME] [--qgis-python PATH]
+python scripts/report.py --out DIR [--start ... --end ...] [--gauges SITE ...]
 python -m pytest tests -q
 ```
 On this Mac the shell sets `PROJ_DATA=/opt/anaconda3/share/proj`, an old `proj.db` that breaks pip

@@ -54,7 +54,7 @@ gauges whose basins lie mostly outside the study basin are skipped; `--gauge` ru
 4. ~~**Rain/snow partition** (4)~~ — built 1 Nov 2026, with the SNOTEL check.
 5. ~~**Streamflow comparison** (1.2)~~ — built; ~~**uncertainty roll-up** (3.3)~~ — built 1 Nov 2026 without
    product spread; next **multi-product comparison** (1.3), which feeds 3.3.
-6. **Storm context** (6) and **reports** (7).
+6. **Storm context** (6) and ~~**reports** (7)~~ (built 1 Nov 2026; maps and PDF still open).
 7. **Engineering** (8). Git is started; add CI and release tags at any point, the rest as the tool grows.
 
 ---
@@ -400,6 +400,13 @@ as a table and map.
 ---
 
 ## 7. Reporting — M
+
+> **Status: built 1 Nov 2026** as `scripts/report.py`: self-contained HTML (no external resources, light
+> and dark, hover values, a data table per chart) plus SVG figures. Sections: headline tiles (volume with
+> range, mean/max, releases, snow share, QC), storm timeline (precipitation per PRISM day with rain/snow
+> above discharge and shaded event runoff at up to three gauges), PRISM vs gauges, runoff ratios, uncertainty
+> components, SNOTEL snow check. Not yet: maps in the report (use the QGIS project), PDF, a QC table, method
+> notes beyond the captions.
 
 **Goal:** One command produces a storm report (HTML, optionally PDF) with:
 - summary: window, basin, area, volume with range, mean and max depth

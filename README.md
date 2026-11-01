@@ -16,6 +16,7 @@ Commands:
 | `scripts/validate_runoff.py` | Compares PRISM precipitation volume with streamflow at every USGS gauge in the basin (runoff ratio), flagging gauges regulated by dams |
 | `scripts/validate_snow.py` | Checks the rain/snow split against snow-water gained at SNOTEL stations |
 | `scripts/build_qgis_project.py` | Builds an organized, styled QGIS project from a folder's outputs (run last) |
+| `scripts/report.py` | Writes a self-contained HTML storm report with charts, plus each chart as SVG (run last) |
 
 ## Setup
 
@@ -66,6 +67,7 @@ python scripts/subbasin_totals.py --out data/huc<HUC> --start <YYYY-MM-DD> --end
 python scripts/validate_runoff.py --out data/huc<HUC> --all-gauges --start <YYYY-MM-DD> --end <YYYY-MM-DD>
 python scripts/validate_snow.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD>
 python scripts/build_qgis_project.py --out data/huc<HUC>
+python scripts/report.py --out data/huc<HUC>
 ```
 
 ## Choosing a watershed
@@ -719,6 +721,36 @@ see the event runoff the ratio is built from.
 Drag `validation.gpkg` into QGIS and add all layers (the styles load automatically), or build a full
 project with `build_qgis_project.py`. The [Map guide](#map-guide-layers-symbols-and-how-they-relate-to-prism)
 explains every layer and symbol.
+
+## `report.py`: storm report with charts
+
+```bash
+python scripts/report.py --out data/huc<HUC>                       # window of the latest storm_total.py run
+python scripts/report.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <YYYY-MM-DD> --gauges 09342500 09361500
+```
+Writes `<out>/report/storm_report_<start>_<end>.html`, one page with no external dependencies (open it
+in any browser, email it, or put it on a share), and each chart as an SVG in `<out>/report/figures/` for
+slides and documents. The page follows the viewer's light or dark setting, shows values on hover, and
+has a data table under each chart.
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--start` / `--end` | the latest `storm_total.py` window, else the whole cube | PRISM days |
+| `--gauges` | up to 3 gauges not regulated by dams, with the most event runoff | USGS sites for the storm timeline |
+| `--title` | the basin name | Page title |
+| `--res` | `800m` | or `4km` |
+
+| Section | Shows | Needs (same window) |
+|---|---|---|
+| Headline tiles | Storm volume with its range, basin mean and max, PRISM releases, snow share, QC status | `storm_total.py` (range), `tmean` (snow) |
+| Storm timeline | Basin precipitation per PRISM day (rain and snow) above 15-minute discharge at the chosen gauges, event runoff shaded above the baseflow line | `validate_runoff.py` for the gauges |
+| PRISM vs rain gauges | Storm totals, PRISM vs gauge, with a 1:1 line; PRISM inputs and independent gauges marked; bias, r and RMSE | `validate_stations.py` |
+| Where the water went | Runoff ratio range per gauge, largest basin first, colored by regulation, with the rain-only ratio | `validate_runoff.py` |
+| Volume and its uncertainty | Each uncertainty component and the total range as bars | `storm_total.py` |
+| Snow check | Snow share by elevation at SNOTEL stations, observed vs PRISM split | `validate_snow.py` |
+
+A section whose inputs are missing, or were made for another window, is replaced by a note naming the
+command to run. Rerun the report after a refresh (it reads the outputs; nothing is downloaded).
 
 ## `build_qgis_project.py`: an organized QGIS project
 ```bash
