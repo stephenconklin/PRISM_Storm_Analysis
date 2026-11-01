@@ -61,7 +61,7 @@ import xarray as xr
 
 import manifest
 import qc
-from storm_total import RES_CODES, VAR_UNITS, build_cube, cell_area_m2, geodesic_km2
+from storm_total import RES_CODES, VAR_UNITS, area_grid, build_cube, geodesic_km2
 
 try:
     # Use the OS trust store: services.nacse.org chains to emSign Root CA - G1,
@@ -264,7 +264,7 @@ def clip(grid, basin, out_path, release=""):
 
 def area_mean(arr, transform):
     """Mean of a masked lat/lon array weighted by ellipsoidal cell area (cells shrink northward)."""
-    area = np.repeat(cell_area_m2(transform, arr.shape[0])[:, None], arr.shape[1], axis=1)
+    area = area_grid(transform, arr.shape)
     return float(np.ma.average(arr, weights=area))
 
 
@@ -275,7 +275,7 @@ def day_stats(arr, transform, var="ppt"):
     if var != "ppt":
         return {"basin_mean": round(mean, 2), "basin_min": round(float(arr.min()), 2),
                 "basin_max": round(float(arr.max()), 2)}
-    area = np.repeat(cell_area_m2(transform, arr.shape[0])[:, None], arr.shape[1], axis=1)
+    area = area_grid(transform, arr.shape)
     volume = float((arr / 1000 * area).sum())
     return {"basin_mean_mm": round(mean, 2), "basin_max_mm": round(float(arr.max()), 2),
             "basin_volume_m3": round(volume)}
@@ -353,7 +353,7 @@ def prism_coverage(arr, transform, basin, grid_bounds=None):
     top) is added from the polygon's ellipsoidal area.
     """
     inside = features.geometry_mask(basin.to_crs(4269).geometry, arr.shape, transform, invert=True)
-    area = np.repeat(cell_area_m2(transform, arr.shape[0])[:, None], arr.shape[1], axis=1)
+    area = area_grid(transform, arr.shape)
     basin_m2 = float(area[inside].sum())
     missing_m2 = float(area[inside & np.ma.getmaskarray(arr)].sum())
     if grid_bounds is not None:
@@ -469,7 +469,7 @@ def main():
         grids.append((day, meta["transform"], arr.shape, meta["crs"].to_wkt()))
         if inside is None:
             inside = features.geometry_mask(basin.to_crs(4269).geometry, arr.shape, meta["transform"], invert=True)
-            area = np.repeat(cell_area_m2(meta["transform"], arr.shape[0])[:, None], arr.shape[1], axis=1)
+            area = area_grid(meta["transform"], arr.shape)
         if arr.shape == inside.shape:
             gone = np.ma.getmaskarray(arr) & inside
             always_missing = gone if always_missing is None else always_missing & gone

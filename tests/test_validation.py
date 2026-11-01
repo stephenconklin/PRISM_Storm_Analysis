@@ -467,3 +467,27 @@ def test_gauge_runs_update_only_their_gauges(tmp_path, monkeypatch):
     assert sorted(gpd.read_file(gpkg, layer="gauge_basins")["site"]) == ["A", "B"]
     gauges = gpd.read_file(gpkg, layer="gauges")
     assert sorted(gauges["site"]) == ["A", "B"] and gauges["ratio_low"].dtype.kind == "f"  # numbers, not text
+
+
+def test_awdb_keeps_primary_sensor():
+    from observations import merge_awdb_station
+
+    def block(el, ordinal, value):
+        return {"stationElement": {"elementCode": el, "ordinal": ordinal}, "values": [{"date": "2026-10-22", "value": value}]}
+    st = {"data": [block("WTEQ", 2, 9.9), block("WTEQ", 1, 1.0), block("PRCP", 1, 0.5), block("PRCP", 2, 7.7)]}
+    series = merge_awdb_station({}, st)
+    assert series["WTEQ"]["2026-10-22"] == 1.0 and series["PRCP"]["2026-10-22"] == 0.5
+
+
+def test_event_total_observation_time_change():
+    """A station that moves from 7 AM to midnight readings maps two days onto one PRISM day."""
+    tzo = -7.0
+    recs = []
+    for i, hour in enumerate((7, 7, 24, 24)):
+        d = dt.date(2026, 10, 20) + dt.timedelta(days=i)
+        pday, off = prism_day_for(d, hour, tzo)
+        recs.append({"obs_date": d, "obs_hour": hour, "hour_known": True, "prism_day": pday, "offset_h": off,
+                     "obs_mm": 1.0, "kind": "value"})
+    days = sorted({r["prism_day"] for r in recs})
+    days = [days[0] + dt.timedelta(days=k) for k in range((days[-1] - days[0]).days + 1)]
+    assert event_total(recs, days) == (None, "observation time changed in the window")

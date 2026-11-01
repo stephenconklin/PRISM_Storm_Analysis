@@ -71,8 +71,11 @@ def versions():
     return out
 
 
+HASH_LIMIT_BYTES = 256 * 2 ** 20  # larger outputs (HUC2-size cubes) get size and time instead of a checksum
+
+
 def files_entry(paths, out):
-    """[{path relative to out, bytes, sha256}] for the files that exist."""
+    """[{path relative to out, bytes, sha256 or modified time}] for the files that exist."""
     rows = []
     for p in paths:
         p = Path(p)
@@ -81,7 +84,13 @@ def files_entry(paths, out):
                 rel = str(p.resolve().relative_to(Path(out).resolve()))
             except ValueError:
                 rel = str(p)
-            rows.append({"path": rel, "bytes": p.stat().st_size, "sha256": sha256(p)})
+            size = p.stat().st_size
+            entry = {"path": rel, "bytes": size}
+            if size <= HASH_LIMIT_BYTES:
+                entry["sha256"] = sha256(p)
+            else:
+                entry["modified"] = dt.datetime.fromtimestamp(p.stat().st_mtime).astimezone().isoformat(timespec="seconds")
+            rows.append(entry)
     return rows
 
 

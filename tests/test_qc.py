@@ -125,3 +125,13 @@ def test_pipeline_manifest_and_corrupt_zip(tmp_path):
     assert bad.returncode == 1 and "download_integrity" in bad.stdout and "not a valid zip" in bad.stdout
     assert (raw / "prism_ppt_us_30s_20261022.zip.bad").exists()
     assert len(json.loads((out / "run_manifest.json").read_text())["runs"]) == 3
+
+
+def test_manifest_skips_hash_for_huge_files(tmp_path, monkeypatch):
+    small, big = tmp_path / "a.nc", tmp_path / "b.nc"
+    small.write_bytes(b"x" * 10)
+    big.write_bytes(b"x" * 100)
+    monkeypatch.setattr(manifest, "HASH_LIMIT_BYTES", 50)
+    rows = {r["path"]: r for r in manifest.files_entry([small, big, tmp_path / "missing.nc"], tmp_path)}
+    assert set(rows) == {"a.nc", "b.nc"} and "sha256" in rows["a.nc"]
+    assert "sha256" not in rows["b.nc"] and rows["b.nc"]["bytes"] == 100 and "modified" in rows["b.nc"]

@@ -40,9 +40,7 @@ import numpy as np
 from shapely.geometry import Point
 
 from storm_total import prism_day_files, snow_fraction
-from validate_stations import cube_days, load_basin, sample_grid, write_layer
-
-INCH_MM = 25.4
+from validate_stations import INCH_MM, cube_days, load_basin, sample_grid, write_layer
 
 
 def f_to_c(f):

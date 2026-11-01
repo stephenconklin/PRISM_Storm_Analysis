@@ -101,6 +101,11 @@ def prism_day_files(extracted, var, res, day):
     return grid, (stn[0] if stn else None)
 
 
+def area_grid(transform, shape):
+    """Ellipsoidal area (m^2) of every cell of a (rows, cols) north-up lat/lon grid."""
+    return np.repeat(cell_area_m2(transform, shape[0])[:, None], shape[1], axis=1)
+
+
 def build_cube(clipped_dir, var, res, nc_path, attrs=None):
     """Stack every clipped daily grid into one NetCDF with a time axis and cell areas."""
     tifs = sorted(Path(clipped_dir).glob(f"{var}_{res}_*_clip.tif"))
@@ -122,7 +127,7 @@ def build_cube(clipped_dir, var, res, nc_path, attrs=None):
     h, w = layers[0].shape
     lat = transform.f + (np.arange(h) + 0.5) * transform.e
     lon = transform.c + (np.arange(w) + 0.5) * transform.a
-    area = np.repeat(cell_area_m2(transform, h)[:, None], w, axis=1)
+    area = area_grid(transform, (h, w))
     ds = xr.Dataset(
         {
             var: (("time", "lat", "lon"), np.stack(layers),
@@ -241,7 +246,7 @@ def boundary_volumes(total_mm, transform, geom):
     Cells without PRISM data are left out of all three.
     """
     shape = total_mm.shape
-    area = np.repeat(cell_area_m2(transform, shape[0])[:, None], shape[1], axis=1)
+    area = area_grid(transform, shape)
     cell_m3 = np.where(np.isnan(total_mm), 0.0, total_mm) / 1000 * area
     centers = features.geometry_mask([geom], shape, transform, invert=True)
     touched = features.geometry_mask([geom], shape, transform, all_touched=True, invert=True)
@@ -597,7 +602,7 @@ def boundary_check(out, res, boundary, ds, start, n_days):
     geom = gpd.read_file(files[0]).to_crs(4269).union_all()
     total, transform = national_window_total(grids, ds)
     centers = features.geometry_mask([geom], total.shape, transform, invert=True)
-    area = np.repeat(cell_area_m2(transform, total.shape[0])[:, None], total.shape[1], axis=1)
+    area = area_grid(transform, total.shape)
     return {"volumes": boundary_volumes(total, transform, geom), "grid_km2": float(area[centers].sum()) / 1e6,
             "polygon_km2": geodesic_km2(geom)}
 

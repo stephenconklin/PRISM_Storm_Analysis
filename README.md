@@ -659,7 +659,8 @@ peak time, interpolated hours and approval status.
 |---|---|
 | ok | Complete storm total compared |
 | missing day | The gauge has no report for at least one day in the window |
-| days missing from record | No gauge report lines up with some PRISM day in the window (for example the record ends early, or the observation hour changes mid-window) |
+| days missing from record | No gauge report lines up with some PRISM day in the window (for example the record ends early) |
+| observation time changed in the window | The gauge's reading hour changed mid-window (for example 7 AM to midnight), so two readings fall on one PRISM day and none on another |
 | accumulation starts before window / ends after window | A multi-day total straddles the window edge, so the in-window share is unknown |
 | no PRISM value | The gauge's cell has no PRISM data |
 | day ends too far from PRISM day | Complete total, but the gauge's day ends more than `--max-offset` hours from the PRISM day |

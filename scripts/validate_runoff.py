@@ -65,11 +65,10 @@ import requests
 from shapely.geometry import Point
 import xarray as xr
 
-from storm_total import cell_area_m2, prism_day_files, snow_fraction
+from storm_total import M3_PER_ACRE_FT, area_grid, prism_day_files, snow_fraction
 from validate_stations import load_basin, write_layer
 
 CFS_TO_M3S = 0.028316846592
-M3_PER_ACRE_FT = 1233.48184
 KM2_PER_MI2 = 2.589988
 
 
@@ -108,7 +107,7 @@ def basin_precip(grids, basin, max_missing_pct=1.0, tmean=None, all_snow_c=0.0, 
         if nodata is not None:
             vals[vals == nodata] = np.nan
         inside = features.geometry_mask(shapes, vals.shape, transform, invert=True)
-        area = np.repeat(cell_area_m2(transform, vals.shape[0])[:, None], vals.shape[1], axis=1)
+        area = area_grid(transform, vals.shape)
         area_m2 = float(area[inside].sum())
         if area_m2 == 0:
             raise ValueError("gauge basin covers no PRISM grid cells")

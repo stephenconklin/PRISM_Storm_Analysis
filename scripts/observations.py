@@ -285,8 +285,19 @@ def snotel_daily(triplets, begin, end, elements=("WTEQ", "PRCP", "TAVG")):
                                              "elements": ",".join(elements), "duration": "DAILY",
                                              "beginDate": str(begin), "endDate": str(end)})
         for st in r.json():
-            series = out.setdefault(st["stationTriplet"], {})
-            for block in st.get("data", []):
-                series[block["stationElement"]["elementCode"]] = {v["date"][:10]: v.get("value")
-                                                                  for v in block.get("values", [])}
+            merge_awdb_station(out.setdefault(st["stationTriplet"], {}), st)
     return out
+
+
+def merge_awdb_station(series, station):
+    """Add one AWDB station's data blocks to series ({element: {date: value}}). A station can report two
+    sensors for one element (ordinal 1, 2, ...); the primary sensor (lowest ordinal) is kept."""
+    ordinals = {}
+    for block in station.get("data", []):
+        el = block["stationElement"]["elementCode"]
+        ordinal = block["stationElement"].get("ordinal", 1)
+        if el in series and ordinals.get(el, 1) <= ordinal:
+            continue
+        ordinals[el] = ordinal
+        series[el] = {v["date"][:10]: v.get("value") for v in block.get("values", [])}
+    return series

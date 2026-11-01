@@ -133,6 +133,10 @@ def event_total(recs, days):
     """
     idx = [i for i, r in enumerate(recs) if r["prism_day"] in days]
     if sorted({recs[i]["prism_day"] for i in idx}) != sorted(days) or len(idx) != len(days):
+        hours = {recs[i]["obs_hour"] for i in idx if recs[i]["hour_known"]}
+        if len(hours) > 1 and len(idx) >= len(days) - 1:
+            # e.g. a 7 AM observer switching to midnight: two readings land on one PRISM day, none on another
+            return None, "observation time changed in the window"
         return None, "days missing from record"
     first = idx[0]
     if (recs[first]["kind"] in ("subsequent", "accumulated") and first > 0
@@ -340,10 +344,7 @@ def main():
     def subset(rows, **cond):
         return [r for r in rows if r["in_stats"] and all(r[k] == v for k, v in cond.items())]
 
-    def ev(rows):
-        return stats([r["prism_mm"] for r in rows], [r["obs_mm"] for r in rows])
-
-    def dy(rows):
+    def ev(rows):  # PRISM vs observed, for event totals or days alike
         return stats([r["prism_mm"] for r in rows], [r["obs_mm"] for r in rows])
 
     networks = sorted({r["network"] for r in st_rows})
@@ -359,9 +360,9 @@ def main():
             "independent": ev(subset(st_rows, in_sample=False)), "in_sample": ev(subset(st_rows, in_sample=True)),
             "by_network": {nw: ev(subset(st_rows, network=nw)) for nw in networks}},
         "daily": {
-            "all": dy(subset(day_rows)), "independent": dy(subset(day_rows, in_sample=False)),
-            "in_sample": dy(subset(day_rows, in_sample=True)),
-            "by_network": {nw: dy(subset(day_rows, network=nw)) for nw in networks}},
+            "all": ev(subset(day_rows)), "independent": ev(subset(day_rows, in_sample=False)),
+            "in_sample": ev(subset(day_rows, in_sample=True)),
+            "by_network": {nw: ev(subset(day_rows, network=nw)) for nw in networks}},
         "notes": ["diff and bias are PRISM minus observed.",
                   "in_sample stations were PRISM inputs; their agreement is optimistic.",
                   "Gauges undercatch, especially snow and wind-driven rain at high elevation."]}
