@@ -27,6 +27,10 @@ Usage examples:
 
 The volume raster holds m³ of water per cell; its sum is the basin volume. The
 volume NetCDF holds the same per day (`volume`) plus the window total (`volume_total`).
+
+Each run ends with QC checks for the window (qc.py; --qc-strict turns warnings into
+failures, and any failure gives exit status 1) and appends a record of the run to
+<out>/run_manifest.json.
 """
 import argparse
 import csv
@@ -41,6 +45,9 @@ from rasterio.transform import from_origin
 from rasterio.windows import from_bounds
 import shapely
 import xarray as xr
+
+import manifest
+import qc
 
 # PRISM file names carry a resolution code instead of the resolution: 30s = 800 m, 25m = 4 km.
 RES_CODES = {"800m": "30s", "4km": "25m"}
@@ -181,6 +188,13 @@ def revision_change(history, days):
             "change_pct": (latest - first) / first * 100 if first else 0.0, "revised": revised}
 
 
+def geodesic_km2(geom):
+    """Ellipsoidal (GRS80) area of a lon/lat polygon."""
+    from pyproj import Geod
+    area, _ = Geod(ellps="GRS80").geometry_area_perimeter(geom)
+    return abs(area) / 1e6
+
+
 def cell_fractions(geom, transform, shape):
     """Share of each grid cell inside geom (lat/lon polygon on the grid's CRS); 0 for cells it misses.
 
@@ -312,7 +326,11 @@ def main():
                     help="also write daily and total water volume per cell (m³) to this NetCDF")
     ap.add_argument("--boundary",
                     help="basin polygon for the boundary check (default: the wbd_huc*.geojson in --out)")
+    ap.add_argument("--qc-strict", action="store_true", help="treat QC warnings as failures")
+    ap.add_argument("--qc-max-daily-mm", type=float, default=400.0,
+                    help="flag daily precipitation in any cell above this (default 400 mm)")
     a = ap.parse_args()
+    run = manifest.start_run("storm_total.py", a)
 
     nc = Path(a.out) / f"ppt_{a.res}_daily_clip.nc"
     if not nc.exists():
@@ -331,6 +349,15 @@ def main():
         gap = ds.attrs.get("basin_without_prism_pct", 0)
         basin_km2 = ds.attrs.get("basin_area_km2")
         bounds = boundary_check(Path(a.out), a.res, a.boundary, ds, start, r["days"])
+        daily = r["daily_mm"]
+        day_keys = [str(t)[:10] for t in daily.time.values]
+        day_min = dict(zip(day_keys, daily.min(("lat", "lon")).values.tolist()))
+        day_max = dict(zip(day_keys, daily.max(("lat", "lon")).values.tolist()))
+        has_data = daily.notnull()
+        some, every = has_data.any("time"), has_data.all("time")
+        some_m2 = float(ds.cell_area.where(some).sum())
+        varying = {k: float(ds.cell_area.where(some & ~has_data.isel(time=i)).sum()) / some_m2 * 100
+                   for i, k in enumerate(day_keys)} if some_m2 else {}
 
     v = r["volume_m3"]
     print(f"PRISM days {start} to {end} ({r['days']} days; each ends 12:00 UTC on its date)")
@@ -358,9 +385,10 @@ def main():
     if isinstance(bounds, str):
         print(f"Boundary:    {bounds}")
     else:
-        lo, hi = min(bounds.values()), max(bounds.values())
-        print(f"Boundary:    cell centers {bounds['centers'] / 1e9:.4f} km³, area-weighted {bounds['weighted'] / 1e9:.4f}, "
-              f"any cell touched {bounds['touched'] / 1e9:.4f} (range {(hi - lo) / bounds['weighted'] * 100:.2f}% "
+        vols = bounds["volumes"]
+        lo, hi = min(vols.values()), max(vols.values())
+        print(f"Boundary:    cell centers {vols['centers'] / 1e9:.4f} km³, area-weighted {vols['weighted'] / 1e9:.4f}, "
+              f"any cell touched {vols['touched'] / 1e9:.4f} (range {(hi - lo) / vols['weighted'] * 100:.2f}% "
               "of area-weighted)")
     if a.tif:
         print(f"Total depth raster: {a.tif}")
@@ -369,10 +397,36 @@ def main():
     if a.volume_nc:
         print(f"Volume NetCDF (daily + total m³ per cell): {a.volume_nc}")
 
+    pairs = []
+    if a.volume_tif:
+        with rasterio.open(a.volume_tif) as src:
+            pairs.append(("volume raster sum = reported volume", float(src.read(1, masked=True).astype("float64").sum()), v))
+    if not isinstance(bounds, str):
+        pairs.append(("national-grid volume by cell center = cube volume", bounds["volumes"]["centers"], v))
+    checks = [
+        qc.nodata_inside(varying, gap),
+        qc.physical_limits(day_min, day_max, a.qc_max_daily_mm),
+        qc.totals_reconcile(pairs),
+        qc.release_mix(dict(zip(day_keys, r["releases"]))),
+        (qc.result("boundary_agreement", "skip", bounds) if isinstance(bounds, str)
+         else qc.boundary_agreement(bounds["grid_km2"], bounds["polygon_km2"])),
+    ]
+    if a.qc_strict:
+        checks = qc.apply_strict(checks)
+    print("\n" + "\n".join(qc.report(checks)))
+    run.update(window={"start": start, "end": end}, inputs=manifest.files_entry([nc], a.out),
+               results={"area_km2": r["area_m2"] / 1e6, "mean_mm": r["mean_mm"], "max_mm": r["max_mm"],
+                        "volume_m3": v, "releases": dict(zip(day_keys, r["releases"])),
+                        "boundary_volumes_m3": None if isinstance(bounds, str) else bounds["volumes"]},
+               qc=checks, outputs=manifest.files_entry([f for f in (a.tif, a.volume_tif, a.volume_nc) if f], a.out))
+    print(f"Run recorded in {manifest.append_run(a.out, run).name}")
+    if qc.worst_level(checks) == "fail":
+        sys.exit("QC failed (see above).")
+
 
 def boundary_check(out, res, boundary, ds, start, n_days):
-    """boundary_volumes for the window from the national grids in <out>/extracted, or a note saying why
-    it was skipped."""
+    """{"volumes": boundary_volumes, "grid_km2": area of the cells counted by center, "polygon_km2"} for the
+    window from the national grids in <out>/extracted, or a note saying why it was skipped."""
     import geopandas as gpd
     files = [Path(boundary)] if boundary else sorted(out.glob("wbd_huc*.geojson"))
     if len(files) != 1:
@@ -383,7 +437,10 @@ def boundary_check(out, res, boundary, ds, start, n_days):
         return "skipped: national grids for the window are not all in extracted/"
     geom = gpd.read_file(files[0]).to_crs(4269).union_all()
     total, transform = national_window_total(grids, ds)
-    return boundary_volumes(total, transform, geom)
+    centers = features.geometry_mask([geom], total.shape, transform, invert=True)
+    area = np.repeat(cell_area_m2(transform, total.shape[0])[:, None], total.shape[1], axis=1)
+    return {"volumes": boundary_volumes(total, transform, geom), "grid_km2": float(area[centers].sum()) / 1e6,
+            "polygon_km2": geodesic_km2(geom)}
 
 
 if __name__ == "__main__":

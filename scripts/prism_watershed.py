@@ -34,6 +34,10 @@ Usage examples:
 Also writes <out>/<var>_<res>_daily_clip.nc, a NetCDF stack of every clipped day
 in --out; storm_total.py reads it to total depth and volume for any date range.
 
+Each run ends with QC checks (qc.py; --qc-strict turns warnings into failures, and any
+failure gives exit status 1) and appends a record of the run, with per-day zip checksums,
+releases and info.txt fields, to <out>/run_manifest.json.
+
 Requires: pip install requests numpy rasterio geopandas xarray netCDF4  (optional: truststore)
 """
 import argparse
@@ -47,12 +51,17 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import rasterio
 from rasterio import features
 from rasterio.mask import mask
 import requests
+import shapely
+import xarray as xr
 
-from storm_total import RES_CODES, build_cube, cell_area_m2
+import manifest
+import qc
+from storm_total import RES_CODES, build_cube, cell_area_m2, geodesic_km2
 
 try:
     # Use the OS trust store: services.nacse.org chains to emSign Root CA - G1,
@@ -105,8 +114,9 @@ def zip_name(var, res, region, day, fmt=""):
     return f"prism_{var}_{region}_{RES_CODES[res]}_{day.strftime('%Y%m%d')}{suffix}.zip"
 
 
-def fetch_zip(var, res, region, day, fmt, path, session):
-    """Download one daily zip to path. Returns False (printing PRISM's message) if no zip came back."""
+def fetch_zip(var, res, region, day, fmt, path, session, errors=None):
+    """Download one daily zip to path. Returns False (printing PRISM's message, and saving it in
+    errors[day] if given) if no zip came back."""
     ymd = day.strftime("%Y%m%d")
     url = PRISM_URL.format(region=region, res=res, var=var, date=ymd)
     params = {"format": fmt} if fmt else None
@@ -115,16 +125,19 @@ def fetch_zip(var, res, region, day, fmt, path, session):
     if r.status_code != 200 or "zip" not in ctype:
         # The service returns a short text message when data isn't available yet
         # or when the 2-downloads-per-24h limit is hit.
-        print(f"  {ymd}: not downloaded ({r.status_code}) {r.text[:200].strip()}")
+        message = f"not downloaded ({r.status_code}) {r.text[:200].strip()}"
+        print(f"  {ymd}: {message}")
+        if errors is not None:
+            errors[day] = message
         return False
     path.write_bytes(r.content)
     return True
 
 
-def download_day(var, res, region, day, fmt, raw_dir, session):
+def download_day(var, res, region, day, fmt, raw_dir, session, errors=None):
     """Download one daily zip (cached). Returns the zip path or None."""
     path = raw_dir / zip_name(var, res, region, day, fmt)
-    if path.exists() or fetch_zip(var, res, region, day, fmt, path, session):
+    if path.exists() or fetch_zip(var, res, region, day, fmt, path, session, errors):
         return path
     return None
 
@@ -138,13 +151,28 @@ def parse_release(text):
     return ""
 
 
-def zip_release(zpath):
-    """Release number recorded in a PRISM zip's info.txt ('' if none)."""
+def zip_info(zpath):
+    """Text of a PRISM zip's info.txt ('' if none)."""
     with zipfile.ZipFile(zpath) as z:
         for name in z.namelist():
             if "info" in Path(name).name and name.endswith(".txt"):
-                return parse_release(z.read(name).decode(errors="ignore"))
+                return z.read(name).decode(errors="ignore")
     return ""
+
+
+def zip_release(zpath):
+    """Release number recorded in a PRISM zip's info.txt ('' if none)."""
+    return parse_release(zip_info(zpath))
+
+
+def zip_problem(zpath):
+    """'' if the zip opens and its members' CRCs check out, else what is wrong."""
+    try:
+        with zipfile.ZipFile(zpath) as z:
+            bad = z.testzip()
+        return f"corrupt member {bad}" if bad else ""
+    except zipfile.BadZipFile as e:
+        return f"not a valid zip ({e})"
 
 
 def folder_release(folder):
@@ -161,7 +189,7 @@ def due_for_refresh(release, last_downloaded, today, target, age_days):
     return (today - last_downloaded).days >= age_days
 
 
-def refresh_day(var, res, region, day, fmt, raw_dir, session):
+def refresh_day(var, res, region, day, fmt, raw_dir, session, errors=None):
     """Re-download a cached zip. Returns (old release, new release), or None if nothing came back.
 
     If the release changed, the old zip moves to raw_zips/releases/<name>_r<old>.zip; if not, the new
@@ -170,7 +198,7 @@ def refresh_day(var, res, region, day, fmt, raw_dir, session):
     path = raw_dir / zip_name(var, res, region, day, fmt)
     old = zip_release(path)
     part = path.with_name(path.name + ".part")
-    if not fetch_zip(var, res, region, day, fmt, part, session):
+    if not fetch_zip(var, res, region, day, fmt, part, session, errors):
         return None
     new = zip_release(part)
     if new != old:
@@ -238,6 +266,12 @@ def clipped_day(path, summary_csv):
     return release, day_stats(arr, transform)
 
 
+def stations_near(stn_csv, zone):
+    """PRISM input stations (from a zip's stn.csv) inside zone, a lon/lat polygon."""
+    df = pd.read_csv(stn_csv, skiprows=1)  # first line describes the file
+    return int(shapely.contains_xy(zone, df["Longitude"].to_numpy(), df["Latitude"].to_numpy()).sum())
+
+
 HISTORY_FIELDS = ["date", "release", "basin_mean_mm", "basin_max_mm", "basin_volume_m3", "recorded"]
 
 
@@ -292,7 +326,15 @@ def main():
     ap.add_argument("--target-release", type=int, default=8, help="release to refresh up to (default 8, final)")
     ap.add_argument("--refresh-age", type=float, default=7,
                     help="only re-download zips last downloaded at least this many days ago (default 7)")
+    ap.add_argument("--qc-strict", action="store_true", help="treat QC warnings as failures")
+    ap.add_argument("--qc-max-daily-mm", type=float, default=400.0,
+                    help="flag daily precipitation in any cell above this (default 400 mm)")
+    ap.add_argument("--qc-station-buffer-km", type=float, default=10.0,
+                    help="count PRISM input stations this far outside the basin (default 10 km)")
+    ap.add_argument("--qc-min-stations", type=float, default=0.5,
+                    help="warn below this many PRISM input stations per 1,000 km² (default 0.5)")
     a = ap.parse_args()
+    run = manifest.start_run("prism_watershed.py", a)
     if a.huc and not (a.huc.isdigit() and len(a.huc) % 2 == 0 and 2 <= len(a.huc) <= 16):
         ap.error("--huc must be 2, 4, 6, 8, 10, 12, 14 or 16 digits")
 
@@ -304,13 +346,23 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     basin = get_boundary(a.huc, a.boundary, out)
+    run["basin"] = ({"huc": a.huc, "wbd_layer_url": WBD_URL.format(layer=len(a.huc) // 2),
+                     "where": f"huc{len(a.huc)}='{a.huc}'",
+                     "cached_file": manifest.files_entry(sorted(out.glob(f"wbd_huc{a.huc}.geojson")), out)}
+                    if a.huc else {"boundary": str(Path(a.boundary).resolve()),
+                                   "sha256": manifest.sha256(a.boundary)})
+    utm = basin.estimate_utm_crs()
+    station_zone = basin.to_crs(utm).buffer(a.qc_station_buffer_km * 1000).to_crs(4269).union_all()
     session = requests.Session()
     session.headers["User-Agent"] = "prism-data-wrangler"
 
     summary_csv = out / "daily_basin_summary.csv"
     today, recorded = dt.date.today(), dt.datetime.now().isoformat(timespec="seconds")
     rows, history, changes, total, meta = [], [], [], None, None
-    for day in daterange(start, end):
+    errors, downloads, grids, stations, day_min, day_max, missing_m2 = {}, [], [], {}, {}, {}, {}
+    inside = area = always_missing = None
+    requested = list(daterange(start, end))
+    for day in requested:
         ymd = day.strftime("%Y%m%d")
         cached = raw / zip_name(a.var, a.res, a.region, day, a.format)
         clip_path = clipped / f"{a.var}_{a.res}_{ymd}_clip.tif"
@@ -320,20 +372,46 @@ def main():
         if (a.refresh and cached.exists() and due_for_refresh(
                 zip_release(cached), dt.date.fromtimestamp(cached.stat().st_mtime), today,
                 a.target_release, a.refresh_age)):
-            change = refresh_day(a.var, a.res, a.region, day, a.format, raw, session)
+            change = refresh_day(a.var, a.res, a.region, day, a.format, raw, session, errors)
             time.sleep(a.pause)
             if change:
                 print(f"  {ymd}: " + (f"release {change[0] or '?'} -> {change[1]}" if change[0] != change[1]
                                       else f"still release {change[1]}"))
         had_zip = cached.exists()
-        zpath = download_day(a.var, a.res, a.region, day, a.format, raw, session)
+        zpath = download_day(a.var, a.res, a.region, day, a.format, raw, session, errors)
         if not had_zip:
             time.sleep(a.pause)
         if zpath is None:
+            downloads.append({"date": day, "error": errors.get(day, "no zip")})
+            continue
+        problem = zip_problem(zpath)
+        if problem:
+            bad = zpath.with_name(zpath.name + ".bad")
+            zpath.replace(bad)  # so the next run downloads it again
+            errors[day] = f"{problem}; moved to {bad.name}"
+            print(f"  {ymd}: {errors[day]}")
+            downloads.append({"date": day, "error": errors[day]})
             continue
         grid, release = extract_grid(zpath, ext)
         arr, meta = clip(grid, basin, clip_path, release)
         total = arr.copy() if total is None else total + arr
+        downloads.append({"date": day, "error": "", "zip": zpath.name, "bytes": zpath.stat().st_size,
+                          "sha256": manifest.sha256(zpath), "release": release,
+                          "url": PRISM_URL.format(region=a.region, res=a.res, var=a.var, date=ymd)
+                          + (f"?format={a.format}" if a.format else ""),
+                          "info": manifest.info_fields(zip_info(zpath))})
+        grids.append((day, meta["transform"], arr.shape, meta["crs"].to_wkt()))
+        if inside is None:
+            inside = features.geometry_mask(basin.to_crs(4269).geometry, arr.shape, meta["transform"], invert=True)
+            area = np.repeat(cell_area_m2(meta["transform"], arr.shape[0])[:, None], arr.shape[1], axis=1)
+        if arr.shape == inside.shape:
+            gone = np.ma.getmaskarray(arr) & inside
+            always_missing = gone if always_missing is None else always_missing & gone
+            missing_m2[day] = float(area[gone].sum())
+        day_min[day], day_max[day] = float(arr.min()), float(arr.max())
+        stn = sorted(Path(grid).parent.glob("*.stn.csv"))
+        if stn:
+            stations[day] = stations_near(stn[0], station_zone)
         stats = day_stats(arr, meta["transform"])
         rows.append({"date": day.isoformat(), "release": release,
                      "basin_mean_mm": stats["basin_mean_mm"], "basin_max_mm": stats["basin_max_mm"],
@@ -388,6 +466,41 @@ def main():
                              "basin_without_prism_pct": round(missing_pct, 2)})
     print(f"Daily cube: {cube.name} (use storm_total.py for any date range)")
     print(f"Outputs in {out.resolve()}")
+
+    # QC: this run's days, plus the cube they went into.
+    total_tif = out / f"{a.var}_{a.res}_total_{tag}.tif"
+    run_days = [dt.date.fromisoformat(r["date"]) for r in rows]
+    with xr.open_dataset(cube) as ds:
+        cube_days = set(ds.time.values.astype("datetime64[D]").astype(object))
+        cube_sum = float(ds[a.var].sel(time=[np.datetime64(d, "ns") for d in run_days]).sum("time", skipna=False).sum())
+    with rasterio.open(total_tif) as src:
+        tif_sum = float(src.read(1, masked=True).astype("float64").sum())
+    basin_m2 = float(area[inside].sum())
+    constant_m2 = float(area[always_missing].sum()) if always_missing is not None else 0.0
+    checks = [
+        qc.completeness(requested, [d for d in run_days if d in cube_days]),
+        qc.download_integrity(downloads),
+        qc.grid_consistency(grids),
+        qc.nodata_inside({str(d): (m - constant_m2) / basin_m2 * 100 for d, m in missing_m2.items()},
+                         constant_m2 / basin_m2 * 100),
+        (qc.physical_limits(day_min, day_max, a.qc_max_daily_mm) if a.var == "ppt"
+         else qc.result("physical_limits", "skip", f"limits are for ppt, not {a.var}")),
+        qc.totals_reconcile([("cube sum = event-total raster", cube_sum, tif_sum)]),
+        qc.release_mix({r["date"]: r["release"] for r in rows}),
+        qc.station_density(stations, basin_km2, a.qc_station_buffer_km, a.qc_min_stations),
+        qc.boundary_agreement(basin_km2, geodesic_km2(basin.to_crs(4269).geometry.iloc[0])),
+    ]
+    if a.qc_strict:
+        checks = qc.apply_strict(checks)
+    print("\n" + "\n".join(qc.report(checks)))
+
+    run.update(window={"start": str(start), "end": str(end)}, days=downloads, qc=checks,
+               outputs=manifest.files_entry([cube, total_tif, summary_csv, history_csv]
+                                            + [clipped / f"{a.var}_{a.res}_{d.strftime('%Y%m%d')}_clip.tif"
+                                               for d in run_days], out))
+    print(f"Run recorded in {manifest.append_run(out, run).name}")
+    if qc.worst_level(checks) == "fail":
+        sys.exit("QC failed (see above).")
 
 
 if __name__ == "__main__":

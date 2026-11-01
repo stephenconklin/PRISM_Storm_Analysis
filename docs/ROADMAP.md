@@ -15,10 +15,10 @@ Effort: **S** (an afternoon), **M** (a few days), **L** (a week or more).
 | Download / clip | `prism_watershed.py`: any HUC or polygon, cached zips, `--refresh` to newer PRISM releases with a per-release history |
 | Totals / volume | `storm_total.py`: any date window; depth, ellipsoidal per-cell volume, GeoTIFF / NetCDF outputs |
 | Lookup | `find_huc.py`: WBD name search |
-| QC | Missing days in a window are an error; everything else was checked by hand |
+| QC | `qc.py`: nine checks at the end of every `prism_watershed.py` and `storm_total.py` run, `--qc-strict` |
 | Uncertainty | None reported; totals are single numbers |
 | Validation | `validate_stations.py` (gauges, 1.1) and `validate_runoff.py` (streamflow, 1.2) built 31 Oct 2026; 1.3 not started |
-| Provenance | Release number per day in the CSV, clipped tifs and cube; release history CSV; no run record |
+| Provenance | `run_manifest.json` (one entry per run); releases in the CSV, clipped tifs and cube; release history CSV |
 | Engineering | Scripts plus offline pytest; no packaging, logging, CI or git |
 
 ## Multi-basin test (31 Oct 2026)
@@ -52,7 +52,7 @@ gauges whose basins lie mostly outside the study basin are skipped; `--gauge` ru
 
 ## Suggested order
 
-1. **QC checks and run manifest** (sections 2 and 5). Cheap, and every later feature reports through them.
+1. ~~**QC checks and run manifest** (sections 2 and 5.1)~~ — built 1 Nov 2026.
 2. ~~**Uncertainty: revision and boundary sensitivity** (3.1, 3.2)~~ — built 1 Nov 2026.
 3. ~~**Station validation** (1.1)~~ — built; follow-ups listed in 1.1.
 4. **Rain/snow partition** (4). Needed before the runoff comparison means anything in mountain basins.
@@ -197,6 +197,13 @@ aligned and documented.
 
 ## 2. Automated QC checks — S/M
 
+> **Status: built 1 Nov 2026** as `scripts/qc.py`, called by `prism_watershed.py` and `storm_total.py`;
+> results print at the end of each run and go into `run_manifest.json`. A failure exits with status 1 after
+> outputs are written. Changes from the plan: a nodata gap that is the same every day (outside PRISM
+> coverage) is a warning, not a failure, so border basins don't always fail; cells missing on only some
+> days follow the warn >0 / fail >1% rule. A corrupt cached zip is renamed `.bad`. Station density
+> threshold defaults to 0.5 per 1,000 km² (San Juan: 1.80); revisit after more basins.
+
 **Goal:** Every run ends with a QC report of pass / warn / fail checks, also saved as JSON.
 
 | Check | Rule (starting point) | Level |
@@ -302,6 +309,11 @@ rain/snow maps.
 ## 5. Provenance and reproducibility
 
 ### 5.1 Run manifest — S
+
+> **Status: built 1 Nov 2026** as `scripts/manifest.py`. `<out>/run_manifest.json` holds a `runs` list with
+> one entry appended per run (folders are refreshed over time, so entries are never overwritten). The
+> validation and subbasin scripts don't write entries yet. Tool version is the git commit until there
+> are tagged releases.
 **Goal:** A `run_manifest.json` in each output folder recording how the outputs were made.
 
 **Contents:** command line and parsed arguments; start and end time; tool version and git commit;

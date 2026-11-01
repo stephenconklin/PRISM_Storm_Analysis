@@ -17,6 +17,10 @@ That run's outputs (HUC 1408, PRISM days Oct 20–27) are in
   `extracted/`), and a CLI that totals depth/volume for any date range from the cube, with releases, revision
   change (from the release history) and boundary sensitivity (centers / area-weighted / touched, from the national
   grids). Volumes use per-row GRS80 cell areas on the native grid; don't reproject or resample.
+- `scripts/qc.py` — pure QC check functions (pass/warn/fail/skip) run at the end of `prism_watershed.py` and
+  `storm_total.py`; any fail → exit status 1 after outputs are written; `--qc-strict` makes warnings fail
+- `scripts/manifest.py` — appends one entry per run to `<out>/run_manifest.json` (`runs` list): command, git
+  commit, versions, basin source, per-day URL/SHA-256/release/info.txt fields, outputs with SHA-256, QC
 - `scripts/observations.py` — all network access for validation (RCC-ACIS stations, USGS Water Data API, NLDI,
   National Inventory of Dams); `_get` retries 429/503 and raises `RateLimited` on long waits
 - `scripts/validate_stations.py` — gauge vs PRISM comparison; pure functions for ACIS parsing, day alignment,
@@ -36,7 +40,7 @@ That run's outputs (HUC 1408, PRISM days Oct 20–27) are in
 - `styles/` — QGIS QML styles embedded into GeoPackages (`layer_styles` table) by `write_default_style`
 - `docs/ROADMAP.md` — planned features with approach and done-criteria; read it before starting new feature work
   and update it as items land
-- `tests/test_offline.py` — offline test using synthetic rasters (no network)
+- `tests/test_offline.py` — offline test using synthetic rasters (no network); `tests/test_qc.py` — QC and manifest
 - `data/` — all downloads and outputs (git-ignored; never commit rasters)
 
 `prism_watershed.py` requires `--start`, `--end`, and one of `--huc`/`--boundary`.

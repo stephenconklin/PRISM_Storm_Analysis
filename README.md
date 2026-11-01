@@ -117,6 +117,10 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 | `--refresh` | off | Re-download cached days below `--target-release` to pick up PRISM's revisions (see Updating to newer PRISM releases) |
 | `--target-release` | `8` | Release to refresh up to (8 is final) |
 | `--refresh-age` | `7` | Only re-download a zip last downloaded at least this many days ago |
+| `--qc-strict` | off | Treat QC warnings as failures (see QC checks and run manifest) |
+| `--qc-max-daily-mm` | `400` | Flag a daily cell above this much precipitation |
+| `--qc-station-buffer-km` | `10` | Count PRISM input stations this far outside the basin |
+| `--qc-min-stations` | `0.5` | Warn below this many PRISM input stations per 1,000 km² |
 
 ### Outputs (in `--out`)
 
@@ -127,12 +131,53 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 | `wbd_huc<code>.geojson` | Cached basin boundary from USGS WBD (with `--huc`) |
 | `clipped/<var>_<res>_YYYYMMDD_clip.tif` | Each day clipped to the basin (mm for `ppt`), tagged with its PRISM release (`PRISM_DATASET_RELEASE_NUMBER`) |
 | `daily_basin_summary.csv` | Per day: PRISM release number, basin mean and max (mm), basin mean (in). Covers every day in the folder; a run replaces its own days |
+| `run_manifest.json` | One entry per run of `prism_watershed.py` or `storm_total.py`: command, versions, inputs, outputs with checksums, QC results |
 | `<var>_<res>_release_history.csv` | One row per day and PRISM release seen in this folder: basin mean and max (mm), basin volume (m³), when recorded |
 | `<var>_<res>_total_<start>_<end>.tif` | Sum of the run's days per pixel (mm for `ppt`) |
 | `<var>_<res>_daily_clip.nc` | NetCDF cube: every clipped day in the folder on a time axis (`<var>`, mm) plus `cell_area` (m²) and `release` (PRISM release per day; 0 unknown). Rebuilt on each run, so new days are added automatically |
 
 All rasters are on PRISM's native grid (1/120°, ≈800 m) in NAD83 (EPSG:4269), nodata −9999 or NaN
 outside the basin.
+
+### QC checks and run manifest
+
+Each run of `prism_watershed.py` and `storm_total.py` ends with a QC block, for example:
+
+```
+QC: WARN
+  PASS  completeness         all 12 days present
+  PASS  download_integrity   12 zips open; SHA-256 recorded
+  PASS  grid_consistency     12 days on one grid (292 x 518 cells)
+  PASS  nodata_inside        no nodata inside the basin
+  PASS  physical_limits      no negatives; largest daily cell 101.7 mm (limit 400)
+  PASS  totals_reconcile     cube sum = event-total raster agree
+  WARN  release_mix          12 days at release 1-2 (PRISM revises them within weeks); mixed releases r1, r2
+  PASS  station_density      116 stations in the basin or within 10 km of it on 2026-10-30 (1.80 per 1,000 km²; warn below 0.5)
+  PASS  boundary_agreement   grid 64,558.0 km² vs polygon 64,569.1 km² (-0.02%; warn beyond 1%)
+```
+
+| Check | Fails or warns when |
+|---|---|
+| `completeness` | A requested day was not downloaded or is not in the cube (fail) |
+| `download_integrity` | A download returned no zip (PRISM's message is quoted) or a zip is corrupt (fail). A corrupt cached zip is renamed `.bad` so the next run downloads it again |
+| `grid_consistency` | Days differ in transform, shape or CRS (fail) |
+| `nodata_inside` | Basin cells lack data on some days only: above 0 (warn) or 1% (fail). A gap that is the same every day, such as the part of a basin in Canada, is a warning |
+| `physical_limits` | Negative precipitation (fail) or a daily cell above `--qc-max-daily-mm` (warn). `ppt` only |
+| `totals_reconcile` | The cube's sum differs from the event-total raster; in `storm_total.py`, the volume raster or the national-grid volume differs from the reported volume (fail) |
+| `release_mix` | The window has release 1–2 days, unknown releases, or a mix of releases (warn) |
+| `station_density` | Fewer than `--qc-min-stations` PRISM input stations (from each day's `stn.csv`) per 1,000 km² in the basin plus `--qc-station-buffer-km` (warn) |
+| `boundary_agreement` | The area of the cells counted as the basin differs from the polygon's ellipsoidal area by more than 1% (warn) |
+
+`storm_total.py` runs the checks that apply to a window (no completeness, download or grid checks,
+since the cube is one grid and missing days are already an error). `--qc-strict` turns warnings into
+failures. If any check fails, the script still writes its outputs, then exits with status 1.
+
+`run_manifest.json` keeps one entry per run, so a folder refreshed over months keeps its whole history.
+Each entry has the command line and arguments, start and end time, git commit (with `-dirty` for
+uncommitted changes), Python and package versions (including GDAL and PROJ), the basin source (HUC and
+WBD query, or boundary file and SHA-256), per day the PRISM URL, zip SHA-256, release and all
+`info.txt` fields, the output files with SHA-256, and the QC results. `storm_total.py` entries also
+record the window results.
 
 ### Updating to newer PRISM releases
 
