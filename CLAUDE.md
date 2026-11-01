@@ -17,6 +17,9 @@ That run's outputs (HUC 1408, PRISM days Oct 20–27) are in
   `extracted/`), and a CLI that totals depth/volume for any date range from the cube, with releases, revision
   change (from the release history) and boundary sensitivity (centers / area-weighted / touched, from the national
   grids). Volumes use per-row GRS80 cell areas on the native grid; don't reproject or resample.
+- `scripts/uncertainty.py` — pure components (gauges, boundary, revisions, products) and the bounding range
+  (sum of lows/highs) for `storm_total.py`; writes `<out>/ppt_<res>_uncertainty_<start>_<end>.json`, which the QGIS
+  basin label reads. Method and judgments in `docs/UNCERTAINTY.md`; keep it in step with the code
 - `scripts/qc.py` — pure QC check functions (pass/warn/fail/skip) run at the end of `prism_watershed.py` and
   `storm_total.py`; any fail → exit status 1 after outputs are written; `--qc-strict` makes warnings fail
 - `scripts/manifest.py` — appends one entry per run to `<out>/run_manifest.json` (`runs` list): command, git

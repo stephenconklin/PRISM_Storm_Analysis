@@ -35,6 +35,12 @@ Usage examples:
 The volume raster holds m³ of water per cell; its sum is the basin volume. The
 volume NetCDF holds the same per day (`volume`) plus the window total (`volume_total`).
 
+Uncertainty: the report ends with the volume's components of uncertainty (gauge comparison
+from validate_stations.py for the same window, basin boundary, PRISM revisions so far; other
+products not yet assessed) and a bounding range, saved to
+<out>/ppt_<res>_uncertainty_<start>_<end>.json. With a tmean cube, the rain volume is also
+given across --ramp-alternatives. Method: docs/UNCERTAINTY.md.
+
 Each run ends with QC checks for the window (qc.py; --qc-strict turns warnings into
 failures, and any failure gives exit status 1) and appends a record of the run to
 <out>/run_manifest.json.
@@ -42,6 +48,7 @@ failures, and any failure gives exit status 1) and appends a record of the run t
 import argparse
 import csv
 import datetime as dt
+import json
 import sys
 from pathlib import Path
 
@@ -55,6 +62,7 @@ import xarray as xr
 
 import manifest
 import qc
+import uncertainty
 
 # PRISM file names carry a resolution code instead of the resolution: 30s = 800 m, 25m = 4 km.
 RES_CODES = {"800m": "30s", "4km": "25m"}
@@ -413,6 +421,8 @@ def main():
     ap.add_argument("--rain-tif", help="also write the window's total rain (mm) to this GeoTIFF (needs the tmean cube)")
     ap.add_argument("--snow-tif", help="also write the window's total snow-water (mm) to this GeoTIFF")
     ap.add_argument("--rain-snow-nc", help="also write daily rain, snow and snow fraction plus totals to this NetCDF")
+    ap.add_argument("--ramp-alternatives", default="-1,3 1,1",
+                    help="other rain/snow ramps (all-snow,all-rain °C pairs) for the rain volume range (default '-1,3 1,1')")
     ap.add_argument("--qc-strict", action="store_true", help="treat QC warnings as failures")
     ap.add_argument("--qc-max-daily-mm", type=float, default=400.0,
                     help="flag daily precipitation in any cell above this (default 400 mm)")
@@ -439,7 +449,12 @@ def main():
         part = partition_window(a.out, a.res, ds, r, a.all_snow_c, a.all_rain_c)
         if isinstance(part, str) and (a.rain_tif or a.snow_tif or a.rain_snow_nc):
             sys.exit(f"Rain/snow outputs requested but the partition was {part}")
+        alt_rain = {}
         if not isinstance(part, str):
+            for pair in a.ramp_alternatives.split():
+                t_snow, t_rain = (float(x) for x in pair.split(","))
+                alt = partition_window(a.out, a.res, ds, r, t_snow, t_rain)
+                alt_rain[pair] = alt["rain_m3"]
             if a.rain_tif:
                 write_tif(part["rain_total_mm"], ds.crs.attrs["crs_wkt"], a.rain_tif, "mm")
             if a.snow_tif:
@@ -470,6 +485,7 @@ def main():
         print("             Release 8 is final; earlier releases change for about 6 months. To pick up revisions, "
               "re-run prism_watershed.py with --refresh.")
     history_csv = Path(a.out) / f"ppt_{a.res}_release_history.csv"
+    rc = None
     if history_csv.exists():
         with open(history_csv, newline="") as f:
             rc = revision_change(list(csv.DictReader(f)), days)
@@ -496,6 +512,29 @@ def main():
         print(f"Boundary:    cell centers {vols['centers'] / 1e9:.4f} km³, area-weighted {vols['weighted'] / 1e9:.4f}, "
               f"any cell touched {vols['touched'] / 1e9:.4f} (range {(hi - lo) / vols['weighted'] * 100:.2f}% "
               "of area-weighted)")
+    stations_json = Path(a.out) / "validation" / "stations_summary.json"
+    event_totals = None
+    if stations_json.exists():
+        sj = json.loads(stations_json.read_text())
+        if sj.get("window", {}).get("start") == start and sj["window"].get("end") == end:
+            event_totals = sj.get("event_totals")
+    components = [uncertainty.gauge_component(event_totals),
+                  uncertainty.boundary_component(None if isinstance(bounds, str) else bounds["volumes"], v),
+                  uncertainty.revision_component(rc, r["releases"]),
+                  uncertainty.product_component()]
+    print("\n".join(uncertainty.report(v, components)))
+    v_lo, v_hi = uncertainty.volume_range(v, components)
+    unc = {"window": {"start": start, "end": end}, "volume_m3": v, "range_m3": [v_lo, v_hi],
+           "range_pct": list(uncertainty.bounding_range(components)), "components": components}
+    if alt_rain:
+        rains = [part["rain_m3"]] + list(alt_rain.values())
+        unc["rain"] = {"rain_m3": part["rain_m3"], "range_m3": [min(rains), max(rains)],
+                       "ramps": {f"{a.all_snow_c:g},{a.all_rain_c:g}": part["rain_m3"], **alt_rain}}
+        print(f"  rain       {min(rains) / 1e9:.3f}-{max(rains) / 1e9:.3f} km³ across ramps "
+              f"{a.all_snow_c:g},{a.all_rain_c:g} (used) and {', '.join(alt_rain)} °C; shifts water between rain "
+              "and snow, not the total")
+    unc_json = Path(a.out) / f"ppt_{a.res}_uncertainty_{start.replace('-', '')}_{end.replace('-', '')}.json"
+    unc_json.write_text(json.dumps(unc, indent=2))
     if a.tif:
         print(f"Total depth raster: {a.tif}")
     if a.volume_tif:
@@ -534,9 +573,10 @@ def main():
                         "boundary_volumes_m3": None if isinstance(bounds, str) else bounds["volumes"],
                         "rain_snow": part if isinstance(part, str) else {
                             "rain_m3": part["rain_m3"], "snow_m3": part["snow_m3"], "all_snow_c": a.all_snow_c,
-                            "all_rain_c": a.all_rain_c, "tmean_releases": part["tmean_releases"]}},
+                            "all_rain_c": a.all_rain_c, "tmean_releases": part["tmean_releases"]},
+                        "uncertainty": unc},
                qc=checks, outputs=manifest.files_entry([f for f in (a.tif, a.volume_tif, a.volume_nc, a.rain_tif,
-                                                                    a.snow_tif, a.rain_snow_nc) if f], a.out))
+                                                                    a.snow_tif, a.rain_snow_nc, unc_json) if f], a.out))
     print(f"Run recorded in {manifest.append_run(a.out, run).name}")
     if qc.worst_level(checks) == "fail":
         sys.exit("QC failed (see above).")

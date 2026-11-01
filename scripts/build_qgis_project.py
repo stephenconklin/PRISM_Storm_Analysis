@@ -149,6 +149,15 @@ def discover(out):
     return found
 
 
+def volume_range_km3(out, start, end):
+    """(low, high) km³ from storm_total.py's uncertainty file for the window, or None."""
+    files = sorted(Path(out).glob(f"ppt_*_uncertainty_{str(start).replace('-', '')}_{str(end).replace('-', '')}.json"))
+    if not files:
+        return None
+    lo, hi = json.loads(files[0].read_text())["range_m3"]
+    return lo / 1e9, hi / 1e9
+
+
 def releases(summary_csv):
     """{date: release} from daily_basin_summary.csv, if present."""
     if not Path(summary_csv).exists():
@@ -554,7 +563,10 @@ def _build_project(a):
             t = next(basin_lyr.getFeatures())
             af = t["volume_acre_ft"]
             af_text = f"{af / 1e6:.2f} million acre-ft" if af >= 1e6 else f"{af:,.0f} acre-ft"
-            basin_lyr.setName(f"{basin_lyr.name()}: {t['volume_km3']:.2f} km³ ({af_text}), mean {t['mean_mm']:.0f} mm")
+            vr = volume_range_km3(out, t["prism_start"], t["prism_end"])
+            range_text = f" (range {vr[0]:.2f}–{vr[1]:.2f})" if vr else ""
+            basin_lyr.setName(f"{basin_lyr.name()}: {t['volume_km3']:.2f} km³{range_text} ({af_text}), "
+                              f"mean {t['mean_mm']:.0f} mm")
         outline = QgsFillSymbol.createSimple({"color": "0,0,0,0", "outline_color": "230,60,180",
                                               "outline_width": "0.8"})
         basin_lyr.setRenderer(QgsSingleSymbolRenderer(outline))
@@ -566,7 +578,9 @@ def _build_project(a):
                   "'mean ' || format_number(\"mean_mm\", 0) || ' mm, max ' || format_number(\"max_mm\", 0) "
                   "|| ' mm, PRISM days ' || \"prism_start\" || ' to ' || \"prism_end\" || "
                   "CASE WHEN \"coverage_pct\" < 99.5 THEN '\\n(' || format_number(100 - \"coverage_pct\", 1) "
-                  "|| '% of the basin has no PRISM data)' ELSE '' END", (150, 20, 110), 11, bold=True, box=True,
+                  "|| '% of the basin has no PRISM data)' ELSE '' END"
+                  + (f" || '\\nrange {vr[0]:.2f}–{vr[1]:.2f} km³ (uncertainty components: storm_total.py)'" if vr else ""),
+                  (150, 20, 110), 11, bold=True, box=True,
                   priority=10, outside_top_left=True)
             basin_lyr.setMapTipTemplate(
                 "<b>[% \"name\" %]</b><br>Storm total: [% format_number(\"volume_km3\", 3) %] km³ = "

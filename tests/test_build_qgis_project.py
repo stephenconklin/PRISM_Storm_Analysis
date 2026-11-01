@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from build_qgis_project import (diff_breaks, discover, is_number, nice_breaks, nice_round, tif_kind, utm_epsg,  # noqa: E402
+from build_qgis_project import (diff_breaks, discover, is_number, nice_breaks, nice_round, tif_kind, utm_epsg, volume_range_km3,  # noqa: E402
                                 version_key, window_label)
 
 
@@ -70,3 +70,10 @@ def test_tif_kind():
     assert tif_kind("volume_m3") == "volume" and tif_kind("ppt_800m_volume_m3_20261020_20261027") == "volume"
     assert tif_kind("rain_mm_20261020_20261027") == "rain" and tif_kind("snow_mm_20261020_20261027") == "snow"
     assert tif_kind("depth_mm") == "depth"
+
+
+def test_volume_range_km3(tmp_path):
+    import json
+    (tmp_path / "ppt_800m_uncertainty_20261020_20261027.json").write_text(json.dumps({"range_m3": [4.6e9, 4.9e9]}))
+    assert volume_range_km3(tmp_path, "2026-10-20", "2026-10-27") == (4.6, 4.9)
+    assert volume_range_km3(tmp_path, "2026-10-20", "2026-10-31") is None

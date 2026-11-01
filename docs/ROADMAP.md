@@ -56,7 +56,8 @@ gauges whose basins lie mostly outside the study basin are skipped; `--gauge` ru
 2. ~~**Uncertainty: revision and boundary sensitivity** (3.1, 3.2)~~ — built 1 Nov 2026.
 3. ~~**Station validation** (1.1)~~ — built; follow-ups listed in 1.1.
 4. ~~**Rain/snow partition** (4)~~ — built 1 Nov 2026, with the SNOTEL check.
-5. ~~**Streamflow comparison** (1.2)~~ — built; then **multi-product comparison** (1.3) and the **uncertainty roll-up** (3.3).
+5. ~~**Streamflow comparison** (1.2)~~ — built; ~~**uncertainty roll-up** (3.3)~~ — built 1 Nov 2026 without
+   product spread; next **multi-product comparison** (1.3), which feeds 3.3.
 6. **Storm context** (6) and **reports** (7).
 7. **Engineering** (8). Start version control and CI at any point; the rest as the tool grows.
 
@@ -268,6 +269,14 @@ small basins will differ far more.
 **Done when:** the window report includes the three volumes and their spread.
 
 ### 3.3 Combined uncertainty statement — M (after 1.1, 1.3, 3.1, 3.2)
+
+> **Status: built 1 Nov 2026** (without 1.3) as `scripts/uncertainty.py`, reported by `storm_total.py`,
+> saved to `ppt_<res>_uncertainty_<start>_<end>.json`, shown on the QGIS basin label; method in
+> `docs/UNCERTAINTY.md`. Decisions: bounding range = sum of component lows and highs; gauge term spans
+> all-gauge and independent-gauge implied volumes; boundary term uses area-weighted vs centers ("touched"
+> shown only); revision term = observed change so far, both directions, flagged while releases < 8, no
+> allowance for future revisions; rain/snow is a separate rain-volume range, not part of the total.
+> San Juan Oct 20–27: 4.685 km³, 4.625–4.916 (−1.3% to +4.9%). Add product spread when 1.3 lands.
 **Goal:** Report volume as a value with a range, not a bare number like 4.719 km³.
 
 **Approach:** treat sources separately and document the combination:

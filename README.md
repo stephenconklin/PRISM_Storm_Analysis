@@ -226,6 +226,7 @@ python scripts/storm_total.py --out data/huc14080104 --start 2026-10-20 --end 20
 | `--volume-tif` | — | Write water volume per pixel (m³ = depth × cell area) to this GeoTIFF; its sum is the basin volume |
 | `--volume-nc` | — | Write a NetCDF with `volume` (m³ per pixel per day), `volume_total` (window total), and `cell_area` |
 | `--boundary` | the `wbd_huc*.geojson` in `--out` | Basin polygon for the boundary check (needed for `--boundary` runs) |
+| `--ramp-alternatives` | `-1,3 1,1` | Other rain/snow ramps (°C pairs) for the rain volume range |
 
 It prints the basin area, area-weighted mean depth, max depth, and the total water volume in m³, km³
 and acre-feet, then each day's PRISM release, the revision change and the boundary check, for example:
@@ -242,6 +243,13 @@ Revisions:   none recorded yet for these days (ppt_800m_release_history.csv)
 Boundary:    cell centers 4.7188 km³, area-weighted 4.7194, any cell touched 4.7993 (range 1.71% of area-weighted)
 ```
 
+- **Uncertainty:** the volume with a bounding range and its components: gauge comparison
+  (`validate_stations.py` for the same window), basin boundary, PRISM revisions so far, and other
+  products (not yet assessed); with a `tmean` cube, also the rain volume across alternative ramps
+  (`--ramp-alternatives`). Saved to `ppt_<res>_uncertainty_<start>_<end>.json`; the QGIS project
+  shows the range on the basin label. It is a bound on what has been measured, not a confidence
+  interval; see [docs/UNCERTAINTY.md](docs/UNCERTAINTY.md). San Juan, Oct 20–27: 4.685 km³, range
+  4.625–4.916 km³ (−1.3% to +4.9%).
 - **Revisions:** from `ppt_<res>_release_history.csv`, the change in window volume from each day's
   first recorded release to its latest, and which days were revised (for example
   `window volume +2.3% since the first releases recorded (...); revised: Oct 26 r1->r2`). This is how
@@ -682,6 +690,8 @@ Finds the outputs in `--out` by their standard names and writes a styled, organi
 | Basemap | **OpenStreetMap** |
 
 - **Layers and symbols** are explained in the [Map guide](#map-guide-layers-symbols-and-how-they-relate-to-prism).
+- **Basin label:** volume, depth and window, plus the uncertainty range when `storm_total.py` has run for
+  the same window as `subbasin_totals.py`.
 - **Colors:** daily rasters share one scale and storm totals another, with round-number classes spread
   on a log scale from the data's minimum to its maximum; areas below the first class are transparent. Station difference classes are also
   set from the data, so small storms aren't all one color.
