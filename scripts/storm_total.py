@@ -501,17 +501,18 @@ def main():
         rv, sv = part["rain_m3"], part["snow_m3"]
         ramp = (f"snow below {a.all_snow_c:g} °C" if a.all_rain_c <= a.all_snow_c else
                 f"all snow at or below {a.all_snow_c:g} °C, all rain at or above {a.all_rain_c:g} °C")
-        print(f"Rain/snow:   rain {rv / r['area_m2'] * 1000:.1f} mm, {rv / 1e9:.3f} km³ ({rv / v * 100:.1f}%); "
-              f"snow {sv / r['area_m2'] * 1000:.1f} mm, {sv / 1e9:.3f} km³ ({sv / v * 100:.1f}%) "
+        pct = (lambda x: f"{x / v * 100:.1f}%") if v else (lambda x: "n/a")
+        print(f"Rain/snow:   rain {rv / r['area_m2'] * 1000:.1f} mm, {rv / 1e9:.3f} km³ ({pct(rv)}); "
+              f"snow {sv / r['area_m2'] * 1000:.1f} mm, {sv / 1e9:.3f} km³ ({pct(sv)}) "
               f"[{ramp}, daily mean temperature]")
     if isinstance(bounds, str):
         print(f"Boundary:    {bounds}")
     else:
         vols = bounds["volumes"]
         lo, hi = min(vols.values()), max(vols.values())
+        spread = f"{(hi - lo) / vols['weighted'] * 100:.2f}%" if vols["weighted"] else "n/a"
         print(f"Boundary:    cell centers {vols['centers'] / 1e9:.4f} km³, area-weighted {vols['weighted'] / 1e9:.4f}, "
-              f"any cell touched {vols['touched'] / 1e9:.4f} (range {(hi - lo) / vols['weighted'] * 100:.2f}% "
-              "of area-weighted)")
+              f"any cell touched {vols['touched'] / 1e9:.4f} (range {spread} of area-weighted)")
     stations_json = Path(a.out) / "validation" / "stations_summary.json"
     event_totals = None
     if stations_json.exists():
@@ -586,9 +587,9 @@ def boundary_check(out, res, boundary, ds, start, n_days):
     """{"volumes": boundary_volumes, "grid_km2": area of the cells counted by center, "polygon_km2"} for the
     window from the national grids in <out>/extracted, or a note saying why it was skipped."""
     import geopandas as gpd
-    files = [Path(boundary)] if boundary else sorted(out.glob("wbd_huc*.geojson"))
+    files = [Path(boundary)] if boundary else (sorted(out.glob("wbd_huc*.geojson")) or sorted(out.glob("boundary.geojson")))
     if len(files) != 1:
-        return "skipped: pass --boundary (no single wbd_huc*.geojson in --out)"
+        return "skipped: pass --boundary (no single wbd_huc*.geojson or boundary.geojson in --out)"
     days = [dt.date.fromisoformat(start) + dt.timedelta(days=i) for i in range(n_days)]
     grids = [prism_day_files(out / "extracted", "ppt", res, d)[0] for d in days]
     if None in grids:

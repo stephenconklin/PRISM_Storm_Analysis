@@ -47,6 +47,8 @@ def boundary_component(volumes, reported_m3):
     covers more than the basin, so it is shown but not used."""
     if not volumes:
         return not_assessed("boundary", "national grids or boundary not available")
+    if not reported_m3:
+        return not_assessed("boundary", "no precipitation in the window")
     w = (volumes["weighted"] / reported_m3 - 1) * 100
     t = (volumes["touched"] / reported_m3 - 1) * 100
     return component("boundary", w, w, f"area-weighted {w:+.2f}% (any cell touched {t:+.2f}%, not used: it "

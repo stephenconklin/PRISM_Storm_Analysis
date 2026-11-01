@@ -9,6 +9,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+import pytest
 import rasterio
 from rasterio.transform import from_origin
 from pyproj import Geod
@@ -23,13 +24,18 @@ from storm_total import (boundary_volumes, cell_area_m2, cell_fractions, revisio
                          snow_fraction, window_total)
 
 
+# Any request is sent to a closed local port, so it fails fast instead of reaching PRISM.
+OFFLINE = {**os.environ, "HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9", "NO_PROXY": ""}
+GRID = from_origin(-108.5, 37.8, 1 / 120, 1 / 120)
+
+
 def make_zip(raw_dir, ymd, value, release=2, var="ppt"):
     tif = raw_dir / f"prism_{var}_us_30s_{ymd}.tif"
     with rasterio.open(tif, "w", driver="GTiff", height=100, width=100, count=1,
                        dtype="float32", crs="EPSG:4269",
                        transform=from_origin(-108.5, 37.8, 1 / 120, 1 / 120),
                        nodata=-9999) as dst:
-        dst.write(np.full((100, 100), value, dtype="float32"), 1)
+        dst.write(np.broadcast_to(np.asarray(value, dtype="float32"), (100, 100)), 1)
     info = raw_dir / f"prism_{var}_us_30s_{ymd}.info.txt"
     info.write_text(f"PRISM_DATASET_VERSION: D2\nPRISM_DATASET_RELEASE_NUMBER: {release}\n")
     with zipfile.ZipFile(raw_dir / f"prism_{var}_us_30s_{ymd}.zip", "w") as z:
@@ -187,8 +193,9 @@ def test_refresh_skips_recent_zips(tmp_path):
     gpd.GeoDataFrame(geometry=[box(-108.4, 37.5, -108.0, 37.7)], crs="EPSG:4326").to_file(boundary)
     res = subprocess.run([sys.executable, str(SCRIPT), "--start", "2026-10-22", "--end", "2026-10-22",
                           "--boundary", str(boundary), "--out", str(out), "--pause", "0", "--refresh"],
-                         check=True, capture_output=True, text=True, env={**os.environ, "HTTPS_PROXY": "http://127.0.0.1:9"})
+                         check=True, capture_output=True, text=True, env=OFFLINE)
     assert "release 2" in res.stdout and "Re-run later with --refresh" in res.stdout
+    assert "request failed" not in res.stdout  # no download was attempted
 
 
 def test_revision_change():
@@ -259,6 +266,105 @@ def test_rain_snow_with_tmean_cube(tmp_path):
         assert np.isclose(src.read(1, masked=True).mean(), 25.0)
 
 
+def basin_file(tmp_path, geom):
+    path = tmp_path / "basin.geojson"
+    gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4269").to_file(path)
+    return path
+
+
+def run_wrangler(out, boundary, start, end, *extra):
+    return subprocess.run([sys.executable, str(SCRIPT), "--start", start, "--end", end, "--boundary", str(boundary),
+                           "--out", str(out), "--pause", "0", *extra], capture_output=True, text=True, env=OFFLINE)
+
+
+def test_clip_keeps_the_right_cells(tmp_path):
+    """A gradient raster and a cell-aligned basin: the clip must keep exactly the cells inside."""
+    out = tmp_path / "run"
+    (out / "raw_zips").mkdir(parents=True)
+    grad = np.arange(100 * 100, dtype="float32").reshape(100, 100) / 100  # unique value per cell
+    make_zip(out / "raw_zips", "20261021", grad)
+    rows, cols = slice(10, 30), slice(20, 50)  # 20 x 30 cells
+    geom = box(-108.5 + 20 / 120, 37.8 - 30 / 120, -108.5 + 50 / 120, 37.8 - 10 / 120)
+    res = run_wrangler(out, basin_file(tmp_path, geom), "2026-10-21", "2026-10-21")
+    assert res.returncode == 0, res.stdout + res.stderr
+    area = np.repeat(cell_area_m2(GRID, 100)[:, None], 100, axis=1)
+    expected_m3 = float((grad[rows, cols] / 1000 * area[rows, cols]).sum())
+    with xr.open_dataset(out / "ppt_800m_daily_clip.nc") as ds:
+        assert int(ds.ppt.notnull().sum()) == 600
+        assert np.isclose(window_total(ds, "2026-10-21", "2026-10-21")["volume_m3"], expected_m3, rtol=1e-6)
+    row = next(csv.DictReader(open(out / "daily_basin_summary.csv")))
+    weighted = float((grad[rows, cols] * area[rows, cols]).sum() / area[rows, cols].sum())
+    assert float(row["basin_mean_mm"]) == pytest.approx(weighted, abs=0.006)  # area-weighted, rounded to 0.01
+    assert (out / "boundary.geojson").exists()  # --boundary is copied into the folder
+
+
+def test_coverage_counts_basin_beyond_grid_edge():
+    from prism_watershed import prism_coverage
+    from storm_total import geodesic_km2
+    arr = np.ma.masked_array(np.ones((12, 12)), mask=False)
+    transform = from_origin(-108.0, 38.0, 0.1, 0.1)      # grid covers 36.8-38.0 N
+    basin = gpd.GeoDataFrame(geometry=[box(-107.5, 37.5, -107.0, 38.5)], crs=4269)  # half beyond the top edge
+    pct, missing_km2, basin_km2 = prism_coverage(arr, transform, basin, grid_bounds=(-108.0, 36.8, -106.8, 38.0))
+    beyond = geodesic_km2(box(-107.5, 38.0, -107.0, 38.5))
+    assert missing_km2 == pytest.approx(beyond, rel=1e-6) and pct == pytest.approx(beyond / basin_km2 * 100)
+    assert prism_coverage(arr, transform, basin)[0] == 0.0  # without the grid bounds the gap is invisible
+
+
+def test_dry_window_and_missing_day(tmp_path):
+    """Zero precipitation must not crash storm_total; a missing day fails QC and skips the event total."""
+    out = tmp_path / "run"
+    (out / "raw_zips").mkdir(parents=True)
+    make_zip(out / "raw_zips", "20261021", 0.0)
+    make_zip(out / "raw_zips", "20261022", 0.0)
+    boundary = basin_file(tmp_path, box(-108.4, 37.5, -108.0, 37.7))
+    res = run_wrangler(out, boundary, "2026-10-21", "2026-10-23")  # Oct 23 can't be downloaded
+    assert res.returncode == 1 and "Traceback" not in res.stderr
+    assert "2026-10-23" in res.stdout and "request failed" in res.stdout
+    assert "Event total not written: 1 of 3 days missing" in res.stdout
+    assert "FAIL  completeness" in res.stdout and not list(out.glob("ppt_800m_total_*.tif"))
+    dry = subprocess.run([sys.executable, str(SCRIPTS / "storm_total.py"), "--out", str(out), "--boundary",
+                          str(boundary)], capture_output=True, text=True)
+    assert dry.returncode == 0, dry.stderr
+    assert "Volume:      0 m³" in dry.stdout and "range n/a" in dry.stdout
+
+
+def test_refresh_with_corrupt_files(tmp_path):
+    """A corrupt cached zip is set aside instead of crashing --refresh; a corrupt refreshed download is discarded."""
+    from prism_watershed import refresh_day, zip_release
+    out = tmp_path / "run"
+    raw = out / "raw_zips"
+    raw.mkdir(parents=True)
+    make_zip(raw, "20261021", 10.0)
+    (raw / "prism_ppt_us_30s_20261022.zip").write_bytes(b"truncated")
+    old = dt.datetime(2026, 10, 1).timestamp()
+    for z in raw.glob("*.zip"):
+        os.utime(z, (old, old))
+    res = run_wrangler(out, basin_file(tmp_path, box(-108.4, 37.5, -108.0, 37.7)), "2026-10-21", "2026-10-22",
+                       "--refresh")
+    assert "Traceback" not in res.stderr and (raw / "prism_ppt_us_30s_20261022.zip.bad").exists()
+    assert res.returncode == 1  # Oct 21 refresh fails (offline), Oct 22 is corrupt
+
+    session = FakeSession(b"not a zip")
+    assert refresh_day("ppt", "800m", "us", dt.date(2026, 10, 21), "", raw, session) is None
+    assert zip_release(raw / "prism_ppt_us_30s_20261021.zip") == "2" and not list(raw.glob("*.part"))
+
+
+def test_tiny_basin_exits_cleanly(tmp_path):
+    out = tmp_path / "run"
+    (out / "raw_zips").mkdir(parents=True)
+    make_zip(out / "raw_zips", "20261021", 5.0)
+    tiny = box(-108.5 + 10.1 / 120, 37.8 - 10.4 / 120, -108.5 + 10.3 / 120, 37.8 - 10.1 / 120)  # misses every center
+    res = run_wrangler(out, basin_file(tmp_path, tiny), "2026-10-21", "2026-10-21")
+    assert res.returncode == 1 and "covers no PRISM cell center" in res.stderr and "Traceback" not in res.stderr
+
+
+def test_summary_names():
+    from prism_watershed import summary_name
+    assert summary_name("ppt", "800m") == "daily_basin_summary.csv"
+    assert summary_name("ppt", "4km") == "ppt_4km_daily_basin_summary.csv"
+    assert summary_name("tmean", "800m") == "tmean_800m_daily_basin_summary.csv"
+
+
 def test_cell_area_matches_pyproj():
     transform = from_origin(-108.5, 37.8, 1 / 120, 1 / 120)
     areas = cell_area_m2(transform, 3)
@@ -278,6 +384,7 @@ def test_requires_basin_and_valid_huc(tmp_path):
     def run(*args):
         return subprocess.run([sys.executable, str(SCRIPT), "--start", "2026-10-21", "--end", "2026-10-21",
                                "--out", str(tmp_path), *args], capture_output=True, text=True)
-    assert run().returncode != 0
+    missing = run()
+    assert missing.returncode == 2 and "one of the arguments --huc --boundary is required" in missing.stderr
     bad = run("--huc", "140")
     assert bad.returncode != 0 and "--huc must be" in bad.stderr

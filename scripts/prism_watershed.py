@@ -96,12 +96,18 @@ def get_boundary(huc, boundary_file, out_dir):
             print(f"Fetching WBD boundary for HUC {huc} ...")
             r = requests.get(WBD_URL.format(layer=layer), params=params, timeout=120)
             r.raise_for_status()
+            # ArcGIS reports server errors as HTTP 200 with {"error": ...}; don't cache those.
+            if "features" not in r.json():
+                sys.exit(f"WBD service error for HUC {huc}: {r.text[:300]}")
             cache.write_bytes(r.content)
         gdf = gpd.read_file(cache)
         if gdf.empty:
             sys.exit(f"No WBD polygon found for HUC {huc}")
         print(f"Basin: {', '.join(gdf.get('name', gdf.iloc[:, 0]).astype(str))}")
-    return gdf.dissolve()
+    basin = gdf.dissolve()
+    if boundary_file:  # keep a copy, so later steps and the QGIS project find the basin in the folder
+        basin.to_crs(4269).to_file(out_dir / "boundary.geojson", driver="GeoJSON")
+    return basin
 
 
 def zip_name(var, res, region, day, fmt=""):
@@ -120,7 +126,14 @@ def fetch_zip(var, res, region, day, fmt, path, session, errors=None):
     ymd = day.strftime("%Y%m%d")
     url = PRISM_URL.format(region=region, res=res, var=var, date=ymd)
     params = {"format": fmt} if fmt else None
-    r = session.get(url, params=params, timeout=300)
+    try:
+        r = session.get(url, params=params, timeout=300)
+    except requests.RequestException as e:
+        message = f"request failed ({e.__class__.__name__})"
+        print(f"  {ymd}: {message}")
+        if errors is not None:
+            errors[day] = message
+        return False
     ctype = r.headers.get("Content-Type", "")
     if r.status_code != 200 or "zip" not in ctype:
         # The service returns a short text message when data isn't available yet
@@ -200,6 +213,14 @@ def refresh_day(var, res, region, day, fmt, raw_dir, session, errors=None):
     part = path.with_name(path.name + ".part")
     if not fetch_zip(var, res, region, day, fmt, part, session, errors):
         return None
+    problem = zip_problem(part)
+    if problem:
+        part.unlink()
+        message = f"refreshed download is {problem}; kept the cached zip"
+        print(f"  {day.strftime('%Y%m%d')}: {message}")
+        if errors is not None:
+            errors[day] = message
+        return None
     new = zip_release(part)
     if new != old:
         archive = raw_dir / "releases" / f"{path.stem}_r{old or 'unknown'}.zip"
@@ -241,22 +262,29 @@ def clip(grid, basin, out_path, release=""):
     return arr, meta
 
 
+def area_mean(arr, transform):
+    """Mean of a masked lat/lon array weighted by ellipsoidal cell area (cells shrink northward)."""
+    area = np.repeat(cell_area_m2(transform, arr.shape[0])[:, None], arr.shape[1], axis=1)
+    return float(np.ma.average(arr, weights=area))
+
+
 def day_stats(arr, transform, var="ppt"):
-    """Basin mean, max (mm) and volume (m³) of one clipped precipitation day; for other variables,
-    basin mean, min and max in the variable's units."""
+    """Area-weighted basin mean, max (mm) and volume (m³) of one clipped precipitation day; for other
+    variables, area-weighted basin mean, min and max in the variable's units."""
+    mean = area_mean(arr, transform)
     if var != "ppt":
-        return {"basin_mean": round(float(arr.mean()), 2), "basin_min": round(float(arr.min()), 2),
+        return {"basin_mean": round(mean, 2), "basin_min": round(float(arr.min()), 2),
                 "basin_max": round(float(arr.max()), 2)}
     area = np.repeat(cell_area_m2(transform, arr.shape[0])[:, None], arr.shape[1], axis=1)
     volume = float((arr / 1000 * area).sum())
-    return {"basin_mean_mm": round(float(arr.mean()), 2), "basin_max_mm": round(float(arr.max()), 2),
+    return {"basin_mean_mm": round(mean, 2), "basin_max_mm": round(float(arr.max()), 2),
             "basin_volume_m3": round(volume)}
 
 
 def summary_name(var, res):
-    """daily_basin_summary.csv for precipitation (its original name); <var>_<res>_daily_basin_summary.csv
-    for other variables, so a folder can hold several."""
-    return "daily_basin_summary.csv" if var == "ppt" else f"{var}_{res}_daily_basin_summary.csv"
+    """daily_basin_summary.csv for 800 m precipitation (its original name); <var>_<res>_daily_basin_summary.csv
+    for anything else, so a folder can hold several variables and resolutions."""
+    return "daily_basin_summary.csv" if (var, res) == ("ppt", "800m") else f"{var}_{res}_daily_basin_summary.csv"
 
 
 def clipped_day(path, summary_csv, var="ppt"):
@@ -315,17 +343,24 @@ def update_history(path, entries):
     return rows
 
 
-def prism_coverage(arr, transform, basin):
+def prism_coverage(arr, transform, basin, grid_bounds=None):
     """Share of the basin with no PRISM data: (missing %, missing km², basin km²).
 
     arr is a masked array on the clipped grid (masked = no data). Cells count by center, so
     the basin area here is the PRISM-cell area. PRISM covers the conterminous US only, so
-    basins reaching into Canada or Mexico have a gap.
+    basins reaching into Canada or Mexico have a gap. The clip stops at the edge of PRISM's
+    grid, so the part of the basin beyond grid_bounds (the national grid's left, bottom, right,
+    top) is added from the polygon's ellipsoidal area.
     """
     inside = features.geometry_mask(basin.to_crs(4269).geometry, arr.shape, transform, invert=True)
     area = np.repeat(cell_area_m2(transform, arr.shape[0])[:, None], arr.shape[1], axis=1)
     basin_m2 = float(area[inside].sum())
     missing_m2 = float(area[inside & np.ma.getmaskarray(arr)].sum())
+    if grid_bounds is not None:
+        beyond = basin.to_crs(4269).union_all().difference(shapely.box(*grid_bounds))
+        beyond_m2 = geodesic_km2(beyond) * 1e6 if not beyond.is_empty else 0.0
+        basin_m2 += beyond_m2
+        missing_m2 += beyond_m2
     return (missing_m2 / basin_m2 * 100 if basin_m2 else 0.0), missing_m2 / 1e6, basin_m2 / 1e6
 
 
@@ -381,8 +416,8 @@ def main():
     ppt = a.var == "ppt"
     today, recorded = dt.date.today(), dt.datetime.now().isoformat(timespec="seconds")
     rows, history, changes, total, meta = [], [], [], None, None
-    errors, downloads, grids, stations, day_min, day_max, missing_m2 = {}, [], [], {}, {}, {}, {}
-    inside = area = always_missing = None
+    errors, downloads, grids, stations, day_min, day_max, missing_m2, day_m3 = {}, [], [], {}, {}, {}, {}, []
+    inside = area = always_missing = grid_bounds = None
     requested = list(daterange(start, end))
     for day in requested:
         ymd = day.strftime("%Y%m%d")
@@ -391,7 +426,7 @@ def main():
         before = clipped_day(clip_path, summary_csv, a.var)  # what this folder held before this run
         if before:
             history.append({"date": day.isoformat(), "release": before[0], **before[1], "recorded": recorded})
-        if (a.refresh and cached.exists() and due_for_refresh(
+        if (a.refresh and cached.exists() and not zip_problem(cached) and due_for_refresh(
                 zip_release(cached), dt.date.fromtimestamp(cached.stat().st_mtime), today,
                 a.target_release, a.refresh_age)):
             change = refresh_day(a.var, a.res, a.region, day, a.format, raw, session, errors)
@@ -415,9 +450,18 @@ def main():
             downloads.append({"date": day, "error": errors[day]})
             continue
         grid, release = extract_grid(zpath, ext)
-        arr, meta = clip(grid, basin, clip_path, release)
+        try:
+            arr, meta = clip(grid, basin, clip_path, release)
+        except ValueError as e:  # rasterio: "Input shapes do not overlap raster."
+            sys.exit(f"The basin does not overlap PRISM's {a.region} grid ({e}).")
+        if grid_bounds is None:
+            with rasterio.open(grid) as src:
+                grid_bounds = tuple(src.bounds)
+        if arr.count() == 0:
+            sys.exit(f"No PRISM data inside the basin on {day}: it covers no PRISM cell center with data "
+                     "(a basin smaller than one cell, or outside PRISM coverage).")
         total = arr.copy() if total is None else total + arr
-        downloads.append({"date": day, "error": "", "zip": zpath.name, "bytes": zpath.stat().st_size,
+        downloads.append({"date": day, "error": "", "refresh_error": errors.get(day, ""), "zip": zpath.name, "bytes": zpath.stat().st_size,
                           "sha256": manifest.sha256(zpath), "release": release,
                           "url": PRISM_URL.format(region=a.region, res=a.res, var=a.var, date=ymd)
                           + (f"?format={a.format}" if a.format else ""),
@@ -436,9 +480,10 @@ def main():
             stations[day] = stations_near(stn[0], station_zone)
         stats = day_stats(arr, meta["transform"], a.var)
         if ppt:
+            day_m3.append(stats["basin_volume_m3"])
             rows.append({"date": day.isoformat(), "release": release,
                          "basin_mean_mm": stats["basin_mean_mm"], "basin_max_mm": stats["basin_max_mm"],
-                         "basin_mean_in": round(float(arr.mean()) / 25.4, 3)})
+                         "basin_mean_in": round(stats["basin_mean_mm"] / 25.4, 3)})
         else:
             rows.append({"date": day.isoformat(), "release": release, **stats, "units": VAR_UNITS.get(a.var, "")})
         history.append({"date": day.isoformat(), "release": release, **stats, "recorded": recorded})
@@ -482,13 +527,17 @@ def main():
 
     tag = f"{rows[0]['date']}_{rows[-1]['date']}".replace("-", "")
     total_tif = out / f"{a.var}_{a.res}_total_{tag}.tif"
-    if ppt:  # a sum only means something for precipitation
+    complete = len(rows) == len(requested)
+    if ppt and complete:  # a sum only means something for precipitation, and only over every day
         meta.update(dtype="float32")
         with rasterio.open(total_tif, "w", **meta) as dst:
             dst.write(total.filled(-9999).astype("float32"), 1)
-        print(f"\nEvent total: basin mean {total.mean():.1f} mm ({total.mean()/25.4:.2f} in), "
+        mean = area_mean(total, meta["transform"])
+        print(f"\nEvent total: basin mean {mean:.1f} mm ({mean / 25.4:.2f} in), "
               f"max {total.max():.1f} mm ({total.max()/25.4:.2f} in)")
-    missing_pct, missing_km2, basin_km2 = prism_coverage(total, meta["transform"], basin)
+    elif ppt:
+        print(f"\nEvent total not written: {len(requested) - len(rows)} of {len(requested)} days missing.")
+    missing_pct, missing_km2, basin_km2 = prism_coverage(total, meta["transform"], basin, grid_bounds)
     if missing_pct > 0.5:
         print(f"WARNING: {missing_pct:.1f}% of the basin ({missing_km2:,.0f} of {basin_km2:,.0f} km²) has no PRISM "
               "data, usually because it lies outside the conterminous US. Totals and volumes cover only the rest.")
@@ -507,10 +556,10 @@ def main():
     run_days = [dt.date.fromisoformat(r["date"]) for r in rows]
     with xr.open_dataset(cube) as ds:
         cube_days = set(ds.time.values.astype("datetime64[D]").astype(object))
-        cube_sum = float(ds[a.var].sel(time=[np.datetime64(d, "ns") for d in run_days]).sum("time", skipna=False).sum())
-    if ppt:
-        with rasterio.open(total_tif) as src:
-            tif_sum = float(src.read(1, masked=True).astype("float64").sum())
+        if ppt:  # the cube, read back, against the volumes computed from each clip as it was made
+            daily = ds[a.var].sel(time=[np.datetime64(d, "ns") for d in run_days])
+            cube_m3 = float((daily / 1000 * ds.cell_area).sum())
+            clip_m3 = float(sum(day_m3))
     basin_m2 = float(area[inside].sum())
     constant_m2 = float(area[always_missing].sum()) if always_missing is not None else 0.0
     checks = [
@@ -521,10 +570,10 @@ def main():
                          constant_m2 / basin_m2 * 100),
         (qc.physical_limits(day_min, day_max, a.qc_max_daily_mm) if ppt
          else qc.result("physical_limits", "skip", f"limits are for ppt, not {a.var}")),
-        qc.totals_reconcile([("cube sum = event-total raster", cube_sum, tif_sum)] if ppt else []),
+        qc.totals_reconcile([("daily clip volumes = cube volumes", clip_m3, cube_m3)] if ppt else []),
         qc.release_mix({r["date"]: r["release"] for r in rows}),
         qc.station_density(stations, basin_km2, a.qc_station_buffer_km, a.qc_min_stations),
-        qc.boundary_agreement(basin_km2, geodesic_km2(basin.to_crs(4269).geometry.iloc[0])),
+        qc.boundary_agreement(basin_km2, geodesic_km2(basin.to_crs(4269).union_all())),
     ]
     if a.qc_strict:
         checks = qc.apply_strict(checks)

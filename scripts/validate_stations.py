@@ -232,9 +232,9 @@ def write_layer(gdf, gpkg, layer):
 def load_basin(out, boundary):
     if boundary:
         return gpd.read_file(boundary).to_crs(4269).dissolve()
-    wbd = sorted(Path(out).glob("wbd_huc*.geojson"))
+    wbd = sorted(Path(out).glob("wbd_huc*.geojson")) or sorted(Path(out).glob("boundary.geojson"))
     if len(wbd) != 1:
-        sys.exit("Pass --boundary: expected exactly one wbd_huc*.geojson in --out.")
+        sys.exit("Pass --boundary: expected exactly one wbd_huc*.geojson (or boundary.geojson) in --out.")
     return gpd.read_file(wbd[0]).to_crs(4269).dissolve()
 
 
