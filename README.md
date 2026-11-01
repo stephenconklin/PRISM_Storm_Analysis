@@ -943,8 +943,11 @@ gauges, terrain and climate patterns. Everything else on the map is there to che
 - NetCDFs open as rasters (one band per day; QGIS shows the first three as RGB by default, which
   is not meaningful here) or, for the Temporal Controller, as mesh layers via
   **Layer › Add Layer › Add Mesh Layer**. Set a fixed min/max in Symbology so days are comparable.
-- Time stamps in the NetCDFs are 00:00 UTC on each PRISM day label; the data covers the 24 hours
-  ending at 12:00 UTC that day.
+- The NetCDFs follow CF-1.10: each time stamp is 00:00 UTC on the PRISM day label, the midpoint of
+  the day, with `time_bnds` giving the 24 hours it covers (12:00 UTC the day before to 12:00 UTC);
+  precipitation has `standard_name` `lwe_thickness_of_precipitation_amount` and `cell_methods`
+  `area: mean time: sum`, and `cell_area` is linked as the cell measure. The cube also carries each
+  day's PRISM `release`.
 
 ## Notes
 - **PRISM day:** 12:00 UTC to 12:00 UTC, labeled with the end date. For example, in Mountain Daylight

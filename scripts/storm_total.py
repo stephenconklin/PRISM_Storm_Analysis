@@ -72,6 +72,32 @@ M3_PER_ACRE_FT = 1233.48184
 GRID_SUFFIXES = (".tif", ".bil", ".nc", ".asc")  # preference order
 VAR_UNITS = {"ppt": "mm", "tmin": "degC", "tmax": "degC", "tmean": "degC", "tdmean": "degC",
              "vpdmin": "hPa", "vpdmax": "hPa"}
+# CF standard names and cell methods per PRISM variable (vpd has no CF standard name).
+VAR_CF = {"ppt": ("lwe_thickness_of_precipitation_amount", "time: sum"),
+          "tmin": ("air_temperature", "time: minimum"), "tmax": ("air_temperature", "time: maximum"),
+          "tmean": ("air_temperature", "time: mean (mean of daily maximum and minimum)"),
+          "tdmean": ("dew_point_temperature", "time: mean"),
+          "vpdmin": (None, "time: minimum"), "vpdmax": (None, "time: maximum")}
+
+
+def cf_time(ds_or_days):
+    """CF time attributes and bounds for PRISM days: each time value is 00:00 UTC on the day label, the
+    midpoint of the PRISM day (12:00 UTC the day before to 12:00 UTC on the label date)."""
+    days = np.asarray(ds_or_days, dtype="datetime64[ns]")
+    bnds = np.stack([days - np.timedelta64(12, "h"), days + np.timedelta64(12, "h")], axis=1)
+    attrs = {"standard_name": "time", "axis": "T", "bounds": "time_bnds",
+             "long_name": "PRISM day midpoint (each day is the 24 h ending 12:00 UTC on its date)"}
+    return attrs, bnds
+
+
+def cf_globals(title):
+    """Global attributes shared by the NetCDF outputs (CF-1.10)."""
+    return {"Conventions": "CF-1.10", "title": title,
+            "institution": "Data: PRISM Group, Oregon State University; processing: PRISM Data Wrangler",
+            "source": "PRISM Group, Oregon State University, https://prism.oregonstate.edu",
+            "references": "https://prism.oregonstate.edu/documents/PRISM_datasets.pdf",
+            "history": f"{dt.datetime.now(dt.timezone.utc):%Y-%m-%dT%H:%M:%SZ} written by PRISM Data Wrangler",
+            "prism_day": "Each time step covers 12:00 UTC the previous day to 12:00 UTC its date."}
 
 
 def cell_area_m2(transform, height):
@@ -128,28 +154,45 @@ def build_cube(clipped_dir, var, res, nc_path, attrs=None):
     lat = transform.f + (np.arange(h) + 0.5) * transform.e
     lon = transform.c + (np.arange(w) + 0.5) * transform.a
     area = area_grid(transform, (h, w))
+    std, method = VAR_CF.get(var, (None, ""))
+    t_attrs, t_bnds = cf_time(days)
     ds = xr.Dataset(
         {
             var: (("time", "lat", "lon"), np.stack(layers),
-                  {"units": VAR_UNITS.get(var, ""), "long_name": f"PRISM daily {var}", "grid_mapping": "crs"}),
+                  {"units": VAR_UNITS.get(var, ""), "long_name": f"PRISM daily {var}", "grid_mapping": "crs",
+                   "cell_methods": f"area: mean {method}".strip(), "cell_measures": "area: cell_area",
+                   **({"standard_name": std} if std else {})}),
+            "time_bnds": (("time", "nv"), t_bnds),
             "cell_area": (("lat", "lon"), area,
-                          {"units": "m2", "long_name": "cell area on the GRS80 ellipsoid",
+                          {"units": "m2", "standard_name": "cell_area", "long_name": "cell area on the GRS80 ellipsoid",
                            "grid_mapping": "crs"}),
             "release": (("time",), np.array(releases, dtype="int8"),
                         {"long_name": "PRISM dataset release number (1-8, 8 final; 0 unknown)"}),
-            "crs": ((), np.int32(0), {"grid_mapping_name": "latitude_longitude",
+            "crs": ((), np.int32(0), {"grid_mapping_name": "latitude_longitude", "semi_major_axis": GRS80_A,
+                                      "inverse_flattening": 1 / GRS80_F,
                                       "crs_wkt": crs.to_wkt(), "spatial_ref": crs.to_wkt()}),
         },
         coords={
-            "time": ("time", days),
-            "lat": ("lat", lat, {"units": "degrees_north", "standard_name": "latitude"}),
-            "lon": ("lon", lon, {"units": "degrees_east", "standard_name": "longitude"}),
+            "time": ("time", days, t_attrs),
+            "lat": ("lat", lat, {"units": "degrees_north", "standard_name": "latitude", "axis": "Y"}),
+            "lon": ("lon", lon, {"units": "degrees_east", "standard_name": "longitude", "axis": "X"}),
         },
-        attrs={**(attrs or {}), "source": "PRISM Group, Oregon State University, https://prism.oregonstate.edu",
-               "prism_day": "Each time step covers 12:00 UTC the previous day to 12:00 UTC its date."},
+        attrs={**cf_globals(f"PRISM daily {var} ({res}) clipped to a basin"), **(attrs or {})},
     )
-    ds.to_netcdf(nc_path, encoding={var: {"zlib": True, "complevel": 4, "_FillValue": np.nan}})
+    ds.to_netcdf(nc_path, encoding={var: {"zlib": True, "complevel": 4, "_FillValue": np.nan},
+                                    "time": {"units": "days since 1970-01-01 00:00:00", "dtype": "float64"},
+                                    "time_bnds": {"units": "days since 1970-01-01 00:00:00", "dtype": "float64"}})
     return nc_path
+
+
+def cf_extras(ds, daily):
+    """time_bnds and time attributes for a NetCDF holding some of the cube's days."""
+    t_attrs, t_bnds = cf_time(daily.time.values)
+    return {"time_bnds": (("time", "nv"), t_bnds)}, t_attrs
+
+
+TIME_ENC = {"time": {"units": "days since 1970-01-01 00:00:00", "dtype": "float64"},
+            "time_bnds": {"units": "days since 1970-01-01 00:00:00", "dtype": "float64"}}
 
 
 def window_total(ds, start, end, var="ppt"):
@@ -320,26 +363,43 @@ def partition_window(out, res, ds, r, all_snow_c, all_rain_c):
     return out_r
 
 
+def with_attrs(da, **attrs):
+    """A copy of da with exactly these attributes (none inherited from the precipitation it came from)."""
+    out = da.copy()
+    out.attrs = attrs
+    return out
+
+
 def write_rain_snow_nc(ds, part, path, all_snow_c, all_rain_c):
     """Daily rain, snow and snow fraction plus window totals (mm) to NetCDF."""
-    grid = {"grid_mapping": "crs"}
+    grid = {"grid_mapping": "crs", "cell_measures": "area: cell_area"}
+    bnds, t_attrs = cf_extras(ds, part["rain_mm"])
     out = xr.Dataset(
         {
-            "rain": part["rain_mm"].assign_attrs(units="mm", long_name="daily rain", **grid),
-            "snow": part["snow_mm"].assign_attrs(units="mm", long_name="daily snow (water equivalent)", **grid),
-            "snow_fraction": part["snow_fraction"].assign_attrs(units="1", long_name="share of precipitation as snow",
-                                                                **grid),
-            "rain_total": part["rain_total_mm"].assign_attrs(units="mm", long_name="window-total rain", **grid),
-            "snow_total": part["snow_total_mm"].assign_attrs(units="mm", long_name="window-total snow", **grid),
+            "rain": with_attrs(part["rain_mm"], units="mm", standard_name="thickness_of_rainfall_amount",
+                               long_name="daily rain", cell_methods="area: mean time: sum", **grid),
+            "snow": with_attrs(part["snow_mm"], units="mm", standard_name="lwe_thickness_of_snowfall_amount",
+                               long_name="daily snow (water equivalent)", cell_methods="area: mean time: sum", **grid),
+            "snow_fraction": with_attrs(part["snow_fraction"], units="1", long_name="share of precipitation as snow",
+                                        **grid),
+            "rain_total": with_attrs(part["rain_total_mm"], units="mm", standard_name="thickness_of_rainfall_amount",
+                                     long_name="window-total rain", **grid),
+            "snow_total": with_attrs(part["snow_total_mm"], units="mm",
+                                     standard_name="lwe_thickness_of_snowfall_amount",
+                                     long_name="window-total snow (water equivalent)", **grid),
             "cell_area": ds.cell_area,
             "crs": ds.crs,
+            **bnds,
         },
-        attrs={**ds.attrs, "rain_snow_method": f"snow fraction 1 at or below {all_snow_c:g} degC daily mean "
+        attrs={**ds.attrs, **cf_globals("Rain and snow from PRISM precipitation and daily mean temperature"),
+               "rain_snow_method": f"snow fraction 1 at or below {all_snow_c:g} degC daily mean "
                f"temperature (PRISM tmean), 0 at or above {all_rain_c:g} degC, linear between",
                "rain_m3": part["rain_m3"], "snow_m3": part["snow_m3"]},
     )
+    out["time"].attrs.update(t_attrs)
     enc = {"zlib": True, "complevel": 4, "_FillValue": np.nan}
-    out.to_netcdf(path, encoding={k: enc for k in ("rain", "snow", "snow_fraction", "rain_total", "snow_total")})
+    out.to_netcdf(path, encoding={**{k: enc for k in ("rain", "snow", "snow_fraction", "rain_total", "snow_total")},
+                                  **TIME_ENC})
 
 
 def cube_transform(ds):
@@ -390,20 +450,24 @@ def write_tif(grid, crs_wkt, path, units):
 
 def write_volume_nc(ds, r, path):
     """Write daily and window-total water volume per cell (m³) to NetCDF."""
-    grid = {"units": "m3", "grid_mapping": "crs"}
+    grid = {"units": "m3", "grid_mapping": "crs", "cell_measures": "area: cell_area"}
+    bnds, t_attrs = cf_extras(ds, r["daily_mm"])
     out = xr.Dataset(
         {
             "volume": (r["daily_mm"] / 1000 * ds.cell_area).assign_attrs(
-                long_name="daily water volume per cell (depth x cell area)", **grid),
+                long_name="daily water volume per cell (depth x cell area)", cell_methods="area: sum time: sum",
+                **grid),
             "volume_total": r["volume_cell_m3"].assign_attrs(
-                long_name="window-total water volume per cell", **grid),
+                long_name="window-total water volume per cell", cell_methods="area: sum", **grid),
             "cell_area": ds.cell_area,
             "crs": ds.crs,
+            **bnds,
         },
-        attrs={**ds.attrs, "basin_volume_m3": r["volume_m3"]},
+        attrs={**ds.attrs, **cf_globals("Water volume per PRISM cell"), "basin_volume_m3": r["volume_m3"]},
     )
+    out["time"].attrs.update(t_attrs)
     enc = {"zlib": True, "complevel": 4, "_FillValue": np.nan}
-    out.to_netcdf(path, encoding={"volume": enc, "volume_total": enc})
+    out.to_netcdf(path, encoding={"volume": enc, "volume_total": enc, **TIME_ENC})
 
 
 def main():

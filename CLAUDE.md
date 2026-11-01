@@ -16,7 +16,9 @@ That run's outputs (HUC 1408; ppt and tmean for PRISM days Oct 20–31) are in
 - `scripts/storm_total.py` — `build_cube`, ellipsoidal `cell_area_m2`, `prism_day_files` (national grid lookup in
   `extracted/`), and a CLI that totals depth/volume for any date range from the cube, with releases, revision
   change (from the release history) and boundary sensitivity (centers / area-weighted / touched, from the national
-  grids). Volumes use per-row GRS80 cell areas on the native grid; don't reproject or resample.
+  grids). Volumes use per-row GRS80 cell areas on the native grid; don't reproject or resample. NetCDF outputs are CF-1.10
+  (`cf_time`, `cf_globals`, `VAR_CF`): time = 00:00 UTC on the day label (the midpoint) with `time_bnds` 12:00–12:00 UTC;
+  keep it there, since date selection relies on it.
 - `scripts/uncertainty.py` — pure components (gauges, boundary, revisions, products) and the bounding range
   (sum of lows/highs) for `storm_total.py`; writes `<out>/ppt_<res>_uncertainty_<start>_<end>.json`, which the QGIS
   basin label reads. Method and judgments in `docs/UNCERTAINTY.md`; keep it in step with the code

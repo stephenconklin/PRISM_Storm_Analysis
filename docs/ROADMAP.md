@@ -345,6 +345,13 @@ query URL, or boundary file path and checksum); per day: PRISM URL, zip SHA-256,
 **Done when:** every run writes the manifest, and a test checks its required keys.
 
 ### 5.2 CF-compliant NetCDF — S
+> **Status: built 1 Nov 2026.** Cube, volume and rain/snow NetCDFs carry `Conventions = "CF-1.10"`,
+> `title`, `institution`, `source`, `history`, `references`; `time_bnds` (12:00 UTC to 12:00 UTC) with the
+> time value kept at 00:00 UTC on the label date, which is the day's midpoint (moving it to 12:00 UTC, as
+> planned below, would put it on a bound and break date selection); standard names, `cell_methods`,
+> `cell_measures`, GRS80 on the grid mapping. Checked with netCDF4/xarray and by opening in QGIS 3.44 as
+> raster and mesh; no formal CF checker run (cfchecker needs UDUNITS, not installed).
+
 **Goal:** Make the cube and volume NetCDFs follow CF conventions.
 
 **Changes:**

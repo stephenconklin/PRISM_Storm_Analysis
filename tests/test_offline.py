@@ -67,6 +67,13 @@ def test_pipeline(tmp_path):
     with xr.open_dataset(out / "ppt_800m_daily_clip.nc") as ds:
         assert ds.sizes["time"] == 2
         assert list(ds.release.values) == [2, 2]
+        # CF: day-label time stamps are the midpoints of their 12:00-to-12:00 UTC bounds
+        assert ds.attrs["Conventions"] == "CF-1.10" and ds.time.attrs["bounds"] == "time_bnds"
+        b = ds.time_bnds.values[0]
+        assert b[0] == np.datetime64("2026-10-20T12:00") and b[1] == np.datetime64("2026-10-21T12:00")
+        assert ds.time.values[0] == np.datetime64("2026-10-21T00:00")
+        assert ds.ppt.attrs["standard_name"] == "lwe_thickness_of_precipitation_amount"
+        assert ds.ppt.attrs["cell_methods"] == "area: mean time: sum" and ds.cell_area.attrs["standard_name"] == "cell_area"
         r = window_total(ds, "2026-10-21", "2026-10-22")
         expected = 0.040 * float(ds.cell_area.where(ds.ppt.isel(time=0).notnull()).sum())
         assert np.isclose(r["volume_m3"], expected)
