@@ -119,12 +119,12 @@ def discover(out):
     """Find the standard outputs in a PRISM Data Wrangler folder."""
     out = Path(out)
     found = {"out": out, "wbd": sorted(out.glob("wbd_huc*.geojson")),
-             "totals": sorted(out.glob("*_total_*.tif")),
-             "daily": sorted(out.glob("clipped/*_clip.tif")),
+             "totals": sorted(out.glob("ppt_*_total_*.tif")),
+             "daily": sorted(out.glob("clipped/ppt_*_clip.tif")),  # other variables (e.g. tmean) are not mapped
              "summary": out / "daily_basin_summary.csv",
              "gpkg": out / "validation" / "validation.gpkg",
              "totals_gpkg": out / "totals.gpkg",
-             "other_tifs": [p for p in sorted(out.glob("*.tif")) if "_total_" not in p.name]}
+             "other_tifs": [p for p in sorted(out.glob("*.tif")) if "_total_" not in p.name]}  # volume, rain, snow
     dates = []
     for p in found["daily"]:
         m = re.search(r"_(\d{8})_clip\.tif$", p.name)

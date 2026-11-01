@@ -40,6 +40,7 @@ def test_discover(tmp_path):
     (tmp_path / "clipped").mkdir()
     for d in ("20261021", "20261020"):
         (tmp_path / "clipped" / f"ppt_800m_{d}_clip.tif").write_bytes(b"x")
+        (tmp_path / "clipped" / f"tmean_800m_{d}_clip.tif").write_bytes(b"x")  # not mapped
     (tmp_path / "ppt_800m_total_20261020_20261021.tif").write_bytes(b"x")
     (tmp_path / "volume_m3.tif").write_bytes(b"x")
     (tmp_path / "wbd_huc1408.geojson").write_text("{}")

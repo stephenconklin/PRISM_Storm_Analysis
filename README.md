@@ -109,7 +109,7 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 | `--start` / `--end` | required | PRISM days, inclusive; end is capped at yesterday |
 | `--huc` / `--boundary` | one required | Watershed to clip to (see Choosing a watershed) |
 | `--out` | `data/huc<code>` or `data/<boundary name>` | Output folder, relative to where you run the command. Use one folder per basin |
-| `--var` | `ppt` | `tmin`, `tmax`, `tmean`, `tdmean`, `vpdmin`, `vpdmax` |
+| `--var` | `ppt` | `tmin`, `tmax`, `tmean`, `tdmean`, `vpdmin`, `vpdmax`. Other variables can share a precipitation folder: they get their own cube and `<var>_<res>_daily_basin_summary.csv` (basin mean, min, max in °C or hPa) and no event total. `tmean` enables the rain/snow split |
 | `--res` | `800m` | or `4km` |
 | `--region` | `us` | PRISM region |
 | `--format` | COG GeoTIFF | `nc`, `bil`, `asc` |
@@ -249,6 +249,37 @@ Boundary:    cell centers 4.7188 km³, area-weighted 4.7194, any cell touched 4.
   matters; it is small for large basins (1.7% for the San Juan, mostly from the "touched" rule) and
   grows for small ones. Skipped, with a note, when the boundary or a day's national grid is missing.
 
+### Rain and snow
+
+PRISM precipitation includes snow. To split it, download daily mean temperature for the same basin,
+days and folder, then rerun `storm_total.py`:
+
+```bash
+python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27 --out /path/to/My_Basin --var tmean
+python scripts/storm_total.py --out /path/to/My_Basin --start 2026-10-20 --end 2026-10-27 \
+    --rain-tif rain_mm.tif --snow-tif snow_mm.tif --rain-snow-nc rain_snow.nc
+```
+```
+Rain/snow:   rain 70.3 mm, 4.541 km³ (96.2%); snow 2.8 mm, 0.178 km³ (3.8%) [all snow at or below 0 °C, all rain at or above 3 °C, daily mean temperature]
+```
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--all-snow-c` | `0` | Daily mean temperature (°C) at or below which a cell's precipitation is all snow |
+| `--all-rain-c` | `3` | At or above this it is all rain; linear between. Set both equal for a single threshold |
+| `--rain-tif` / `--snow-tif` | — | Window-total rain or snow-water per pixel (mm) |
+| `--rain-snow-nc` | — | NetCDF with daily `rain`, `snow`, `snow_fraction` and window totals `rain_total`, `snow_total` (mm) |
+
+- The split is made per cell and day: snow = precipitation × snow fraction, rain = the rest, so rain +
+  snow equals precipitation (checked by QC). Snow is snow-water equivalent, not snow depth.
+- PRISM `tmean` is the average of the day's maximum and minimum and uses the same 12:00 UTC day as
+  precipitation. A daily mean is a rough guide to the temperature when precipitation fell: a warm
+  afternoon shower on a day with a cold night can be classed as snow, and the reverse. Try other
+  thresholds (for example `--all-snow-c -1 --all-rain-c 3`, or `1` and `1`) to see how sensitive the
+  split is. For the San Juan, Oct 20–27, snow was 3.8% of the basin's precipitation by default, 2.6% with
+  a single 1 °C threshold and 3.1% with a −1 to 3 °C ramp.
+- Without a `tmean` cube the report says the split was skipped and how to enable it.
+
 Cell areas are computed on the NAD83 (GRS80) ellipsoid for each row of PRISM's native grid, so no
 reprojection or resampling is needed and volumes add up exactly.
 
@@ -339,15 +370,19 @@ python scripts/validate_runoff.py --out data/huc<HUC> --gauge <site> [<site> ...
   long) for up to `--max-wait-min` (default 15). For a longer pause, the run stops, writes what it has,
   and says when to retry. Rerunning the same command reuses
   gauges already finished with the same settings (`--refresh` re-fetches everything, for example after
-  USGS revises provisional data). If only the PRISM releases changed, saved gauges keep their flow
-  and only their precipitation and ratios are recomputed. With a free key from
+  USGS revises provisional data). If only the PRISM releases or the rain/snow settings changed, saved
+  gauges keep their flow and only their precipitation and ratios are recomputed. With a free key from
   [api.waterdata.usgs.gov/signup](https://api.waterdata.usgs.gov/signup/), set `USGS_API_KEY` (for example in
   `~/.zshrc`: `export USGS_API_KEY=...`); it is sent as the `X-Api-Key` header and gets its own
   allowance of 1,000 requests per hour, separate from the anonymous per-IP one. Keep the key out of the
   repository.
 - **Runoff ratio** = event runoff ÷ precipitation volume, bracketed by two baseflow lines: held at
   the starting flow (larger runoff) and rising straight to the ending flow (smaller runoff).
-  Precipitation includes snow, so ratios in mountain basins are low until rain and snow are split.
+  Precipitation includes snow, so ratios in mountain basins are low.
+- **Rain-only ratio:** when `tmean` grids for the window are in `extracted/` (`prism_watershed.py
+  --var tmean`), each gauge also gets runoff ÷ rain volume and its basin's snow share (`rain_mm`,
+  `snow_pct`, `rain_ratio_low`, `rain_ratio_high` in `runoff_summary.csv`), split as in `storm_total.py`
+  (`--all-snow-c`, `--all-rain-c`).
 - **Checks printed:** basin area three ways (PRISM cells, NLDI polygon, USGS published drainage area),
   hours interpolated, and USGS approval status (provisional or approved).
 
@@ -455,23 +490,29 @@ is weaker, as expected from the day-boundary offsets. 46 stations had gaps and w
   Upper St. Johns gave ratios of 0.00–0.02 for 15–40 mm of rain. Compare gauges within a region rather
   than against a fixed range.
 - **Snow lowers the ratio here.** PRISM precipitation includes snow, and snow at high elevations stays
-  on the ground past the flow window. In mountain basins in the cold season, read the ratio as a lower
-  bound until rain and snow are split (roadmap section 4).
+  on the ground past the flow window. In mountain basins in the cold season, read the all-precipitation
+  ratio as a lower bound and the rain-only ratio as an upper bound: some of the "snow" may have fallen as
+  rain (the split uses daily mean temperature), and rain on existing snow can melt it. A rain-only ratio
+  above 1 means the gauge passed more water than fell as rain; in the San Juan test the highest Animas
+  gauges (64–76% snow) went from 0.25–0.29 to 0.69–1.17.
 - **The flow window matters.** If the recession is cut off (the run happened before `--after-days`
   had passed, or `--after-days` is short), runoff is undercounted; rerun later.
 
 Example (`--all-gauges` on the San Juan, excerpt):
 ```
 47 gauges with 15-minute discharge in the study area's bounding box; 144 NID dams in the study basin
-  09342500 SAN JUAN RIVER AT PAGOSA SPRINGS, CO            727 km²   182.1 mm  ratio 0.34–0.40  unregulated (0.2 mm storage, 0% of precip)
-  09355500 SAN JUAN RIVER NEAR ARCHULETA, NM             8,379 km²   139.6 mm  ratio 0.01–0.01  regulated (274.3 mm storage, 196% of precip)
-  09361500 ANIMAS RIVER AT DURANGO, CO                   1,765 km²   126.8 mm  ratio 0.26–0.30  regulated (16.8 mm storage, 13% of precip)
+  09342500 SAN JUAN RIVER AT PAGOSA SPRINGS, CO            727 km²   182.1 mm  ratio 0.34–0.40 (rain-only 0.42–0.50, 20% snow)  unregulated (0.2 mm storage, 0% of precip)
+  09355500 SAN JUAN RIVER NEAR ARCHULETA, NM             8,379 km²   139.6 mm  ratio 0.01–0.01 (rain-only 0.01–0.01, 8% snow)  regulated (274.3 mm storage, 196% of precip)
+  09358000 ANIMAS RIVER AT SILVERTON, CO.                  182 km²   139.9 mm  ratio 0.26–0.29 (rain-only 1.06–1.17, 76% snow)  minor (1.1 mm storage, 1% of precip)
+  09361500 ANIMAS RIVER AT DURANGO, CO                   1,765 km²   126.8 mm  ratio 0.26–0.30 (rain-only 0.39–0.44, 33% snow)  regulated (16.8 mm storage, 13% of precip)
   09365000 skipped: discharge gap of 50.2 h (limit 12 h)
 PRISM days 2026-10-20 to 2026-10-27: 29 gauges compared {'regulated': 13, 'unregulated': 12, 'minor': 4}; 10 skipped (reasons in runoff_summary.csv)
 ```
 Read as: at Pagosa Springs (unregulated, a clean PRISM check) about a third of the storm's 182 mm had
 passed the gauge by the end of the record, which ended at the time of the run (Oct 31) before the full
-recession, and the high country got snow, so the true ratio is likely somewhat higher. Below Navajo Dam
+recession, and 20% of the basin's precipitation was snow by the default split, so the true ratio is
+likely between 0.34 and 0.50. At Silverton, 76% of the precipitation is classed as snow, and the rain-only
+ratio above 1 says either part of it fell as rain or rain melted earlier snow. Below Navajo Dam
 (Archuleta), reservoir storage is twice the storm and the ratio is ~0: the dam held the flood. Durango is
 labeled regulated, but storage is only 13% of the storm and its ratio matches the unregulated Animas
 gauges upstream. Farmington's record has a 50-hour gap during the flood, so it is skipped. Each gauge's

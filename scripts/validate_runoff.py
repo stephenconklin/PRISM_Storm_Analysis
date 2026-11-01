@@ -19,7 +19,10 @@ minus baseflow, bracketed two ways:
     line       baseflow rising linearly from start-of-window to end-of-window flow
                (smaller runoff; the recession is still above pre-storm flow at the end)
 Precipitation includes snow, which at high elevations stays on the ground, so ratios
-from mountain basins understate rain-driven runoff until rain/snow is split.
+from mountain basins understate rain-driven runoff. When PRISM tmean grids for the window
+are in <out>/extracted (prism_watershed.py --var tmean), each gauge also gets a rain-only
+ratio (runoff / rain volume), with rain split from snow by daily mean temperature as in
+storm_total.py (--all-snow-c, --all-rain-c).
 
 Regulation: dams from the National Inventory of Dams inside a gauge's basin are summed
 (normal storage, else NID storage) and expressed as a depth over the basin, comparable
@@ -62,7 +65,7 @@ import requests
 from shapely.geometry import Point
 import xarray as xr
 
-from storm_total import cell_area_m2, prism_day_files
+from storm_total import cell_area_m2, prism_day_files, snow_fraction
 from validate_stations import load_basin, write_layer
 
 CFS_TO_M3S = 0.028316846592
@@ -80,7 +83,7 @@ class GaugeSkipped(Exception):
 
 # ---------- processing (pure functions) ----------
 
-def basin_precip(grids, basin, max_missing_pct=1.0):
+def basin_precip(grids, basin, max_missing_pct=1.0, tmean=None, all_snow_c=0.0, all_rain_c=3.0):
     """Daily precipitation over a gauge basin from PRISM's national daily grids.
 
     grids: [(day, path)] of national grids (the ones in <out>/extracted), so a gauge basin may
@@ -88,6 +91,8 @@ def basin_precip(grids, basin, max_missing_pct=1.0):
     are ellipsoidal per row. Cells with no PRISM data (outside PRISM coverage, for example in
     Canada or Mexico) are filled with the basin-average depth, up to max_missing_pct of the basin
     area; beyond that a ValueError is raised.
+    tmean: optional {day: national tmean grid}; each row then also has rain_mm and rain_m3 (precipitation
+    minus snow by daily mean temperature, see storm_total.snow_fraction), averaged over cells with both grids.
     Returns (rows, missing_pct, basin area in m² from PRISM cells).
     """
     shapes = list(basin.to_crs(4269).geometry)
@@ -111,6 +116,18 @@ def basin_precip(grids, basin, max_missing_pct=1.0):
                              f"(for example in Canada or Mexico) on {d}")
         depth = float((vals[ok] * area[ok]).sum() / area[ok].sum())
         rows.append({"prism_day": d, "depth_mm": depth, "volume_m3": depth / 1000 * area_m2})
+        if tmean:
+            with rasterio.open(tmean[d]) as src:
+                t, _ = rio_mask(src, shapes, crop=True, filled=True, nodata=src.nodata)
+                t = t[0].astype(float)
+                if src.nodata is not None:
+                    t[t == src.nodata] = np.nan
+            both = ok & ~np.isnan(t)
+            if not both.any():
+                raise ValueError(f"no PRISM tmean data over the gauge basin on {d}")
+            rain = vals * (1 - snow_fraction(t, all_snow_c, all_rain_c))
+            rain_mm = float((rain[both] * area[both]).sum() / area[both].sum())
+            rows[-1].update(rain_mm=rain_mm, rain_m3=rain_mm / 1000 * area_m2)
     return rows, missing_pct, area_m2
 
 
@@ -196,7 +213,7 @@ def upsert_layer(gdf, gpkg, layer, key, values):
 
 # ---------- one gauge ----------
 
-def run_gauge(site_no, site, grids, study_poly, dams, a, vdir):
+def run_gauge(site_no, site, grids, study_poly, dams, a, vdir, tmean=None):
     """Compare one gauge. Returns (result dict, basin GeoDataFrame); raises GaugeSkipped."""
     from observations import nldi_basin, usgs_continuous
 
@@ -214,7 +231,8 @@ def run_gauge(site_no, site, grids, study_poly, dams, a, vdir):
         if share < 0.5:
             raise GaugeSkipped(f"gauge basin lies mostly outside the study basin ({share:.0%} inside)", site)
     try:
-        precip, missing_pct, grid_area_m2 = basin_precip(grids, basin, max_missing_pct=a.max_missing_pct)
+        precip, missing_pct, grid_area_m2 = basin_precip(grids, basin, a.max_missing_pct, tmean,
+                                                         a.all_snow_c, a.all_rain_c)
     except ValueError as e:
         raise GaugeSkipped(str(e), site)
 
@@ -258,24 +276,34 @@ def run_gauge(site_no, site, grids, study_poly, dams, a, vdir):
 
 
 def precip_and_ratios(precip, missing_pct, grid_area_m2, vols):
-    """The 'precip' and 'runoff_ratio' blocks of a gauge result."""
+    """The 'precip', 'rain' (if the rows have rain) and 'runoff_ratio' blocks of a gauge result."""
     p_vol = sum(r["volume_m3"] for r in precip)
-    return {"precip": {"volume_m3": p_vol, "depth_mm": p_vol / grid_area_m2 * 1000,
-                       "filled_area_pct": round(missing_pct, 3),
-                       "daily": [{**r, "prism_day": str(r["prism_day"])} for r in precip]},
-            "runoff_ratio": {"constant_baseflow": vols["runoff_constant_m3"] / p_vol,
-                             "line_baseflow": vols["runoff_line_m3"] / p_vol,
-                             "total_flow": vols["total_flow_m3"] / p_vol}}
+    out = {"precip": {"volume_m3": p_vol, "depth_mm": p_vol / grid_area_m2 * 1000,
+                      "filled_area_pct": round(missing_pct, 3),
+                      "daily": [{**r, "prism_day": str(r["prism_day"])} for r in precip]},
+           "rain": None,
+           "runoff_ratio": {"constant_baseflow": vols["runoff_constant_m3"] / p_vol,
+                            "line_baseflow": vols["runoff_line_m3"] / p_vol,
+                            "total_flow": vols["total_flow_m3"] / p_vol}}
+    if precip and "rain_m3" in precip[0]:
+        r_vol = sum(r["rain_m3"] for r in precip)
+        out["rain"] = {"volume_m3": r_vol, "depth_mm": r_vol / grid_area_m2 * 1000,
+                       "snow_pct": (p_vol - r_vol) / p_vol * 100 if p_vol else 0.0}
+        if r_vol:
+            out["runoff_ratio"].update(rain_constant_baseflow=vols["runoff_constant_m3"] / r_vol,
+                                       rain_line_baseflow=vols["runoff_line_m3"] / r_vol)
+    return out
 
 
-def update_precip(result, basin, grids, a):
+def update_precip(result, basin, grids, a, tmean=None):
     """Recompute a saved result's precipitation and runoff ratios from the current grids.
 
     Used when PRISM has revised the grids since the result was saved: the basin, flow and dams don't
     depend on the release, so no network requests are needed.
     """
     try:
-        precip, missing_pct, grid_area_m2 = basin_precip(grids, basin, max_missing_pct=a.max_missing_pct)
+        precip, missing_pct, grid_area_m2 = basin_precip(grids, basin, a.max_missing_pct, tmean,
+                                                         a.all_snow_c, a.all_rain_c)
     except ValueError as e:
         raise GaugeSkipped(str(e), result["gauge"])
     result.update(precip_and_ratios(precip, missing_pct, grid_area_m2, result["flow"]))
@@ -303,36 +331,44 @@ def summary_row(site_no, result=None, site=None, reason=None):
             "ratio_line": round(rr["line_baseflow"], 3), "ratio_const": round(rr["constant_baseflow"], 3),
             "ratio_low": round(min(rr["line_baseflow"], rr["constant_baseflow"]), 3),
             "ratio_high": round(max(rr["line_baseflow"], rr["constant_baseflow"]), 3),
+            **({"rain_mm": round(result["rain"]["depth_mm"], 1), "snow_pct": round(result["rain"]["snow_pct"], 1),
+                "rain_ratio_low": round(min(rr["rain_line_baseflow"], rr["rain_constant_baseflow"]), 3),
+                "rain_ratio_high": round(max(rr["rain_line_baseflow"], rr["rain_constant_baseflow"]), 3)}
+               if result.get("rain") and "rain_line_baseflow" in rr else {}),
             "peak_cfs": round(fl["peak_cfs"]), "peak_utc": fl["peak_time_utc"],
             "interp_h": round(fl["interpolated_h"], 2), "flow_end_utc": result["flow_window_utc"]["end"],
             "lon": result["gauge"]["lon"], "lat": result["gauge"]["lat"]}
 
 
-def window_key(days, a, releases=()):
+def window_key(days, a, releases=(), rain_snow=None):
     """Identifies a run's settings, so cached gauge results are reused only for the same window."""
     return {"start": str(days[0]), "end": str(days[-1]), "after_days": a.after_days, "precip": "national grids",
             "max_gap_hours": a.max_gap_hours, "minor_mm": a.minor_mm, "regulated_mm": a.regulated_mm,
-            "releases": list(releases)}
+            "releases": list(releases), "rain_snow": rain_snow}
 
 
-def same_except_releases(key1, key2):
-    """True if two run keys differ at most in the PRISM releases of their days."""
+PRECIP_KEYS = ("releases", "rain_snow")  # change the precipitation only, not the basin or flow
+
+
+def same_except_precip(key1, key2):
+    """True if two run keys differ at most in PRECIP_KEYS (PRISM releases, rain/snow split)."""
     def strip(k):
-        return {n: v for n, v in (k or {}).items() if n != "releases"}
+        return {n: v for n, v in (k or {}).items() if n not in PRECIP_KEYS}
     return strip(key1) == strip(key2)
 
 
 def load_cached(vdir, site_no, key):
     """(result, basin, None) or (None, skip reason, gauge) from an earlier run with the same settings, else None.
 
-    Results saved with other PRISM releases are returned too, with a run_key that differs from key, so the
-    caller can recompute their precipitation (update_precip). Skip reasons don't depend on the release.
+    Results saved with other PRISM releases or rain/snow settings are returned too, with a run_key that
+    differs from key, so the caller can recompute their precipitation (update_precip). Skip reasons don't
+    depend on either.
     """
     path = vdir / f"runoff_{site_no}.json"
     if not path.exists():
         return None
     cached = json.loads(path.read_text())
-    if not same_except_releases(cached.get("run_key"), key):
+    if not same_except_precip(cached.get("run_key"), key):
         return None
     if cached.get("status") and cached["status"] != "ok":
         return None, cached["status"], cached.get("gauge")
@@ -358,6 +394,10 @@ def main():
     ap.add_argument("--end", help="last PRISM day (default: last day in the cube)")
     ap.add_argument("--after-days", type=int, default=7, help="days of flow after --end to include (default 7)")
     ap.add_argument("--max-gap-hours", type=float, default=12.0, help="longest discharge gap to interpolate (default 12)")
+    ap.add_argument("--all-snow-c", type=float, default=0.0,
+                    help="daily mean temperature at or below which precipitation is all snow (default 0 °C)")
+    ap.add_argument("--all-rain-c", type=float, default=3.0,
+                    help="daily mean temperature at or above which precipitation is all rain (default 3 °C)")
     ap.add_argument("--max-missing-pct", type=float, default=1.0,
                     help="share of a gauge basin allowed outside PRISM coverage (e.g. Canada), filled with the basin mean (default 1)")
     ap.add_argument("--minor-mm", type=float, default=1.0, help="upstream dam storage depth for 'minor' (default 1 mm)")
@@ -396,11 +436,17 @@ def main():
             if grid is None:
                 sys.exit(f"No extracted PRISM grid for {d} in {out / 'extracted'}; run prism_watershed.py for it.")
             grids.append((d, grid))
+        tmean = {d: prism_day_files(out / "extracted", "tmean", a.res, d)[0] for d in days}
+        if None in tmean.values():
+            tmean = None
+            print("No PRISM tmean grids for every day in extracted/; rain-only ratios skipped "
+                  "(run prism_watershed.py --var tmean for the window).")
+        rain_snow = [a.all_snow_c, a.all_rain_c] if tmean else None
 
         releases = ([int(v) for v in ds.release.sel(time=slice(str(start), str(end))).values]
                     if "release" in ds else [])
         bbox = tuple(study.total_bounds)
-        key = window_key(days, a, releases)
+        key = window_key(days, a, releases, rain_snow)
         stopped = None
         try:
             dams = nid_dams(bbox)
@@ -426,14 +472,14 @@ def main():
                 if cached:
                     result, basin = cached[0], cached[1]
                     if result["run_key"] != key:
-                        result = update_precip(result, basin, grids, a)
+                        result = update_precip(result, basin, grids, a, tmean)
                         result["run_key"] = key
                         (vdir / f"runoff_{site_no}.json").write_text(json.dumps(result, indent=2))
-                        cached = "precip updated for new PRISM releases"
+                        cached = "precipitation recomputed (new PRISM releases or rain/snow settings)"
                 else:
                     try:
                         site = meta.get(site_no) or usgs_site(site_no)
-                        result, basin = run_gauge(site_no, site, grids, study_poly, dams, a, vdir)
+                        result, basin = run_gauge(site_no, site, grids, study_poly, dams, a, vdir, tmean)
                     except RateLimited:
                         raise
                     except requests.RequestException as e:
@@ -457,7 +503,10 @@ def main():
             rows.append(row)
             basins.append(gpd.GeoDataFrame([row], geometry=[basin.to_crs(4269).geometry.iloc[0]], crs=4269))
             print(f"  {site_no} {row['name'][:42]:<42} {row['area_km2']:>8,.0f} km²  {row['precip_mm']:6.1f} mm  "
-                  f"ratio {row['ratio_low']:.2f}–{row['ratio_high']:.2f}  {row['regulation']}"
+                  f"ratio {row['ratio_low']:.2f}–{row['ratio_high']:.2f}"
+                  + (f" (rain-only {row['rain_ratio_low']:.2f}–{row['rain_ratio_high']:.2f}, {row['snow_pct']:.0f}% snow)"
+                     if "rain_ratio_low" in row else "")
+                  + f"  {row['regulation']}"
                   f" ({row['dam_storage_mm']:.1f} mm storage, {row['storage_pct_of_precip']:.0f}% of precip)"
                   + (f"  [{cached}]" if isinstance(cached, str) else "  [saved]" if cached else ""))
 

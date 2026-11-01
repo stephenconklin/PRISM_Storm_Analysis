@@ -19,19 +19,20 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 SCRIPT = SCRIPTS / "prism_watershed.py"
 sys.path.insert(0, str(SCRIPTS))
 from find_huc import build_where  # noqa: E402
-from storm_total import boundary_volumes, cell_area_m2, cell_fractions, revision_change, window_total  # noqa: E402
+from storm_total import (boundary_volumes, cell_area_m2, cell_fractions, revision_change,  # noqa: E402
+                         snow_fraction, window_total)
 
 
-def make_zip(raw_dir, ymd, value, release=2):
-    tif = raw_dir / f"prism_ppt_us_30s_{ymd}.tif"
+def make_zip(raw_dir, ymd, value, release=2, var="ppt"):
+    tif = raw_dir / f"prism_{var}_us_30s_{ymd}.tif"
     with rasterio.open(tif, "w", driver="GTiff", height=100, width=100, count=1,
                        dtype="float32", crs="EPSG:4269",
                        transform=from_origin(-108.5, 37.8, 1 / 120, 1 / 120),
                        nodata=-9999) as dst:
         dst.write(np.full((100, 100), value, dtype="float32"), 1)
-    info = raw_dir / f"prism_ppt_us_30s_{ymd}.info.txt"
+    info = raw_dir / f"prism_{var}_us_30s_{ymd}.info.txt"
     info.write_text(f"PRISM_DATASET_VERSION: D2\nPRISM_DATASET_RELEASE_NUMBER: {release}\n")
-    with zipfile.ZipFile(raw_dir / f"prism_ppt_us_30s_{ymd}.zip", "w") as z:
+    with zipfile.ZipFile(raw_dir / f"prism_{var}_us_30s_{ymd}.zip", "w") as z:
         z.write(tif, tif.name)
         z.write(info, info.name)
     tif.unlink()
@@ -209,6 +210,44 @@ def test_boundary_volumes_three_ways():
     touched = 0.010 * (4 * area[1] + 3 * area[2])
     assert np.isclose(v["weighted"], weighted) and np.isclose(v["touched"], touched)
     assert np.isclose(v["centers"], centers)
+
+
+def test_snow_fraction():
+    t = np.array([-2.0, 0.0, 1.5, 3.0, 8.0, np.nan])
+    assert np.allclose(snow_fraction(t), [1, 1, 0.5, 0, 0, np.nan], equal_nan=True)
+    assert np.allclose(snow_fraction(t, 1.0, 1.0), [1, 1, 0, 0, 0, np.nan], equal_nan=True)  # single threshold
+
+
+def test_rain_snow_with_tmean_cube(tmp_path):
+    """A tmean run in the same folder gets its own summary and cube; storm_total splits rain from snow."""
+    out = tmp_path / "run"
+    raw = out / "raw_zips"
+    raw.mkdir(parents=True)
+    for ymd, p, t in (("20261021", 10.0, -4.0), ("20261022", 30.0, 1.5)):  # all snow, then half snow
+        make_zip(raw, ymd, p)
+        make_zip(raw, ymd, t, var="tmean")
+    boundary = tmp_path / "basin.geojson"
+    gpd.GeoDataFrame(geometry=[box(-108.4, 37.5, -108.0, 37.7)], crs="EPSG:4326").to_file(boundary)
+    base = [sys.executable, str(SCRIPT), "--start", "2026-10-21", "--end", "2026-10-22",
+            "--boundary", str(boundary), "--out", str(out), "--pause", "0"]
+    subprocess.run(base, check=True, capture_output=True)
+    subprocess.run(base + ["--var", "tmean"], check=True, capture_output=True)
+    rows = list(csv.DictReader(open(out / "daily_basin_summary.csv")))
+    assert [r["basin_mean_mm"] for r in rows] == ["10.0", "30.0"]  # untouched by the tmean run
+    trows = list(csv.DictReader(open(out / "tmean_800m_daily_basin_summary.csv")))
+    assert [(r["basin_mean"], r["units"]) for r in trows] == [("-4.0", "degC"), ("1.5", "degC")]
+    assert not list(out.glob("tmean_*_total_*.tif"))
+
+    nc = tmp_path / "rs.nc"
+    res = subprocess.run([sys.executable, str(SCRIPTS / "storm_total.py"), "--out", str(out), "--boundary",
+                          str(boundary), "--rain-snow-nc", str(nc), "--snow-tif", str(tmp_path / "snow.tif")],
+                         check=True, capture_output=True, text=True)
+    assert "Rain/snow:   rain 15.0 mm" in res.stdout and "snow 25.0 mm" in res.stdout  # 0+15 rain, 10+15 snow
+    assert "rain + snow = precipitation volume" in res.stdout
+    with xr.open_dataset(nc) as ds:
+        assert np.isclose(float(ds.rain_total.mean()), 15.0) and np.isclose(float(ds.snow_total.mean()), 25.0)
+    with rasterio.open(tmp_path / "snow.tif") as src:
+        assert np.isclose(src.read(1, masked=True).mean(), 25.0)
 
 
 def test_cell_area_matches_pyproj():

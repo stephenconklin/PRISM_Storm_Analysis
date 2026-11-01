@@ -55,7 +55,7 @@ gauges whose basins lie mostly outside the study basin are skipped; `--gauge` ru
 1. ~~**QC checks and run manifest** (sections 2 and 5.1)~~ — built 1 Nov 2026.
 2. ~~**Uncertainty: revision and boundary sensitivity** (3.1, 3.2)~~ — built 1 Nov 2026.
 3. ~~**Station validation** (1.1)~~ — built; follow-ups listed in 1.1.
-4. **Rain/snow partition** (4). Needed before the runoff comparison means anything in mountain basins.
+4. ~~**Rain/snow partition** (4)~~ — built 1 Nov 2026; SNOTEL check still open.
 5. ~~**Streamflow comparison** (1.2)~~ — built; then **multi-product comparison** (1.3) and the **uncertainty roll-up** (3.3).
 6. **Storm context** (6) and **reports** (7).
 7. **Engineering** (8). Start version control and CI at any point; the rest as the tool grows.
@@ -285,6 +285,14 @@ written up in `docs/`.
 ---
 
 ## 4. Rain/snow partition — M
+
+> **Status: built 1 Nov 2026.** `prism_watershed.py --var tmean` shares the precipitation folder (own cube
+> and summary CSV, no event total); `storm_total.py` splits rain and snow per cell and day with a linear
+> ramp (`--all-snow-c` 0, `--all-rain-c` 3), reports both, writes `--rain-tif`, `--snow-tif`,
+> `--rain-snow-nc`, and QC checks rain + snow = precipitation; `validate_runoff.py` adds a rain-only
+> ratio and snow share per gauge. San Juan Oct 20–27: 3.8% snow basin-wide; 64–76% at the high Animas
+> gauges, whose rain-only ratios reach 1.06–1.17. Not built: the SNOTEL SWE check (next step: it would
+> show whether the high-elevation snow share is plausible), and rain/snow layers in the QGIS project.
 
 **Goal:** Split each cell's daily precipitation into rain and snow-water.
 

@@ -61,7 +61,7 @@ import xarray as xr
 
 import manifest
 import qc
-from storm_total import RES_CODES, build_cube, cell_area_m2, geodesic_km2
+from storm_total import RES_CODES, VAR_UNITS, build_cube, cell_area_m2, geodesic_km2
 
 try:
     # Use the OS trust store: services.nacse.org chains to emSign Root CA - G1,
@@ -241,15 +241,25 @@ def clip(grid, basin, out_path, release=""):
     return arr, meta
 
 
-def day_stats(arr, transform):
-    """Basin mean, max (mm) and volume (m³) of one clipped day."""
+def day_stats(arr, transform, var="ppt"):
+    """Basin mean, max (mm) and volume (m³) of one clipped precipitation day; for other variables,
+    basin mean, min and max in the variable's units."""
+    if var != "ppt":
+        return {"basin_mean": round(float(arr.mean()), 2), "basin_min": round(float(arr.min()), 2),
+                "basin_max": round(float(arr.max()), 2)}
     area = np.repeat(cell_area_m2(transform, arr.shape[0])[:, None], arr.shape[1], axis=1)
     volume = float((arr / 1000 * area).sum())
     return {"basin_mean_mm": round(float(arr.mean()), 2), "basin_max_mm": round(float(arr.max()), 2),
             "basin_volume_m3": round(volume)}
 
 
-def clipped_day(path, summary_csv):
+def summary_name(var, res):
+    """daily_basin_summary.csv for precipitation (its original name); <var>_<res>_daily_basin_summary.csv
+    for other variables, so a folder can hold several."""
+    return "daily_basin_summary.csv" if var == "ppt" else f"{var}_{res}_daily_basin_summary.csv"
+
+
+def clipped_day(path, summary_csv, var="ppt"):
     """(release, stats) of an existing clipped tif, or None. Tifs clipped before releases were tagged
     take the release from daily_basin_summary.csv."""
     if not path.exists():
@@ -263,7 +273,7 @@ def clipped_day(path, summary_csv):
             for r in csv.DictReader(f):
                 if r["date"].replace("-", "") == ymd:
                     release = r.get("release", "")
-    return release, day_stats(arr, transform)
+    return release, day_stats(arr, transform, var)
 
 
 def stations_near(stn_csv, zone):
@@ -272,11 +282,9 @@ def stations_near(stn_csv, zone):
     return int(shapely.contains_xy(zone, df["Longitude"].to_numpy(), df["Latitude"].to_numpy()).sum())
 
 
-HISTORY_FIELDS = ["date", "release", "basin_mean_mm", "basin_max_mm", "basin_volume_m3", "recorded"]
-
-
 def update_history(path, entries):
     """Add (date, release) rows not already in the release history CSV; returns all rows."""
+    fields = list(entries[0])
     rows = []
     if path.exists():
         with open(path, newline="") as f:
@@ -284,11 +292,11 @@ def update_history(path, entries):
     seen = {(r["date"], r["release"]) for r in rows}
     for e in entries:
         if (e["date"], e["release"]) not in seen:
-            rows.append({k: e[k] for k in HISTORY_FIELDS})
+            rows.append({k: e[k] for k in fields})
             seen.add((e["date"], e["release"]))
     rows.sort(key=lambda r: (r["date"], int(r["release"]) if r["release"].isdigit() else 0))
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=HISTORY_FIELDS)
+        w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)
     return rows
@@ -356,7 +364,8 @@ def main():
     session = requests.Session()
     session.headers["User-Agent"] = "prism-data-wrangler"
 
-    summary_csv = out / "daily_basin_summary.csv"
+    summary_csv = out / summary_name(a.var, a.res)
+    ppt = a.var == "ppt"
     today, recorded = dt.date.today(), dt.datetime.now().isoformat(timespec="seconds")
     rows, history, changes, total, meta = [], [], [], None, None
     errors, downloads, grids, stations, day_min, day_max, missing_m2 = {}, [], [], {}, {}, {}, {}
@@ -366,7 +375,7 @@ def main():
         ymd = day.strftime("%Y%m%d")
         cached = raw / zip_name(a.var, a.res, a.region, day, a.format)
         clip_path = clipped / f"{a.var}_{a.res}_{ymd}_clip.tif"
-        before = clipped_day(clip_path, summary_csv)  # what this folder held before this run
+        before = clipped_day(clip_path, summary_csv, a.var)  # what this folder held before this run
         if before:
             history.append({"date": day.isoformat(), "release": before[0], **before[1], "recorded": recorded})
         if (a.refresh and cached.exists() and due_for_refresh(
@@ -412,15 +421,19 @@ def main():
         stn = sorted(Path(grid).parent.glob("*.stn.csv"))
         if stn:
             stations[day] = stations_near(stn[0], station_zone)
-        stats = day_stats(arr, meta["transform"])
-        rows.append({"date": day.isoformat(), "release": release,
-                     "basin_mean_mm": stats["basin_mean_mm"], "basin_max_mm": stats["basin_max_mm"],
-                     "basin_mean_in": round(float(arr.mean()) / 25.4, 3)})
+        stats = day_stats(arr, meta["transform"], a.var)
+        if ppt:
+            rows.append({"date": day.isoformat(), "release": release,
+                         "basin_mean_mm": stats["basin_mean_mm"], "basin_max_mm": stats["basin_max_mm"],
+                         "basin_mean_in": round(float(arr.mean()) / 25.4, 3)})
+        else:
+            rows.append({"date": day.isoformat(), "release": release, **stats, "units": VAR_UNITS.get(a.var, "")})
         history.append({"date": day.isoformat(), "release": release, **stats, "recorded": recorded})
         if before and before[0] != release:
             changes.append((day, before, release, stats))
-        print(f"  {ymd}: mean {rows[-1]['basin_mean_mm']} mm, max {rows[-1]['basin_max_mm']} mm "
-              f"[release {release or 'n/a'}]")
+        print(f"  {ymd}: " + (f"mean {stats['basin_mean_mm']} mm, max {stats['basin_max_mm']} mm" if ppt else
+                              f"mean {stats['basin_mean']}, min {stats['basin_min']}, max {stats['basin_max']} "
+                              f"{VAR_UNITS.get(a.var, '')}") + f" [release {release or 'n/a'}]")
 
     if not rows:
         sys.exit("No data downloaded.")
@@ -428,8 +441,12 @@ def main():
     history_csv = out / f"{a.var}_{a.res}_release_history.csv"
     update_history(history_csv, history)
     if changes:
-        print("\nRevised by PRISM since the last run (basin mean / volume):")
+        print("\nRevised by PRISM since the last run (basin mean" + (" / volume):" if ppt else "):"))
         for day, (old_rel, old), new_rel, new in changes:
+            if not ppt:
+                print(f"  {day}: release {old_rel or '?'} -> {new_rel}: {old['basin_mean']} -> {new['basin_mean']} "
+                      f"{VAR_UNITS.get(a.var, '')}")
+                continue
             dv = new["basin_volume_m3"] - old["basin_volume_m3"]
             pct = f" ({dv / old['basin_volume_m3'] * 100:+.1f}%)" if old["basin_volume_m3"] else ""
             print(f"  {day}: release {old_rel or '?'} -> {new_rel}: {old['basin_mean_mm']} -> "
@@ -451,11 +468,13 @@ def main():
         w.writerows(sorted(kept + rows, key=lambda r: r["date"]))
 
     tag = f"{rows[0]['date']}_{rows[-1]['date']}".replace("-", "")
-    meta.update(dtype="float32")
-    with rasterio.open(out / f"{a.var}_{a.res}_total_{tag}.tif", "w", **meta) as dst:
-        dst.write(total.filled(-9999).astype("float32"), 1)
-    print(f"\nEvent total: basin mean {total.mean():.1f} mm ({total.mean()/25.4:.2f} in), "
-          f"max {total.max():.1f} mm ({total.max()/25.4:.2f} in)")
+    total_tif = out / f"{a.var}_{a.res}_total_{tag}.tif"
+    if ppt:  # a sum only means something for precipitation
+        meta.update(dtype="float32")
+        with rasterio.open(total_tif, "w", **meta) as dst:
+            dst.write(total.filled(-9999).astype("float32"), 1)
+        print(f"\nEvent total: basin mean {total.mean():.1f} mm ({total.mean()/25.4:.2f} in), "
+              f"max {total.max():.1f} mm ({total.max()/25.4:.2f} in)")
     missing_pct, missing_km2, basin_km2 = prism_coverage(total, meta["transform"], basin)
     if missing_pct > 0.5:
         print(f"WARNING: {missing_pct:.1f}% of the basin ({missing_km2:,.0f} of {basin_km2:,.0f} km²) has no PRISM "
@@ -468,13 +487,13 @@ def main():
     print(f"Outputs in {out.resolve()}")
 
     # QC: this run's days, plus the cube they went into.
-    total_tif = out / f"{a.var}_{a.res}_total_{tag}.tif"
     run_days = [dt.date.fromisoformat(r["date"]) for r in rows]
     with xr.open_dataset(cube) as ds:
         cube_days = set(ds.time.values.astype("datetime64[D]").astype(object))
         cube_sum = float(ds[a.var].sel(time=[np.datetime64(d, "ns") for d in run_days]).sum("time", skipna=False).sum())
-    with rasterio.open(total_tif) as src:
-        tif_sum = float(src.read(1, masked=True).astype("float64").sum())
+    if ppt:
+        with rasterio.open(total_tif) as src:
+            tif_sum = float(src.read(1, masked=True).astype("float64").sum())
     basin_m2 = float(area[inside].sum())
     constant_m2 = float(area[always_missing].sum()) if always_missing is not None else 0.0
     checks = [
@@ -483,9 +502,9 @@ def main():
         qc.grid_consistency(grids),
         qc.nodata_inside({str(d): (m - constant_m2) / basin_m2 * 100 for d, m in missing_m2.items()},
                          constant_m2 / basin_m2 * 100),
-        (qc.physical_limits(day_min, day_max, a.qc_max_daily_mm) if a.var == "ppt"
+        (qc.physical_limits(day_min, day_max, a.qc_max_daily_mm) if ppt
          else qc.result("physical_limits", "skip", f"limits are for ppt, not {a.var}")),
-        qc.totals_reconcile([("cube sum = event-total raster", cube_sum, tif_sum)]),
+        qc.totals_reconcile([("cube sum = event-total raster", cube_sum, tif_sum)] if ppt else []),
         qc.release_mix({r["date"]: r["release"] for r in rows}),
         qc.station_density(stations, basin_km2, a.qc_station_buffer_km, a.qc_min_stations),
         qc.boundary_agreement(basin_km2, geodesic_km2(basin.to_crs(4269).geometry.iloc[0])),

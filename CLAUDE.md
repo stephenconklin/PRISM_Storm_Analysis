@@ -43,7 +43,10 @@ That run's outputs (HUC 1408, PRISM days Oct 20–27) are in
 - `tests/test_offline.py` — offline test using synthetic rasters (no network); `tests/test_qc.py` — QC and manifest
 - `data/` — all downloads and outputs (git-ignored; never commit rasters)
 
-`prism_watershed.py` requires `--start`, `--end`, and one of `--huc`/`--boundary`.
+`prism_watershed.py` requires `--start`, `--end`, and one of `--huc`/`--boundary`. `--var tmean` (etc.) can share a
+`ppt` folder: own cube and `<var>_<res>_daily_basin_summary.csv`, no event total. `storm_total.py` splits rain/snow
+from the `tmean` cube (`snow_fraction`, `rain_snow`); `validate_runoff.py` adds rain-only ratios from national
+`tmean` grids in `extracted/`. Discovery globs that mean precipitation must say `ppt_` (e.g. QGIS `discover`).
 Outputs (default `--out data/huc<code>` or `data/<boundary stem>`): `raw_zips/`, `extracted/`, `clipped/<var>_<res>_YYYYMMDD_clip.tif`,
 `daily_basin_summary.csv` (every day in the folder; a run replaces its own days), `<var>_<res>_total_<start>_<end>.tif`, `<var>_<res>_daily_clip.nc` (rebuilt each run
 from every tif in `clipped/`, so one `--out` folder = one basin), `<var>_<res>_release_history.csv`. `--end` is capped at yesterday.

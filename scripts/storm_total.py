@@ -18,12 +18,19 @@ for each day. If the national grids in <out>/extracted and the basin boundary ar
 also reports boundary sensitivity: the window volume counting cells by center (the cube's rule),
 any cell touching the basin, and each cell weighted by its share inside the basin.
 
+Rain and snow: if <out>/tmean_<res>_daily_clip.nc exists (prism_watershed.py --var tmean
+for the same basin and days), each cell's daily precipitation is split by its PRISM daily
+mean temperature: all snow at or below --all-snow-c (default 0 °C), all rain at or above
+--all-rain-c (default 3 °C), linear between (equal values give a single threshold). Snow
+here is snow-water equivalent; rain + snow = precipitation.
+
 Usage examples:
     python storm_total.py --out data/huc14080104                     # every day in the cube
     python storm_total.py --out data/huc14080104 --start 2026-10-22 --end 2026-10-23
     python storm_total.py --out data/huc14080104 --tif depth_mm.tif
     python storm_total.py --out data/huc14080104 --volume-tif volume_m3.tif
     python storm_total.py --out data/huc14080104 --volume-nc volume_m3.nc
+    python storm_total.py --out data/huc14080104 --rain-tif rain_mm.tif --snow-tif snow_mm.tif --rain-snow-nc rain_snow.nc
 
 The volume raster holds m³ of water per cell; its sum is the basin volume. The
 volume NetCDF holds the same per day (`volume`) plus the window total (`volume_total`).
@@ -55,6 +62,8 @@ GRS80_A = 6378137.0
 GRS80_F = 1 / 298.257222101
 M3_PER_ACRE_FT = 1233.48184
 GRID_SUFFIXES = (".tif", ".bil", ".nc", ".asc")  # preference order
+VAR_UNITS = {"ppt": "mm", "tmin": "degC", "tmax": "degC", "tmean": "degC", "tdmean": "degC",
+             "vpdmin": "hPa", "vpdmax": "hPa"}
 
 
 def cell_area_m2(transform, height):
@@ -109,7 +118,7 @@ def build_cube(clipped_dir, var, res, nc_path, attrs=None):
     ds = xr.Dataset(
         {
             var: (("time", "lat", "lon"), np.stack(layers),
-                  {"units": "mm", "long_name": f"PRISM daily {var}", "grid_mapping": "crs"}),
+                  {"units": VAR_UNITS.get(var, ""), "long_name": f"PRISM daily {var}", "grid_mapping": "crs"}),
             "cell_area": (("lat", "lon"), area,
                           {"units": "m2", "long_name": "cell area on the GRS80 ellipsoid",
                            "grid_mapping": "crs"}),
@@ -249,6 +258,77 @@ def national_window_total(grids, ds):
     return total, transform
 
 
+def snow_fraction(t, all_snow_c=0.0, all_rain_c=3.0):
+    """Share of precipitation falling as snow, from daily mean temperature t (°C, numpy array).
+
+    1 at or below all_snow_c, 0 at or above all_rain_c, linear between. If all_rain_c <= all_snow_c,
+    a single threshold: snow below all_snow_c, rain at or above it. NaN where t is NaN.
+    """
+    t = np.asarray(t, dtype=float)
+    if all_rain_c <= all_snow_c:
+        f = (t < all_snow_c).astype(float)
+    else:
+        f = np.clip((all_rain_c - t) / (all_rain_c - all_snow_c), 0.0, 1.0)
+    return np.where(np.isnan(t), np.nan, f)
+
+
+def rain_snow(daily_mm, tmean, all_snow_c=0.0, all_rain_c=3.0):
+    """Split daily precipitation (DataArray: time, lat, lon) into rain and snow using tmean on the same
+    grid and days. snow = precipitation x snow fraction and rain = precipitation - snow, so they add up to
+    the precipitation. Returns (rain, snow, snow fraction) as DataArrays like daily_mm."""
+    f = snow_fraction(tmean, all_snow_c, all_rain_c)
+    snow = daily_mm.values * f
+    return daily_mm.copy(data=daily_mm.values - snow), daily_mm.copy(data=snow), daily_mm.copy(data=f)
+
+
+def partition_window(out, res, ds, r, all_snow_c, all_rain_c):
+    """Rain and snow for a window_total result r, from the tmean cube in out, or a note why not."""
+    tnc = Path(out) / f"tmean_{res}_daily_clip.nc"
+    if not tnc.exists():
+        return f"skipped: no {tnc.name} (run prism_watershed.py --var tmean for the same basin and days)"
+    daily = r["daily_mm"]
+    with xr.open_dataset(tnc) as tds:
+        if tds.sizes["lat"] != ds.sizes["lat"] or tds.sizes["lon"] != ds.sizes["lon"] or not (
+                np.allclose(tds.lat, ds.lat) and np.allclose(tds.lon, ds.lon)):
+            return f"skipped: {tnc.name} is on a different grid than the precipitation cube"
+        have = set(tds.time.values.astype("datetime64[D]"))
+        missing = [str(t)[:10] for t in daily.time.values.astype("datetime64[D]") if t not in have]
+        if missing:
+            return f"skipped: {tnc.name} has no data for {', '.join(missing)}"
+        tmean = tds.tmean.sel(time=daily.time).values
+        t_releases = ([int(v) for v in tds.release.sel(time=daily.time).values] if "release" in tds else [])
+    rain, snow, frac = rain_snow(daily, tmean, all_snow_c, all_rain_c)
+    inside = r["total_mm"].notnull()
+    out_r = {"rain_mm": rain, "snow_mm": snow, "snow_fraction": frac, "tmean_releases": t_releases}
+    for name, da in (("rain", rain), ("snow", snow)):
+        total = da.sum("time", skipna=False)
+        out_r[f"{name}_total_mm"] = total
+        out_r[f"{name}_m3"] = float((total / 1000 * ds.cell_area).where(inside).sum())
+    return out_r
+
+
+def write_rain_snow_nc(ds, part, path, all_snow_c, all_rain_c):
+    """Daily rain, snow and snow fraction plus window totals (mm) to NetCDF."""
+    grid = {"grid_mapping": "crs"}
+    out = xr.Dataset(
+        {
+            "rain": part["rain_mm"].assign_attrs(units="mm", long_name="daily rain", **grid),
+            "snow": part["snow_mm"].assign_attrs(units="mm", long_name="daily snow (water equivalent)", **grid),
+            "snow_fraction": part["snow_fraction"].assign_attrs(units="1", long_name="share of precipitation as snow",
+                                                                **grid),
+            "rain_total": part["rain_total_mm"].assign_attrs(units="mm", long_name="window-total rain", **grid),
+            "snow_total": part["snow_total_mm"].assign_attrs(units="mm", long_name="window-total snow", **grid),
+            "cell_area": ds.cell_area,
+            "crs": ds.crs,
+        },
+        attrs={**ds.attrs, "rain_snow_method": f"snow fraction 1 at or below {all_snow_c:g} degC daily mean "
+               f"temperature (PRISM tmean), 0 at or above {all_rain_c:g} degC, linear between",
+               "rain_m3": part["rain_m3"], "snow_m3": part["snow_m3"]},
+    )
+    enc = {"zlib": True, "complevel": 4, "_FillValue": np.nan}
+    out.to_netcdf(path, encoding={k: enc for k in ("rain", "snow", "snow_fraction", "rain_total", "snow_total")})
+
+
 def cube_transform(ds):
     """Affine transform of the cube's (lat, lon) cell grid."""
     lat, lon = ds.lat.values, ds.lon.values
@@ -326,6 +406,13 @@ def main():
                     help="also write daily and total water volume per cell (m³) to this NetCDF")
     ap.add_argument("--boundary",
                     help="basin polygon for the boundary check (default: the wbd_huc*.geojson in --out)")
+    ap.add_argument("--all-snow-c", type=float, default=0.0,
+                    help="daily mean temperature at or below which precipitation is all snow (default 0 °C)")
+    ap.add_argument("--all-rain-c", type=float, default=3.0,
+                    help="daily mean temperature at or above which precipitation is all rain (default 3 °C)")
+    ap.add_argument("--rain-tif", help="also write the window's total rain (mm) to this GeoTIFF (needs the tmean cube)")
+    ap.add_argument("--snow-tif", help="also write the window's total snow-water (mm) to this GeoTIFF")
+    ap.add_argument("--rain-snow-nc", help="also write daily rain, snow and snow fraction plus totals to this NetCDF")
     ap.add_argument("--qc-strict", action="store_true", help="treat QC warnings as failures")
     ap.add_argument("--qc-max-daily-mm", type=float, default=400.0,
                     help="flag daily precipitation in any cell above this (default 400 mm)")
@@ -349,6 +436,16 @@ def main():
         gap = ds.attrs.get("basin_without_prism_pct", 0)
         basin_km2 = ds.attrs.get("basin_area_km2")
         bounds = boundary_check(Path(a.out), a.res, a.boundary, ds, start, r["days"])
+        part = partition_window(a.out, a.res, ds, r, a.all_snow_c, a.all_rain_c)
+        if isinstance(part, str) and (a.rain_tif or a.snow_tif or a.rain_snow_nc):
+            sys.exit(f"Rain/snow outputs requested but the partition was {part}")
+        if not isinstance(part, str):
+            if a.rain_tif:
+                write_tif(part["rain_total_mm"], ds.crs.attrs["crs_wkt"], a.rain_tif, "mm")
+            if a.snow_tif:
+                write_tif(part["snow_total_mm"], ds.crs.attrs["crs_wkt"], a.snow_tif, "mm")
+            if a.rain_snow_nc:
+                write_rain_snow_nc(ds, part, a.rain_snow_nc, a.all_snow_c, a.all_rain_c)
         daily = r["daily_mm"]
         day_keys = [str(t)[:10] for t in daily.time.values]
         day_min = dict(zip(day_keys, daily.min(("lat", "lon")).values.tolist()))
@@ -382,6 +479,15 @@ def main():
                   + ", ".join(f"{d.strftime('%b %d')} r{r0}->r{r1}" for d, r0, r1 in rc["revised"]))
         elif rc:
             print(f"Revisions:   none recorded yet for these days ({history_csv.name})")
+    if isinstance(part, str):
+        print(f"Rain/snow:   {part}")
+    else:
+        rv, sv = part["rain_m3"], part["snow_m3"]
+        ramp = (f"snow below {a.all_snow_c:g} °C" if a.all_rain_c <= a.all_snow_c else
+                f"all snow at or below {a.all_snow_c:g} °C, all rain at or above {a.all_rain_c:g} °C")
+        print(f"Rain/snow:   rain {rv / r['area_m2'] * 1000:.1f} mm, {rv / 1e9:.3f} km³ ({rv / v * 100:.1f}%); "
+              f"snow {sv / r['area_m2'] * 1000:.1f} mm, {sv / 1e9:.3f} km³ ({sv / v * 100:.1f}%) "
+              f"[{ramp}, daily mean temperature]")
     if isinstance(bounds, str):
         print(f"Boundary:    {bounds}")
     else:
@@ -396,8 +502,14 @@ def main():
         print(f"Volume raster (m³ per cell): {a.volume_tif}")
     if a.volume_nc:
         print(f"Volume NetCDF (daily + total m³ per cell): {a.volume_nc}")
+    for label, path in (("Rain raster (mm)", a.rain_tif), ("Snow raster (mm)", a.snow_tif),
+                        ("Rain/snow NetCDF", a.rain_snow_nc)):
+        if path:
+            print(f"{label}: {path}")
 
     pairs = []
+    if not isinstance(part, str):
+        pairs.append(("rain + snow = precipitation volume", part["rain_m3"] + part["snow_m3"], v))
     if a.volume_tif:
         with rasterio.open(a.volume_tif) as src:
             pairs.append(("volume raster sum = reported volume", float(src.read(1, masked=True).astype("float64").sum()), v))
@@ -414,11 +526,17 @@ def main():
     if a.qc_strict:
         checks = qc.apply_strict(checks)
     print("\n" + "\n".join(qc.report(checks)))
-    run.update(window={"start": start, "end": end}, inputs=manifest.files_entry([nc], a.out),
+    tnc = Path(a.out) / f"tmean_{a.res}_daily_clip.nc"
+    run.update(window={"start": start, "end": end},
+               inputs=manifest.files_entry([nc] + ([tnc] if not isinstance(part, str) else []), a.out),
                results={"area_km2": r["area_m2"] / 1e6, "mean_mm": r["mean_mm"], "max_mm": r["max_mm"],
                         "volume_m3": v, "releases": dict(zip(day_keys, r["releases"])),
-                        "boundary_volumes_m3": None if isinstance(bounds, str) else bounds["volumes"]},
-               qc=checks, outputs=manifest.files_entry([f for f in (a.tif, a.volume_tif, a.volume_nc) if f], a.out))
+                        "boundary_volumes_m3": None if isinstance(bounds, str) else bounds["volumes"],
+                        "rain_snow": part if isinstance(part, str) else {
+                            "rain_m3": part["rain_m3"], "snow_m3": part["snow_m3"], "all_snow_c": a.all_snow_c,
+                            "all_rain_c": a.all_rain_c, "tmean_releases": part["tmean_releases"]}},
+               qc=checks, outputs=manifest.files_entry([f for f in (a.tif, a.volume_tif, a.volume_nc, a.rain_tif,
+                                                                    a.snow_tif, a.rain_snow_nc) if f], a.out))
     print(f"Run recorded in {manifest.append_run(a.out, run).name}")
     if qc.worst_level(checks) == "fail":
         sys.exit("QC failed (see above).")

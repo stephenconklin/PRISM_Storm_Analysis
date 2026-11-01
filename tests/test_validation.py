@@ -258,7 +258,8 @@ def test_runoff_cache_reused_across_releases(tmp_path):
     import json
     from types import SimpleNamespace
     from validate_runoff import load_cached, update_precip, window_key
-    a = SimpleNamespace(after_days=7, max_gap_hours=12.0, minor_mm=1.0, regulated_mm=10.0, max_missing_pct=1.0)
+    a = SimpleNamespace(after_days=7, max_gap_hours=12.0, minor_mm=1.0, regulated_mm=10.0, max_missing_pct=1.0,
+                        all_snow_c=0.0, all_rain_c=3.0)
     days = [D]
     old_key, new_key = window_key(days, a, [1]), window_key(days, a, [2])
     basin = gpd.GeoDataFrame(geometry=[box(-108.0, 37.8, -107.8, 38.0)], crs=4269)
@@ -275,3 +276,24 @@ def test_runoff_cache_reused_across_releases(tmp_path):
     result = update_precip(result, cached_basin, [(D, grid)], a)
     assert result["precip"]["depth_mm"] == pytest.approx(10.0, rel=1e-4)
     assert result["runoff_ratio"]["constant_baseflow"] == pytest.approx(1e5 / result["precip"]["volume_m3"])
+    assert result["rain"] is None  # no tmean grids
+
+    # Adding the rain/snow split recomputes precipitation only: 1.5 °C everywhere is half snow.
+    key3 = window_key(days, a, [2], [0.0, 3.0])
+    result, cached_basin, _ = load_cached(tmp_path, "09342500", key3)
+    tgrid = national_grid(tmp_path / "t.tif", [[1.5, 1.5], [1.5, 1.5]])
+    result = update_precip(result, cached_basin, [(D, grid)], a, {D: tgrid})
+    assert result["rain"]["depth_mm"] == pytest.approx(5.0, rel=1e-4) and result["rain"]["snow_pct"] == pytest.approx(50)
+    assert result["runoff_ratio"]["rain_constant_baseflow"] == pytest.approx(1e5 / result["rain"]["volume_m3"])
+
+
+def test_basin_precip_rain_by_cell(tmp_path):
+    """Rain is split cell by cell: a cold cell's precipitation is snow, a warm cell's is rain."""
+    from storm_total import cell_area_m2
+    basin = gpd.GeoDataFrame(geometry=[box(-108.0, 37.8, -107.8, 38.0)], crs=4269)
+    ppt = national_grid(tmp_path / "p.tif", [[10, 10], [20, 20]])
+    tmean = national_grid(tmp_path / "t.tif", [[-5, -5], [10, 10]])  # top row all snow, bottom row all rain
+    rows, _, _ = basin_precip([(D, ppt)], basin, tmean={D: tmean})
+    area = cell_area_m2(from_origin(-108.0, 38.0, 0.1, 0.1), 2)
+    assert rows[0]["rain_mm"] == pytest.approx(20 * area[1] / area.sum())
+    assert rows[0]["depth_mm"] == pytest.approx((10 * area[0] + 20 * area[1]) / area.sum())
