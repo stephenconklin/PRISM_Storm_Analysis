@@ -259,7 +259,7 @@ def test_runoff_cache_reused_across_releases(tmp_path):
     from types import SimpleNamespace
     from validate_runoff import load_cached, update_precip, window_key
     a = SimpleNamespace(after_days=7, max_gap_hours=12.0, minor_mm=1.0, regulated_mm=10.0, max_missing_pct=1.0,
-                        all_snow_c=0.0, all_rain_c=3.0)
+                        all_snow_c=0.0, all_rain_c=3.0, res="800m")
     days = [D]
     old_key, new_key = window_key(days, a, [1]), window_key(days, a, [2])
     basin = gpd.GeoDataFrame(geometry=[box(-108.0, 37.8, -107.8, 38.0)], crs=4269)
@@ -319,3 +319,125 @@ def test_snotel_window_alignment_and_shares():
              "station_split_snow_pct": 0, "prism_snow_pct": 0}]
     s = summarize(rows, min_precip_mm=10)
     assert s["stations"] == 1 and s["observed_snow_pct"] == 20 and s["prism_over_observed_snow"] == 1.2
+
+
+
+def test_flow_cache_reuse_rules(tmp_path):
+    """Results cut short by the time of the run are refetched once more flow exists; precip skips are redone
+    when precipitation settings change, flow skips are not."""
+    import json
+    from types import SimpleNamespace
+    from validate_runoff import flow_end_target, flow_stale, load_cached, window_key
+    a = SimpleNamespace(after_days=7, max_gap_hours=12.0, minor_mm=1.0, regulated_mm=10.0, max_missing_pct=1.0,
+                        res="800m")
+    utc = dt.timezone.utc
+    target = flow_end_target(dt.date(2026, 10, 27), 7)
+    assert target == dt.datetime(2026, 11, 3, 12, tzinfo=utc)
+    cut = dt.datetime(2026, 10, 31, 16, tzinfo=utc)
+    assert not flow_stale(cut, target, dt.datetime(2026, 10, 31, 20, tzinfo=utc))   # nothing new yet
+    assert flow_stale(cut, target, dt.datetime(2026, 11, 1, 13, tzinfo=utc))         # a day of new flow
+    assert not flow_stale(target, target, dt.datetime(2026, 12, 1, tzinfo=utc))      # complete
+
+    key = window_key([dt.date(2026, 10, 20), dt.date(2026, 10, 27)], a, [2] * 8)
+    basin = gpd.GeoDataFrame(geometry=[box(-108.0, 37.8, -107.8, 38.0)], crs=4269)
+    basin.to_file(tmp_path / "runoff_1_basin.geojson", driver="GeoJSON")
+    (tmp_path / "runoff_1.json").write_text(json.dumps(
+        {"run_key": key, "status": "ok", "flow_window_utc": {"end": cut.isoformat()}}))
+    late = dt.datetime(2026, 11, 5, tzinfo=utc)
+    assert load_cached(tmp_path, "1", key, target, now=dt.datetime(2026, 10, 31, 18, tzinfo=utc)) is not None
+    assert load_cached(tmp_path, "1", key, target, now=late) is None
+
+    other = window_key([dt.date(2026, 10, 20), dt.date(2026, 10, 27)],
+                       SimpleNamespace(**{**vars(a), "max_missing_pct": 5.0}), [2] * 8)
+    for stage, reused in (("precip", False), ("flow", True)):
+        (tmp_path / "runoff_2.json").write_text(json.dumps(
+            {"run_key": key, "status": "x", "stage": stage, "checked_utc": late.isoformat()}))
+        got = load_cached(tmp_path, "2", other, target, now=late)
+        assert (got is not None) == reused
+    (tmp_path / "runoff_3.json").write_text(json.dumps({"run_key": key, "status": "old skip"}))  # undated
+    assert load_cached(tmp_path, "3", key, target, now=late) is None
+    assert window_key([D], SimpleNamespace(**{**vars(a), "res": "4km"}))["res"] == "4km"
+
+
+def test_flow_series_hourly_gauge():
+    from validate_runoff import flow_series
+    t0 = pd.Timestamp("2026-10-21T12:00Z")
+    hourly = [((t0 + pd.Timedelta(hours=h)).isoformat(), 10.0, [], "P") for h in range(25)]
+    q, interp, info = flow_series(hourly, t0, t0 + pd.Timedelta(hours=24))
+    assert info["reading_interval_min"] == 60 and info["longest_gap_h"] == 0 and info["gaps"] == []
+    assert info["interpolated_h"] == pytest.approx(18.0)  # 3 of every 4 steps lie between readings
+    off = [((t0 + pd.Timedelta(minutes=15 * k + 7)).isoformat(), 10.0, [], "P") for k in range(96)]
+    assert flow_series(off, t0, t0 + pd.Timedelta(hours=24))[2]["interpolated_h"] <= 0.25  # readings at :07, :22
+
+
+def test_ratios_with_all_snow_and_retry_after():
+    from observations import retry_after_s
+    from validate_runoff import precip_and_ratios, summary_row
+    precip = [{"prism_day": D, "depth_mm": 10.0, "volume_m3": 1e6, "rain_mm": 0.0, "rain_m3": 0.0}]
+    vols = {"runoff_constant_m3": 2e5, "runoff_line_m3": 1e5, "total_flow_m3": 3e5}
+    out = precip_and_ratios(precip, 0.0, 1e8, vols)
+    assert out["rain"]["snow_pct"] == 100 and out["runoff_ratio"]["rain_line_baseflow"] is None
+    result = {"gauge": {"name": "x", "lon": 0, "lat": 0}, **out, "flow": {**vols, "peak_cfs": 1, "peak_time_utc": "",
+              "interpolated_h": 0}, "regulation": {"class": "unregulated", "storage_mm": 0, "storage_af": 0,
+              "n_dams": 0, "largest": []}, "basin_area_km2": {"prism_cells": 100, "usgs_drainage_area": None},
+              "prism_window": {"start": "a", "end": "b"}, "flow_window_utc": {"end": "c"}}
+    row = summary_row("1", result)
+    assert row["snow_pct"] == 100 and row["rain_ratio_low"] is None
+    assert retry_after_s("120", 5) == 120 and retry_after_s(None, 5) == 5
+    assert retry_after_s("Wed, 21 Oct 2015 07:28:00 GMT", 5) == 0  # a date in the past
+    assert retry_after_s("soon", 5) == 5
+
+
+def test_snow_share_ignores_nan():
+    from validate_snow import share, summarize
+    assert share(10.0, float("nan")) is None and share(float("nan"), 10.0) is None and share(5.0, 0.0) is None
+    rows = [{"status": "ok", "precip_mm": 50, "swe_gain_mm": 10, "prism_snow_mm": None, "observed_snow_pct": 20,
+             "station_split_snow_pct": 30, "prism_snow_pct": None}]
+    assert summarize(rows, 10)["prism_over_observed_snow"] is None
+
+
+def test_gauge_runs_update_only_their_gauges(tmp_path, monkeypatch):
+    """--gauge A then --gauge B keeps both in the layers (offline: network calls replaced by fakes)."""
+    import subprocess
+    import validate_runoff
+    import observations
+    from test_offline import OFFLINE, SCRIPT, make_zip
+    out = tmp_path / "run"
+    (out / "raw_zips").mkdir(parents=True)
+    for ymd in ("20261021", "20261022"):
+        make_zip(out / "raw_zips", ymd, 10.0)
+    boundary = tmp_path / "basin.geojson"
+    gpd.GeoDataFrame(geometry=[box(-108.4, 37.5, -108.0, 37.7)], crs=4269).to_file(boundary)
+    subprocess.run([sys.executable, str(SCRIPT), "--start", "2026-10-21", "--end", "2026-10-22", "--boundary",
+                    str(boundary), "--out", str(out), "--pause", "0"], check=True, capture_output=True, env=OFFLINE)
+    sites = {"A": (-108.3, 37.6), "B": (-108.1, 37.6)}
+
+    def site(s):
+        return {"site": s, "name": f"gauge {s}", "lon": sites[s][0], "lat": sites[s][1], "site_type": "Stream",
+                "drainage_area_mi2": None}
+
+    def basin(s):
+        x, y = sites[s]
+        return {"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {},
+                "geometry": box(x - 0.05, y - 0.05, x + 0.05, y + 0.05).__geo_interface__}]}
+
+    def flow(s, t0, t1):
+        times = pd.date_range(t0, t1, freq="15min")
+        return [(t.isoformat(), 50.0 + 10 * np.sin(k / 20), [], "Provisional") for k, t in enumerate(times)]
+    monkeypatch.setattr(observations, "nid_dams", lambda bbox: [])
+    monkeypatch.setattr(observations, "usgs_sites", lambda bbox: {s: site(s) for s in sites})
+    monkeypatch.setattr(observations, "usgs_site", site)
+    monkeypatch.setattr(observations, "nldi_basin", basin)
+    monkeypatch.setattr(observations, "usgs_continuous", flow)
+
+    def run(*gauges):
+        monkeypatch.setattr(sys, "argv", ["validate_runoff.py", "--out", str(out), "--boundary", str(boundary),
+                                          "--gauge", *gauges])
+        validate_runoff.main()
+    run("A")
+    run("B")
+    run("B")
+    gpkg = out / "validation" / "validation.gpkg"
+    assert sorted(gpd.read_file(gpkg, layer="gauge_basins")["site"]) == ["A", "B"]
+    gauges = gpd.read_file(gpkg, layer="gauges")
+    assert sorted(gauges["site"]) == ["A", "B"] and gauges["ratio_low"].dtype.kind == "f"  # numbers, not text

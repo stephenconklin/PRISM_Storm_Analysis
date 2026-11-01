@@ -63,6 +63,21 @@ class RateLimited(RuntimeError):
         self.retry_after = retry_after
 
 
+def retry_after_s(value, default):
+    """Seconds to wait from a Retry-After header: delta-seconds or an HTTP date."""
+    if value is None:
+        return default
+    try:
+        return max(0, int(value))
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+            import datetime as dt
+            return max(0, int((parsedate_to_datetime(value) - dt.datetime.now(dt.timezone.utc)).total_seconds()))
+        except (TypeError, ValueError):
+            return default
+
+
 def _get(url, params=None, timeout=120):
     """GET with the USGS key (if set) and retries on 429/503."""
     headers = dict(HEADERS)
@@ -73,7 +88,7 @@ def _get(url, params=None, timeout=120):
         if r.status_code not in (429, 503):
             r.raise_for_status()
             return r
-        wait = int(r.headers.get("Retry-After", 5 * 2 ** attempt))
+        wait = retry_after_s(r.headers.get("Retry-After"), 5 * 2 ** attempt)
         if wait > MAX_WAIT_S:
             raise RateLimited(url, wait)
         if wait > 10:

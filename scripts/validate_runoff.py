@@ -74,11 +74,14 @@ KM2_PER_MI2 = 2.589988
 
 
 class GaugeSkipped(Exception):
-    """A gauge that cannot be compared; the message is the reason, .site its metadata if fetched."""
+    """A gauge that cannot be compared; the message is the reason, .site its metadata if fetched.
+    .stage is 'precip' when the reason comes from PRISM precipitation (so it can change with releases
+    or settings), 'flow' when it comes from the discharge record, else ''."""
 
-    def __init__(self, reason, site=None):
+    def __init__(self, reason, site=None, stage=""):
         super().__init__(reason)
         self.site = site
+        self.stage = stage
 
 
 # ---------- processing (pure functions) ----------
@@ -146,11 +149,20 @@ def flow_series(values, t0, t1):
         raise ValueError("No discharge values in the flow window.")
     grid = pd.date_range(t0, t1, freq="15min", tz="UTC")
     full = valid.reindex(valid.index.union(grid)).interpolate(method="time", limit_area="inside").reindex(grid)
-    interpolated = ~grid.isin(valid.index)
-    # Gaps between consecutive valid readings longer than the 15-minute step.
+    # A grid step is interpolated unless a reading lies within 7.5 minutes of it (readings need not
+    # fall on :00/:15/:30/:45).
+    pos = valid.index.searchsorted(grid)
+    near = np.full(len(grid), np.inf)
+    for k in (pos - 1, pos):
+        ok = (k >= 0) & (k < len(valid))
+        near[ok] = np.minimum(near[ok], np.abs((valid.index[k[ok]] - grid[ok]).total_seconds()))
+    interpolated = near > 450
+    # Gaps: consecutive readings further apart than the gauge's usual interval (15 min, or hourly, ...).
     steps = valid.index.to_series().diff().dt.total_seconds().div(3600)
-    gaps = steps[steps > 0.26]
-    info = {"valid_readings": int(len(valid)), "longest_gap_h": float(gaps.max()) if len(gaps) else 0.0,
+    usual = float(steps.median()) if len(steps.dropna()) else 0.25
+    gaps = steps[steps > max(0.26, usual * 1.01)]
+    info = {"valid_readings": int(len(valid)), "reading_interval_min": round(usual * 60, 1),
+            "longest_gap_h": float(gaps.max()) if len(gaps) else 0.0,
             "interpolated_h": float(interpolated.sum() * 0.25),
             "starts_after_window_h": max(0.0, (valid.index[0] - grid[0]).total_seconds() / 3600),
             "ends_before_window_h": max(0.0, (grid[-1] - valid.index[-1]).total_seconds() / 3600),
@@ -213,9 +225,13 @@ def upsert_layer(gdf, gpkg, layer, key, values):
 
 # ---------- one gauge ----------
 
-def run_gauge(site_no, site, grids, study_poly, dams, a, vdir, tmean=None):
-    """Compare one gauge. Returns (result dict, basin GeoDataFrame); raises GaugeSkipped."""
-    from observations import nldi_basin, usgs_continuous
+def run_gauge(site_no, site, grids, study_poly, dams_for, a, vdir, tmean=None):
+    """Compare one gauge. Returns (result dict, basin GeoDataFrame); raises GaugeSkipped.
+
+    dams_for(bounds) returns NID dams covering at least those lon/lat bounds (the gauge basin may extend
+    past the study basin).
+    """
+    from observations import RateLimited, nldi_basin, usgs_continuous
 
     start, end = grids[0][0], grids[-1][0]
     if site.get("site_type") not in (None, "Stream"):
@@ -224,6 +240,8 @@ def run_gauge(site_no, site, grids, study_poly, dams, a, vdir, tmean=None):
         raise GaugeSkipped("gauge is outside the study basin", site)
     try:
         basin = gpd.GeoDataFrame.from_features(nldi_basin(site_no)["features"], crs=4326).dissolve()
+    except (RateLimited, requests.RequestException):
+        raise  # transient: not saved as a skip, retried next run
     except Exception as e:
         raise GaugeSkipped(f"no NLDI basin ({e.__class__.__name__})", site)
     if study_poly is not None:
@@ -234,7 +252,9 @@ def run_gauge(site_no, site, grids, study_poly, dams, a, vdir, tmean=None):
         precip, missing_pct, grid_area_m2 = basin_precip(grids, basin, a.max_missing_pct, tmean,
                                                          a.all_snow_c, a.all_rain_c)
     except ValueError as e:
-        raise GaugeSkipped(str(e), site)
+        raise GaugeSkipped(str(e), site, "precip")
+    if not sum(r["volume_m3"] for r in precip):
+        raise GaugeSkipped("no precipitation over the gauge basin in the window", site, "precip")
 
     t0 = dt.datetime.combine(start - dt.timedelta(days=1), dt.time(12), tzinfo=dt.timezone.utc)
     t1 = dt.datetime.combine(end + dt.timedelta(days=a.after_days), dt.time(12), tzinfo=dt.timezone.utc)
@@ -243,13 +263,14 @@ def run_gauge(site_no, site, grids, study_poly, dams, a, vdir, tmean=None):
     try:
         q, interp, gaps = flow_series(raw, t0, t1)
     except ValueError as e:
-        raise GaugeSkipped(str(e), site)
+        raise GaugeSkipped(str(e), site, "flow")
     worst = max(gaps["longest_gap_h"], gaps["starts_after_window_h"], gaps["ends_before_window_h"])
     if worst > a.max_gap_hours:
-        raise GaugeSkipped(f"discharge gap of {worst:.1f} h (limit {a.max_gap_hours:g} h)", site)
+        raise GaugeSkipped(f"discharge gap of {worst:.1f} h (limit {a.max_gap_hours:g} h)", site, "flow")
     q = q.ffill().bfill()  # only the window edges, already checked against --max-gap-hours
     vols, base_c, base_l = runoff_volumes(q)
-    reg = regulation(basin, dams, grid_area_m2, a.minor_mm, a.regulated_mm)
+    reg = regulation(basin, dams_for(tuple(basin.to_crs(4269).total_bounds)), grid_area_m2, a.minor_mm,
+                     a.regulated_mm)
 
     peak_t = q.idxmax()
     result = {
@@ -289,9 +310,8 @@ def precip_and_ratios(precip, missing_pct, grid_area_m2, vols):
         r_vol = sum(r["rain_m3"] for r in precip)
         out["rain"] = {"volume_m3": r_vol, "depth_mm": r_vol / grid_area_m2 * 1000,
                        "snow_pct": (p_vol - r_vol) / p_vol * 100 if p_vol else 0.0}
-        if r_vol:
-            out["runoff_ratio"].update(rain_constant_baseflow=vols["runoff_constant_m3"] / r_vol,
-                                       rain_line_baseflow=vols["runoff_line_m3"] / r_vol)
+        out["runoff_ratio"].update(rain_constant_baseflow=vols["runoff_constant_m3"] / r_vol if r_vol else None,
+                                   rain_line_baseflow=vols["runoff_line_m3"] / r_vol if r_vol else None)
     return out
 
 
@@ -305,7 +325,9 @@ def update_precip(result, basin, grids, a, tmean=None):
         precip, missing_pct, grid_area_m2 = basin_precip(grids, basin, a.max_missing_pct, tmean,
                                                          a.all_snow_c, a.all_rain_c)
     except ValueError as e:
-        raise GaugeSkipped(str(e), result["gauge"])
+        raise GaugeSkipped(str(e), result["gauge"], "precip")
+    if not sum(r["volume_m3"] for r in precip):
+        raise GaugeSkipped("no precipitation over the gauge basin in the window", result["gauge"], "precip")
     result.update(precip_and_ratios(precip, missing_pct, grid_area_m2, result["flow"]))
     return result
 
@@ -332,37 +354,52 @@ def summary_row(site_no, result=None, site=None, reason=None):
             "ratio_low": round(min(rr["line_baseflow"], rr["constant_baseflow"]), 3),
             "ratio_high": round(max(rr["line_baseflow"], rr["constant_baseflow"]), 3),
             **({"rain_mm": round(result["rain"]["depth_mm"], 1), "snow_pct": round(result["rain"]["snow_pct"], 1),
-                "rain_ratio_low": round(min(rr["rain_line_baseflow"], rr["rain_constant_baseflow"]), 3),
-                "rain_ratio_high": round(max(rr["rain_line_baseflow"], rr["rain_constant_baseflow"]), 3)}
-               if result.get("rain") and "rain_line_baseflow" in rr else {}),
+                "rain_ratio_low": round(min(rr["rain_line_baseflow"], rr["rain_constant_baseflow"]), 3)
+                if rr.get("rain_line_baseflow") is not None else None,
+                "rain_ratio_high": round(max(rr["rain_line_baseflow"], rr["rain_constant_baseflow"]), 3)
+                if rr.get("rain_line_baseflow") is not None else None} if result.get("rain") else {}),
+            "flow_complete": result.get("flow_complete", True),
             "peak_cfs": round(fl["peak_cfs"]), "peak_utc": fl["peak_time_utc"],
             "interp_h": round(fl["interpolated_h"], 2), "flow_end_utc": result["flow_window_utc"]["end"],
             "lon": result["gauge"]["lon"], "lat": result["gauge"]["lat"]}
 
 
-def window_key(days, a, releases=(), rain_snow=None):
+def window_key(days, a, releases=(), rain_snow=None, tmean_releases=()):
     """Identifies a run's settings, so cached gauge results are reused only for the same window."""
     return {"start": str(days[0]), "end": str(days[-1]), "after_days": a.after_days, "precip": "national grids",
             "max_gap_hours": a.max_gap_hours, "minor_mm": a.minor_mm, "regulated_mm": a.regulated_mm,
-            "releases": list(releases), "rain_snow": rain_snow}
+            "res": a.res, "max_missing_pct": a.max_missing_pct, "releases": list(releases),
+            "rain_snow": rain_snow, "tmean_releases": list(tmean_releases)}
 
 
-PRECIP_KEYS = ("releases", "rain_snow")  # change the precipitation only, not the basin or flow
+# Settings that change only the precipitation, not the basin, flow or dams.
+PRECIP_KEYS = ("res", "max_missing_pct", "releases", "rain_snow", "tmean_releases")
 
 
 def same_except_precip(key1, key2):
-    """True if two run keys differ at most in PRECIP_KEYS (PRISM releases, rain/snow split)."""
+    """True if two run keys differ at most in PRECIP_KEYS."""
     def strip(k):
         return {n: v for n, v in (k or {}).items() if n not in PRECIP_KEYS}
     return strip(key1) == strip(key2)
 
 
-def load_cached(vdir, site_no, key):
+def flow_end_target(end, after_days):
+    """End of the flow window a run asks for: 12:00 UTC, after_days after the last PRISM day."""
+    return dt.datetime.combine(end + dt.timedelta(days=after_days), dt.time(12), tzinfo=dt.timezone.utc)
+
+
+def flow_stale(saved_end, target, now, slack_h=6.0):
+    """True if a saved flow record (or skip) ending at saved_end was cut short of target by more than slack_h
+    hours of data that now exists. Runs before the target time are capped at the time of the run."""
+    return (min(target, now) - saved_end).total_seconds() / 3600 > slack_h
+
+
+def load_cached(vdir, site_no, key, target=None, now=None):
     """(result, basin, None) or (None, skip reason, gauge) from an earlier run with the same settings, else None.
 
-    Results saved with other PRISM releases or rain/snow settings are returned too, with a run_key that
-    differs from key, so the caller can recompute their precipitation (update_precip). Skip reasons don't
-    depend on either.
+    Results saved with other PRECIP_KEYS are returned too, with a run_key that differs from key, so the
+    caller can recompute their precipitation (update_precip); skips caused by precipitation are not reused
+    then. Results whose flow window was cut short (run before target) are not reused once more flow exists.
     """
     path = vdir / f"runoff_{site_no}.json"
     if not path.exists():
@@ -370,7 +407,13 @@ def load_cached(vdir, site_no, key):
     cached = json.loads(path.read_text())
     if not same_except_precip(cached.get("run_key"), key):
         return None
+    if target is not None:
+        saved = (cached.get("flow_window_utc") or {}).get("end") or cached.get("checked_utc")
+        if not saved or flow_stale(dt.datetime.fromisoformat(saved), target, now or dt.datetime.now(dt.timezone.utc)):
+            return None  # (skips saved before checked_utc was recorded can't be dated: check again)
     if cached.get("status") and cached["status"] != "ok":
+        if cached.get("stage") == "precip" and cached.get("run_key") != key:
+            return None
         return None, cached["status"], cached.get("gauge")
     basin_file = vdir / f"runoff_{site_no}_basin.geojson"
     if not basin_file.exists():
@@ -442,15 +485,31 @@ def main():
             print("No PRISM tmean grids for every day in extracted/; rain-only ratios skipped "
                   "(run prism_watershed.py --var tmean for the window).")
         rain_snow = [a.all_snow_c, a.all_rain_c] if tmean else None
+        tmean_releases = []
+        tnc = out / f"tmean_{a.res}_daily_clip.nc"
+        if tmean and tnc.exists():
+            with xr.open_dataset(tnc) as tds:
+                if "release" in tds:
+                    tmean_releases = [int(v) for v in tds.release.sel(time=slice(str(start), str(end))).values]
 
         releases = ([int(v) for v in ds.release.sel(time=slice(str(start), str(end))).values]
                     if "release" in ds else [])
         bbox = tuple(study.total_bounds)
-        key = window_key(days, a, releases, rain_snow)
+        key = window_key(days, a, releases, rain_snow, tmean_releases)
+        target = flow_end_target(end, a.after_days)
         stopped = None
+        dam_cache = {}
+
+        def dams_for(bounds):
+            """NID dams covering bounds, widening the cached query when a gauge basin reaches past it."""
+            w, s, e, n = dam_cache["bbox"]
+            if bounds[0] < w or bounds[1] < s or bounds[2] > e or bounds[3] > n:
+                wider = (min(w, bounds[0]), min(s, bounds[1]), max(e, bounds[2]), max(n, bounds[3]))
+                dam_cache.update(bbox=wider, dams=nid_dams(wider))
+            return dam_cache["dams"]
         try:
-            dams = nid_dams(bbox)
-            dams = [d for d in dams if study_poly.contains(Point(d["lon"], d["lat"]))]
+            dam_cache.update(bbox=bbox, dams=nid_dams(bbox))
+            dams = [d for d in dam_cache["dams"] if study_poly.contains(Point(d["lon"], d["lat"]))]
             meta = usgs_sites(bbox)
             if a.all_gauges:
                 flow_start = str(start - dt.timedelta(days=1))
@@ -465,7 +524,7 @@ def main():
 
         rows, basins = [], []
         for i, site_no in enumerate(sites):
-            cached = None if a.refresh else load_cached(vdir, site_no, key)
+            cached = None if a.refresh else load_cached(vdir, site_no, key, target)
             try:
                 if cached and cached[0] is None:
                     raise GaugeSkipped(cached[1], cached[2])
@@ -474,12 +533,13 @@ def main():
                     if result["run_key"] != key:
                         result = update_precip(result, basin, grids, a, tmean)
                         result["run_key"] = key
+                        result["flow_complete"] = dt.datetime.fromisoformat(result["flow_window_utc"]["end"]) >= target
                         (vdir / f"runoff_{site_no}.json").write_text(json.dumps(result, indent=2))
                         cached = "precipitation recomputed (new PRISM releases or rain/snow settings)"
                 else:
                     try:
                         site = meta.get(site_no) or usgs_site(site_no)
-                        result, basin = run_gauge(site_no, site, grids, study_poly, dams, a, vdir, tmean)
+                        result, basin = run_gauge(site_no, site, grids, study_poly, dams_for, a, vdir, tmean)
                     except RateLimited:
                         raise
                     except requests.RequestException as e:
@@ -487,9 +547,11 @@ def main():
                                            f"{getattr(e.response, 'status_code', '')}".strip(), meta.get(site_no))
                     except GaugeSkipped as e:
                         (vdir / f"runoff_{site_no}.json").write_text(json.dumps(
-                            {"run_key": key, "status": str(e), "gauge": e.site}, indent=2))
+                            {"run_key": key, "status": str(e), "gauge": e.site, "stage": e.stage,
+                             "checked_utc": dt.datetime.now(dt.timezone.utc).isoformat()}, indent=2))
                         raise
                     result["run_key"] = key
+                    result["flow_complete"] = dt.datetime.fromisoformat(result["flow_window_utc"]["end"]) >= target
                     (vdir / f"runoff_{site_no}.json").write_text(json.dumps(result, indent=2))
             except GaugeSkipped as e:
                 rows.append(summary_row(site_no, site=e.site, reason=str(e)))
@@ -505,11 +567,17 @@ def main():
             print(f"  {site_no} {row['name'][:42]:<42} {row['area_km2']:>8,.0f} km²  {row['precip_mm']:6.1f} mm  "
                   f"ratio {row['ratio_low']:.2f}–{row['ratio_high']:.2f}"
                   + (f" (rain-only {row['rain_ratio_low']:.2f}–{row['rain_ratio_high']:.2f}, {row['snow_pct']:.0f}% snow)"
-                     if "rain_ratio_low" in row else "")
+                     if row.get("rain_ratio_low") is not None else
+                     f" ({row['snow_pct']:.0f}% snow)" if "snow_pct" in row else "")
                   + f"  {row['regulation']}"
                   f" ({row['dam_storage_mm']:.1f} mm storage, {row['storage_pct_of_precip']:.0f}% of precip)"
-                  + (f"  [{cached}]" if isinstance(cached, str) else "  [saved]" if cached else ""))
+                  + (f"  [{cached}]" if isinstance(cached, str) else "  [saved]" if cached else "")
+                  + ("" if row["flow_complete"] else "  [flow window not over yet]"))
 
+    if stopped:  # keep the previous outputs; the gauges finished so far are saved and reused next run
+        sys.exit(f"Stopped with {stopped[1]} gauges left: {stopped[0]} Rerun the same command to continue; "
+                 "finished gauges are reused. Summary CSV and layers were left as they were.")
+    this_run = list(rows)
     if a.all_gauges:  # keep only gauges in the study basin
         rows = [r for r in rows if r["status"] != "gauge is outside the study basin"]
     summary = vdir / "runoff_summary.csv"
@@ -524,17 +592,23 @@ def main():
         w.writerows(rows)
 
     ok = [r for r in rows if r["status"] == "ok"]
-    points = [r for r in rows if r.get("lon") is not None]
-    replace = a.all_gauges
-    if basins:
-        gb = gpd.GeoDataFrame(pd.concat(basins, ignore_index=True), crs=4269)
-        (write_layer(gb, gpkg, "gauge_basins") if replace else
-         upsert_layer(gb, gpkg, "gauge_basins", "site", [r["site"] for r in ok]))
-    if points:
-        gp = gpd.GeoDataFrame(points, geometry=gpd.points_from_xy([r["lon"] for r in points],
-                                                                  [r["lat"] for r in points]), crs=4269)
-        (write_layer(gp, gpkg, "gauges") if replace else
-         upsert_layer(gp, gpkg, "gauges", "site", [r["site"] for r in points]))
+    # Layers: --all-gauges replaces them; --gauge replaces only the gauges run now (from this run's rows,
+    # never from the CSV, whose values are text).
+    if a.all_gauges:
+        this_run = [r for r in this_run if r["status"] != "gauge is outside the study basin"]
+    run_sites = [r["site"] for r in this_run]
+    points = [r for r in this_run if r.get("lon") is not None]
+    empty = gpd.GeoDataFrame({"site": pd.Series(dtype=str)}, geometry=gpd.GeoSeries([], crs=4269))
+    gb = gpd.GeoDataFrame(pd.concat(basins, ignore_index=True), crs=4269) if basins else empty
+    gp = (gpd.GeoDataFrame(points, geometry=gpd.points_from_xy([r["lon"] for r in points],
+                                                               [r["lat"] for r in points]), crs=4269)
+          if points else empty)
+    if a.all_gauges:
+        write_layer(gb, gpkg, "gauge_basins")
+        write_layer(gp, gpkg, "gauges")
+    else:
+        upsert_layer(gb, gpkg, "gauge_basins", "site", run_sites)
+        upsert_layer(gp, gpkg, "gauges", "site", run_sites)
     if dams:
         dg = pd.DataFrame(dams).drop(columns=["_af"], errors="ignore")
         dg["storage_af"] = dg["normal_storage_af"].fillna(dg["nid_storage_af"])
@@ -544,9 +618,6 @@ def main():
     print(f"PRISM days {start} to {end}: {len(ok)} gauges compared {counts}; "
           f"{len(rows) - len(ok)} skipped (reasons in runoff_summary.csv)")
     print(f"Outputs in {vdir.resolve()}")
-    if stopped:
-        sys.exit(f"Stopped with {stopped[1]} gauges left: {stopped[0]} Rerun the same command to continue; "
-                 "finished gauges are reused.")
 
 
 if __name__ == "__main__":

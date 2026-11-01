@@ -87,6 +87,8 @@ def main():
 
     bbox = tuple(basin.total_bounds)
     if huc:
+        if not a.digits and len(huc) >= 12:
+            sys.exit(f"HUC {huc} has {len(huc)} digits; subbasins need --digits 14 or 16 (mapped only in places).")
         digits = a.digits or pick_digits(huc, lambda d: wbd_count(d, prefix=huc))
         if digits <= len(huc):
             sys.exit(f"--digits must be longer than the study basin's HUC ({len(huc)} digits).")
@@ -112,7 +114,7 @@ def main():
                  "area_km2": round(basin_t["area_km2"], 1), "basin_cells_km2": round(basin_t["cells_km2"], 1),
                  "coverage_pct": round(basin_t["coverage_pct"], 1), "mean_mm": round(basin_t["mean_mm"], 1),
                  "max_mm": round(basin_t["max_mm"], 1), "volume_m3": round(vol), "volume_km3": round(vol / 1e9, 4),
-                 "volume_acre_ft": round(vol / M3_PER_ACRE_FT), "subbasin_level": f"HUC{digits}",
+                 "volume_acre_ft": round(vol / M3_PER_ACRE_FT), "subbasin_level": f"HUC{digits}", "res": a.res,
                  "subbasins": len(units)}
     rows = subbasin_rows(units, unit_t, vol, digits)
     for r in rows:
@@ -131,11 +133,12 @@ def main():
     print(f"Basin: {basin_t['area_km2']:,.0f} km² with PRISM data ({basin_t['coverage_pct']:.1f}% coverage), "
           f"mean {basin_t['mean_mm']:.1f} mm, max {basin_t['max_mm']:.1f} mm, "
           f"{vol / 1e9:.3f} km³ = {vol / M3_PER_ACRE_FT:,.0f} acre-ft")
-    print(f"{len(rows)} HUC{digits} subbasins; their volumes add up to {summed / vol * 100:.1f}% of the basin total")
+    print(f"{len(rows)} HUC{digits} subbasins" + (f"; their volumes add up to {summed / vol * 100:.1f}% of the basin total"
+                                                   if vol else "; no precipitation in the window"))
     print("Largest by volume:")
     for r in sorted(rows, key=lambda r: r["rank"])[:10]:
         print(f"  {r['rank']:>3}. {r['name'][:40]:<40} {r['area_km2']:>8,.0f} km²  {r['mean_mm'] or 0:6.1f} mm  "
-              f"{r['volume_acre_ft']:>10,} acre-ft  {r['share_pct']:5.1f}%")
+              f"{r['volume_acre_ft']:>10,} acre-ft  " + (f"{r['share_pct']:5.1f}%" if r["share_pct"] is not None else "    -"))
     low = [r for r in rows if r["coverage_pct"] < 99]
     if low:
         print(f"{len(low)} subbasins are partly without PRISM data (coverage < 99%), "

@@ -83,7 +83,10 @@ def prism_split(ppt_mm, tmean_c, all_snow_c=0.0, all_rain_c=3.0):
 
 
 def share(part, whole):
-    return round(part / whole * 100, 1) if part is not None and whole else None
+    """part as a percent of whole; None when either is missing (None or NaN) or whole is 0."""
+    if part is None or whole is None or np.isnan(part) or np.isnan(whole) or not whole:
+        return None
+    return round(part / whole * 100, 1)
 
 
 def summarize(rows, min_precip_mm):
@@ -155,13 +158,16 @@ def main():
             continue
         p_ppt, p_snow = (prism_split(ppt[:, i], tmean[:, i], a.all_snow_c, a.all_rain_c) if tmean is not None
                          else (float(ppt[:, i].sum()), None))
+        if np.isnan(p_ppt):  # station cell without PRISM data on some day
+            p_ppt, p_snow = None, None
         rows.append({**row, "status": "ok",
-                     "precip_mm": round(w["precip_mm"], 1), "prism_precip_mm": round(p_ppt, 1),
+                     "precip_mm": round(w["precip_mm"], 1),
+                     "prism_precip_mm": None if p_ppt is None else round(p_ppt, 1),
                      "swe_before_mm": round(w["swe_before_mm"], 1), "swe_gain_mm": round(w["swe_gain_mm"], 1),
                      "swe_net_mm": round(w["swe_net_mm"], 1),
                      "station_split_snow_mm": None if w["station_split_snow_mm"] is None
                      else round(w["station_split_snow_mm"], 1),
-                     "prism_snow_mm": None if p_snow is None else round(p_snow, 1),
+                     "prism_snow_mm": None if p_snow is None or np.isnan(p_snow) else round(p_snow, 1),
                      "observed_snow_pct": share(w["swe_gain_mm"], w["precip_mm"]),
                      "station_split_snow_pct": share(w["station_split_snow_mm"], w["precip_mm"]),
                      "prism_snow_pct": share(p_snow, p_ppt),
@@ -190,7 +196,7 @@ def main():
         if r["status"] != "ok":
             print(f"{r['name'][:24]:<24} {r['elevation_m'] or 0:6.0f}  skipped: {r['status']}")
             continue
-        print(f"{r['name'][:24]:<24} {r['elevation_m']:6.0f} {r['precip_mm']:6.0f}mm {r['swe_gain_mm']:6.0f}mm"
+        print(f"{r['name'][:24]:<24} {r['elevation_m'] or 0:6.0f} {r['precip_mm']:6.0f}mm {r['swe_gain_mm']:6.0f}mm"
               f"                      {fmt(r['observed_snow_pct'])}           {fmt(r['station_split_snow_pct'])}"
               f"         {fmt(r['prism_snow_pct'])}" + ("" if r["inside_basin"] else "   (outside basin)"))
     if summary["stations"]:
