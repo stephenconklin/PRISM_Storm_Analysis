@@ -194,13 +194,16 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
   re-download may bring back the same release; the zip's date then records when it was last checked.
   Each re-download counts toward PRISM's limit of two downloads of a file per 24 hours.
 - A newer release **replaces** the day in `clipped/`, the cube and the summary CSV, so all later steps
-  use the newest data. The superseded zip moves to `raw_zips/releases/`, and the old and new basin
+  use the newest data. Event-total rasters from other windows that include a revised day are listed as
+  out of date, with the command to update them. The superseded zip moves to `raw_zips/releases/`, and the old and new basin
   mean and volume stay in `<var>_<res>_release_history.csv`. The run prints each revised day, for
   as `<date>: release <old> -> <new>: <old> -> <new> mm, <old> -> <new> m³ (<change>%)`.
 - `storm_total.py` lists each day's release in its report, notes days that are not final, and reports
   how much the window volume has changed since the first releases recorded.
+- First real refresh (San Juan, 1 Nov 2026): Oct 26–27 went from release 1 to 2, Oct 26's basin volume
+  fell 18.9%, and the Oct 20–27 window volume fell 0.7% (4.719 to 4.685 km³).
 - Rerun the later steps after a refresh: `storm_total.py` outputs, `subbasin_totals.py`,
-  `validate_stations.py` and `validate_runoff.py`. `validate_runoff.py` notices the new releases and
+  `validate_stations.py`, `validate_runoff.py` and `validate_snow.py`. `validate_runoff.py` notices the new releases and
   recomputes each saved gauge's precipitation and runoff ratio from the saved basin and flow, with no
   new requests per gauge. Run `build_qgis_project.py` again to update the release numbers in the layer
   metadata.
@@ -672,8 +675,8 @@ Finds the outputs in `--out` by their standard names and writes a styled, organi
 
 | Group | Layers (on by default in bold) |
 |---|---|
-| Validation | **USGS gauges** (by regulation, runoff ratio labels), **rain gauges: PRISM − gauge storm total**, rain gauges daily (Temporal), dams, gauge drainage basins |
-| Storm totals | **Precipitation depth (mm)** for the run's window; precipitation by subbasin (from `subbasin_totals.py`); any `storm_total.py --tif`/`--volume-tif` rasters |
+| Validation | **USGS gauges** (by regulation, runoff ratio labels), **rain gauges: PRISM − gauge storm total**, rain gauges daily (Temporal), dams, gauge drainage basins, SNOTEL snow share (from `validate_snow.py`) |
+| Storm totals | **Precipitation depth (mm)** for each run window; precipitation by subbasin (from `subbasin_totals.py`); any `storm_total.py --tif`/`--volume-tif`/`--rain-tif`/`--snow-tif` rasters saved in the folder (named by what they hold: `volume`/`m3`, `rain`, `snow`) |
 | Daily precipitation | One raster per PRISM day, each tied to its 24-hour period for the Temporal Controller (group off) |
 | Boundaries | **Study basin** outline, labeled with the storm's total volume and depth when `subbasin_totals.py` has run |
 | Basemap | **OpenStreetMap** |
@@ -683,10 +686,12 @@ Finds the outputs in `--out` by their standard names and writes a styled, organi
   on a log scale from the data's minimum to its maximum; areas below the first class are transparent. Station difference classes are also
   set from the data, so small storms aren't all one color.
 - **Map themes:** Storm total; Validation (rain gauges and river gauges over the storm total); Rivers and
-  dams (gauges, their drainage basins and dams); Volume by subbasin; Daily animation (Temporal Controller). Pick one from the
+  dams (gauges, their drainage basins and dams); Volume by subbasin; Rain and snow (rain and snow-water
+  rasters with the SNOTEL comparison); Daily animation (Temporal Controller). Pick one from the
   Map Themes button in the Layers panel.
 - **Temporal Controller:** preset to the storm window with a 1-day step. Turn on the Daily
   precipitation group (or apply the Daily animation theme) and press play.
+- **Only precipitation is mapped:** `tmean` (and other variables) in the same folder are left out.
 - **Also set:** a NAD83 UTM CRS for the basin, relative paths (move or share the whole folder), a basin
   bookmark, and layer metadata with sources and PRISM release numbers.
 - **QGIS version:** runs under QGIS's own Python. From the conda environment it relaunches itself with
@@ -707,6 +712,8 @@ gauges, terrain and climate patterns. Everything else on the map is there to che
 | USGS gauges (`gauges`) | River discharge measured every 15 minutes | USGS Water Data API | **Indirect check:** does the water that left the basin make sense for the precipitation PRISM put on it? |
 | Gauge drainage basins (`gauge_basins`) | The land that drains to each USGS gauge | USGS NLDI | The area PRISM precipitation is summed over for that gauge's runoff ratio |
 | Dams (`dams`) | Dams and their storage capacity | National Inventory of Dams | **Context only:** they decide whether a river gauge's runoff ratio says anything about PRISM |
+| Rain and snow-water rasters | PRISM precipitation split into rain and snow by PRISM daily mean temperature | PRISM `ppt` and `tmean` (`storm_total.py`) | **Derived from the data being evaluated** |
+| SNOTEL (`snotel`) | Snow-water gained by snow pillows over the window | NRCS AWDB | **Check on the rain/snow split,** not on PRISM precipitation |
 | Precipitation by subbasin (`subbasins`) | PRISM depth and volume summed over each HUC10 or HUC12 | PRISM over WBD units (`subbasin_totals.py`) | **The data being evaluated,** aggregated to show where the water fell |
 | Study basin | The watershed the run was built for | USGS Watershed Boundary Dataset | The boundary PRISM was clipped to; its label gives the storm's total volume |
 
@@ -790,6 +797,16 @@ gauges, terrain and climate patterns. Everything else on the map is there to che
 - Dams aren't compared with PRISM; they explain why some river gauges are labeled regulated.
 - Off-channel reservoirs filled by pumping (for example Lake Nighthorse) and transbasin diversions
   (for example the San Juan–Chama Project) count as storage even though they barely regulate storm flow.
+
+### SNOTEL snow share: `snotel`
+| Symbol | Meaning |
+|---|---|
+| **Triangle color** | PRISM's snow share minus the observed share (SWE gain ÷ station precipitation), in percentage points. Teal: PRISM's split has more snow; brown: less. Classes are set from the data |
+| **Size** | Snow-water gained over the window |
+| **Gray outline** | Skipped (missing SNOTEL data) |
+
+- Observed snow is a lower bound (melt during the window), so small positive differences are expected.
+- Attributes include all three shares (`observed_snow_pct`, `station_split_snow_pct`, `prism_snow_pct`).
 
 ### Total volume: study basin label and subbasins
 - **The study basin label** gives the storm's headline numbers, for example *"San Juan: 4.72 km³ = 3.83

@@ -294,6 +294,7 @@ written up in `docs/`.
 > gauges, whose rain-only ratios reach 1.06–1.17. SNOTEL check built as `validate_snow.py` (NRCS AWDB):
 > over 23 stations PRISM's snow is 1.16× the observed SWE gain with 0–3 °C (0.9× with −1–3 °C; ramps ending
 > at 2 °C give ≤0.7×); near Silverton the split is ~2× observed. Keep 0–3 °C until more storms are checked.
+> QGIS project: rain/snow rasters (recognized by name) and a styled `snotel` layer, theme "Rain and snow".
 
 **Goal:** Split each cell's daily precipitation into rain and snow-water.
 

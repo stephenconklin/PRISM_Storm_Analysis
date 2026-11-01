@@ -94,6 +94,21 @@ def diff_breaks(abs_diffs):
     return [-c, -b, -a, a, b, c]
 
 
+def tif_kind(stem):
+    """What a GeoTIFF in the folder holds, from its name: 'volume', 'rain', 'snow' or 'depth'."""
+    low = stem.lower()
+    if "volume" in low or "m3" in low:
+        return "volume"
+    if "snow" in low:
+        return "snow"
+    if "rain" in low:
+        return "rain"
+    return "depth"
+
+
+SNOW_COLORS = ["#f7fbff", "#deebf7", "#c6dbef", "#9ecae1", "#6baed6", "#4292c6", "#2171b5", "#08519c", "#08306b"]
+
+
 def is_number(value):
     """True for real numbers; PyQGIS returns a NULL object (not None) for empty fields."""
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value
@@ -293,11 +308,11 @@ def _build_project(a):
         return ds.GetRasterBand(1).ComputeRasterMinMax(False)
 
 
-    def precip_renderer(lyr, breaks):
+    def precip_renderer(lyr, breaks, colors=PRECIP_COLORS):
         items = []
         lo = 0.0
         for i, hi in enumerate(breaks):
-            color = QColor(0, 0, 0, 0) if i == 0 else QColor(PRECIP_COLORS[min(i - 1, len(PRECIP_COLORS) - 1)])
+            color = QColor(0, 0, 0, 0) if i == 0 else QColor(colors[min(i - 1, len(colors) - 1)])
             items.append(QgsColorRampShader.ColorRampItem(hi, color, f"{lo:g}–{hi:g} mm" if i else f"< {hi:g} mm"))
             lo = hi
         fn = QgsColorRampShader(0, breaks[-1])
@@ -320,10 +335,19 @@ def _build_project(a):
         tag(t, "storm_total_depth", f"PRISM storm-total precipitation (mm), PRISM days {s0} to {s1} "
                                     f"(each ends 12:00 UTC). {rel_note}")
         add(t, g_tot, visible=True)
-    for p in f["other_tifs"]:  # storm_total.py --tif / --volume-tif outputs
+    for p in f["other_tifs"]:  # storm_total.py --tif / --volume-tif / --rain-tif / --snow-tif outputs
         lyr = QgsRasterLayer(str(p), p.stem)
-        is_volume = "volume" in p.stem.lower() or "m3" in p.stem.lower()
-        if is_volume:
+        kind = tif_kind(p.stem)
+        if kind in ("rain", "snow"):
+            label = "Rain depth (mm)" if kind == "rain" else "Snow-water (mm)"
+            lyr.setName(f"{label}: {p.stem}")
+            precip_renderer(lyr, nice_breaks(max(raster_minmax(p)[1], 1)),
+                            PRECIP_COLORS if kind == "rain" else SNOW_COLORS)
+            tag(lyr, kind, f"Window-total {'rain' if kind == 'rain' else 'snow-water equivalent'} (mm) from "
+                           "storm_total.py: PRISM precipitation split by PRISM daily mean temperature.")
+            add(lyr, g_tot, visible=False)
+            continue
+        if kind == "volume":
             lyr.setName(f"Water volume per cell (m³): {p.stem}")
             vmin, vmax = raster_minmax(p)
             ramp = QgsStyle.defaultStyle().colorRamp("YlGnBu")
@@ -381,6 +405,9 @@ def _build_project(a):
         vec("dams", "Dams (NID), size = storage", "dams", "National Inventory of Dams in the study basin.", False)
         vec("gauge_basins", "Gauge drainage basins", "gauge_basins",
             "USGS NLDI drainage basins of compared gauges, colored by regulation.", False)
+        sn = vec("snotel", "SNOTEL: PRISM − observed snow share (points)", "snotel",
+                 "Snow as a share of precipitation over the window from validate_snow.py: PRISM split minus "
+                 "SNOTEL SWE gain (percentage points). Size = SWE gain. Gray: skipped.", False)
 
         def restyle_stations(lyr, size_max):
             """Rule-based renderer like styles/stations.qml, with classes set from this run's data."""
@@ -409,6 +436,34 @@ def _build_project(a):
                                                             "Not compared (missing data or day mismatch)"))
             lyr.setRenderer(QgsRuleBasedRenderer(root_rule))
 
+        def restyle_snotel(lyr):
+            """Diverging colors on PRISM-minus-observed snow share; blue = PRISM has more snow."""
+            diffs = [ft["prism_snow_pct"] - ft["observed_snow_pct"] for ft in lyr.getFeatures()
+                     if is_number(ft["prism_snow_pct"]) and is_number(ft["observed_snow_pct"])]
+            gains = [ft["swe_gain_mm"] for ft in lyr.getFeatures() if is_number(ft["swe_gain_mm"])]
+            top = nice_round(max(gains)) if gains else 100
+            edges = diff_breaks(diffs)
+            expr = '("prism_snow_pct" - "observed_snow_pct")'
+            root_rule = QgsRuleBasedRenderer.Rule(None)
+            bounds = [None] + edges + [None]
+            for i, color in enumerate(reversed(DIFF_COLORS)):  # brown = PRISM less snow, teal = more
+                lo, hi = bounds[i], bounds[i + 1]
+                conds = ['"status" = \'ok\''] + ([f"{expr} >= {lo}"] if lo is not None else []) \
+                    + ([f"{expr} < {hi}"] if hi is not None else [])
+                label = (f"< {hi:g}" if lo is None else f">= {lo:g}" if hi is None else f"{lo:g} to {hi:g}") + " points"
+                sym = QgsMarkerSymbol.createSimple({"name": "triangle", "color": color, "outline_color": "40,40,40",
+                                                    "outline_width": "0.3", "size": "3"})
+                sym.symbolLayer(0).setDataDefinedProperty(QgsSymbolLayer.Property.Size, QgsProperty.fromExpression(
+                    f'scale_linear(coalesce("swe_gain_mm", 0), 0, {top}, 2.5, 6)'))
+                root_rule.appendChild(QgsRuleBasedRenderer.Rule(sym, 0, 0, " AND ".join(conds), label))
+            gray = QgsMarkerSymbol.createSimple({"name": "triangle", "color": "0,0,0,0", "outline_color": "130,130,130",
+                                                 "outline_width": "0.3", "size": "2"})
+            root_rule.appendChild(QgsRuleBasedRenderer.Rule(gray, 0, 0, '"status" <> \'ok\'',
+                                                            "Skipped (missing SNOTEL data)"))
+            lyr.setRenderer(QgsRuleBasedRenderer(root_rule))
+
+        if sn is not None:
+            restyle_snotel(sn)
         if st is not None:
             restyle_stations(st, 150)
         if sd is not None:
@@ -565,6 +620,7 @@ def _build_project(a):
     theme("Rivers and dams", {"gauges", "gauge_basins", "dams", "study_basin", "basemap"},
           {g_val, g_bnd, g_base})
     theme("Volume by subbasin", {"subbasin_totals", "study_basin", "basemap"}, {g_tot, g_bnd, g_base})
+    theme("Rain and snow", {"rain", "snow", "snotel", "study_basin", "basemap"}, {g_tot, g_val, g_bnd, g_base})
     theme("Daily animation (Temporal Controller)", {"daily_precip", "station_days", "study_basin", "basemap"},
           {g_day, g_val, g_bnd, g_base})
     for lyr in managed:

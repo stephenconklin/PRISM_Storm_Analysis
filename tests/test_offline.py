@@ -128,6 +128,15 @@ def test_new_release_replaces_day_and_keeps_history(tmp_path):
         assert np.isclose(window_total(ds, "2026-10-22", "2026-10-22")["mean_mm"], 33.0)
 
 
+def test_stale_totals(tmp_path):
+    from prism_watershed import stale_totals
+    for name in ("ppt_800m_total_20261020_20261027.tif", "ppt_800m_total_20261028_20261031.tif",
+                 "ppt_800m_total_20261026_20261027.tif", "tmean_800m_total_20261020_20261027.tif"):
+        (tmp_path / name).write_bytes(b"x")
+    assert stale_totals(tmp_path, "ppt", "800m", [dt.date(2026, 10, 26)], "ppt_800m_total_20261026_20261027.tif") == [
+        "ppt_800m_total_20261020_20261027.tif"]
+
+
 class FakeResponse:
     def __init__(self, content):
         self.status_code, self.content, self.text = 200, content, ""

@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from build_qgis_project import (diff_breaks, discover, is_number, nice_breaks, nice_round, utm_epsg,  # noqa: E402
+from build_qgis_project import (diff_breaks, discover, is_number, nice_breaks, nice_round, tif_kind, utm_epsg,  # noqa: E402
                                 version_key, window_label)
 
 
@@ -64,3 +64,9 @@ def test_is_number():
         pass
     assert is_number(3) and is_number(2.5) and not is_number(None) and not is_number(Null())
     assert not is_number(float("nan")) and not is_number(True)
+
+
+def test_tif_kind():
+    assert tif_kind("volume_m3") == "volume" and tif_kind("ppt_800m_volume_m3_20261020_20261027") == "volume"
+    assert tif_kind("rain_mm_20261020_20261027") == "rain" and tif_kind("snow_mm_20261020_20261027") == "snow"
+    assert tif_kind("depth_mm") == "depth"

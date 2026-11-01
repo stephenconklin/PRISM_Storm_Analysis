@@ -34,7 +34,7 @@ That run's outputs (HUC 1408, PRISM days Oct 20–27) are in
 - `scripts/subbasin_totals.py` — basin and subbasin (HUC10/12) depth and volume from the cube (`zone_totals` in
   `storm_total.py`) to `<out>/totals.gpkg` (`basin_total`, `subbasins`); WBD units via `observations.wbd_units`
 - `scripts/build_qgis_project.py` — builds `<out>/QGIS/<name>.qgz` from a folder's outputs (found by standard
-  names). Runs under QGIS's Python; relaunches itself there (newest QGIS 3.x app by plist version, so projects open in
+  names; extra tifs classed by `tif_kind`: volume/m3, rain, snow, depth). Runs under QGIS's Python; relaunches itself there (newest QGIS 3.x app by plist version, so projects open in
   QGIS 3 and 4; else newest QGIS; or `--qgis-python`/`QGIS_PYTHON`) with Anaconda's PROJ/GDAL/PDAL env vars cleared. Pure helpers are testable without
   QGIS. In GDAL Python keep the dataset referenced while using its band (a temporary dataset frees the band).
 - PyQGIS returns a NULL object (not None) for empty fields: filter with `is_number()`. Build inside an inner
@@ -57,7 +57,8 @@ Releases: the release is read from the zip's info.txt; clipped tifs carry it as 
 and the cube as `release` (0 unknown). `--refresh` re-downloads days below `--target-release` whose zip is at
 least `--refresh-age` days old (file mtime = last checked) and moves a superseded zip to
 `raw_zips/releases/<stem>_r<n>.zip`. `extract_grid` re-extracts when `extracted/` holds another release. A newer
-release replaces the day everywhere; older values live only in the history CSV and archived zips.
+release replaces the day everywhere; older values live only in the history CSV and archived zips. Other event-total
+tifs covering a revised day are reported as out of date (`stale_totals`).
 `validate_runoff.py` run keys include releases; a release-only change recomputes precipitation without network.
 
 The offline test runs the script as a subprocess with zips pre-seeded in `raw_zips/` and a local
@@ -93,6 +94,8 @@ python -m pytest tests -q
 On this Mac the shell sets `PROJ_DATA=/opt/anaconda3/share/proj`, an old `proj.db` that breaks pip
 rasterio ("EPSG code is unknown … comes from another PROJ installation"). Use the activated
 `prism-data-wrangler` env (or `conda run -n prism-data-wrangler`), `.venv`, or prefix with `env -u PROJ_DATA`.
+The shell is zsh: a variable holding a command with spaces isn't word-split (`$P args` fails; write the command out
+or use `${=P}`), and `echo ===` errors (`=word` expansion), which stops a `;` chain silently.
 
 `services.nacse.org` chains to emSign Root CA - G1, which certifi's bundle lacks (CERTIFICATE_VERIFY_FAILED).
 The script calls `truststore.inject_into_ssl()` to use the OS trust store; never use `verify=False`.

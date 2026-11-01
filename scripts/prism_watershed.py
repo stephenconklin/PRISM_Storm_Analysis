@@ -276,6 +276,19 @@ def clipped_day(path, summary_csv, var="ppt"):
     return release, day_stats(arr, transform, var)
 
 
+def stale_totals(out, var, res, revised, current):
+    """Event-total rasters in out (other than current) whose window includes a revised day."""
+    stale = []
+    for tif in sorted(Path(out).glob(f"{var}_{res}_total_*.tif")):
+        span = tif.stem.rsplit("_", 2)[-2:]
+        if tif.name == current or len(span) != 2 or not all(x.isdigit() for x in span):
+            continue
+        t0, t1 = (dt.datetime.strptime(x, "%Y%m%d").date() for x in span)
+        if any(t0 <= d <= t1 for d in revised):
+            stale.append(tif.name)
+    return stale
+
+
 def stations_near(stn_csv, zone):
     """PRISM input stations (from a zip's stn.csv) inside zone, a lon/lat polygon."""
     df = pd.read_csv(stn_csv, skiprows=1)  # first line describes the file
@@ -484,6 +497,10 @@ def main():
                       attrs={"basin_area_km2": round(basin_km2, 1),
                              "basin_without_prism_pct": round(missing_pct, 2)})
     print(f"Daily cube: {cube.name} (use storm_total.py for any date range)")
+    for name in stale_totals(out, a.var, a.res, [c[0] for c in changes], total_tif.name):
+        span = name.rsplit("_", 2)[-2:]
+        print(f"Out of date (covers a revised day): {name}; rerun with --start {span[0][:4]}-{span[0][4:6]}-"
+              f"{span[0][6:]} --end {span[1][:4]}-{span[1][4:6]}-{span[1][6:]} to update it")
     print(f"Outputs in {out.resolve()}")
 
     # QC: this run's days, plus the cube they went into.
