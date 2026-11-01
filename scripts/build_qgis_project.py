@@ -40,7 +40,8 @@ STYLE_DIR = Path(__file__).resolve().parents[1] / "styles"
 # Anaconda sets these to its own GDAL/PROJ/PDAL, which break QGIS's bundled libraries.
 CLEAR_ENV = ("PROJ_DATA", "PROJ_LIB", "GDAL_DATA", "GDAL_DRIVER_PATH", "PDAL_DRIVER_PATH",
              "PYTHONPATH", "PYTHONHOME")
-NICE = [0.5, 1, 2, 3, 5, 10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200, 250, 300, 400, 500, 750, 1000]
+NICE = [0.1, 0.2, 0.5, 1, 2, 3, 5, 10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200, 250, 300, 400, 500, 750, 1000,
+        1500, 2000, 3000, 5000, 7500, 10000]
 PRECIP_COLORS = ["#ffffd9", "#edf8b1", "#c7e9b4", "#7fcdbb", "#41b6c4", "#1d91c0", "#225ea8", "#253494",
                  "#081d58"]
 DIFF_COLORS = ["#8c510a", "#d8b365", "#f6e8c3", "#f5f5f5", "#c7eae5", "#5ab4ac", "#01665e"]
@@ -61,9 +62,11 @@ def nice_breaks(max_value, min_value=0.0, n_max=8):
     top = next((v for v in NICE if v >= max_value), NICE[-1])
     floor = max((v for v in NICE if v <= min_value), default=None) if min_value >= 1 else None
     cands = [v for v in NICE if v < top and (floor is None or v >= floor)]
+    if not cands:  # the data sit within one round-number step: keep one colored class below the top
+        cands = [max(v for v in NICE if v < top)] if top > NICE[0] else []
     if len(cands) + 1 <= n_max:
         return cands + [top]
-    lo = floor if floor is not None else (0.5 if top <= 20 else 1)
+    lo = floor if floor is not None else (0.1 if top <= 2 else 0.5 if top <= 20 else 1)
     targets = [math.exp(math.log(lo) + i * (math.log(top) - math.log(lo)) / (n_max - 1)) for i in range(n_max - 1)]
     picks = sorted({min(cands, key=lambda v: abs(math.log(v) - math.log(t))) for t in targets})
     return picks + [top]
@@ -95,15 +98,18 @@ def diff_breaks(abs_diffs):
 
 
 def tif_kind(stem):
-    """What a GeoTIFF in the folder holds, from its name: 'volume', 'rain', 'snow' or 'depth'."""
-    low = stem.lower()
-    if "volume" in low or "m3" in low:
+    """What a GeoTIFF in the folder holds, from the words in its name: 'volume', 'rain', 'snow', 'depth',
+    or None for anything else (a DEM, hillshade, ...), which is not mapped."""
+    words = set(re.split(r"[^a-z0-9]+", stem.lower()))
+    if words & {"volume", "m3"}:
         return "volume"
-    if "snow" in low:
+    if "snow" in words:
         return "snow"
-    if "rain" in low:
+    if "rain" in words:
         return "rain"
-    return "depth"
+    if words & {"depth", "total", "mm", "ppt", "precip"}:
+        return "depth"
+    return None
 
 
 SNOW_COLORS = ["#f7fbff", "#deebf7", "#c6dbef", "#9ecae1", "#6baed6", "#4292c6", "#2171b5", "#08519c", "#08306b"]
@@ -125,18 +131,29 @@ def day_label(day):
 
 
 def window_label(start, end):
+    if start == end:
+        return f"{day_label(start)}, {end.year}"
     if start.month == end.month:
         return f"{start:%b} {start.day}–{end.day}, {end.year}"
     return f"{day_label(start)} – {day_label(end)}, {end.year}"
 
 
 def discover(out):
-    """Find the standard outputs in a PRISM Data Wrangler folder."""
+    """Find the standard outputs in a PRISM Data Wrangler folder.
+
+    Only precipitation is mapped (not tmean etc.), at one resolution: 800m if present, else 4km;
+    "other_res" lists resolutions left out.
+    """
     out = Path(out)
-    found = {"out": out, "wbd": sorted(out.glob("wbd_huc*.geojson")),
-             "totals": sorted(out.glob("ppt_*_total_*.tif")),
-             "daily": sorted(out.glob("clipped/ppt_*_clip.tif")),  # other variables (e.g. tmean) are not mapped
-             "summary": out / "daily_basin_summary.csv",
+    have = sorted({m.group(1) for p in out.glob("clipped/ppt_*_clip.tif")
+                   if (m := re.match(r"ppt_(800m|4km)_\d{8}_clip\.tif$", p.name))}
+                  | {m.group(1) for p in out.glob("ppt_*_total_*.tif") if (m := re.match(r"ppt_(800m|4km)_", p.name))})
+    res = "800m" if "800m" in have or not have else have[0]
+    found = {"out": out, "res": res, "other_res": [r for r in have if r != res],
+             "wbd": sorted(out.glob("wbd_huc*.geojson")) or sorted(out.glob("boundary.geojson")),
+             "totals": sorted(out.glob(f"ppt_{res}_total_*.tif")),
+             "daily": sorted(out.glob(f"clipped/ppt_{res}_*_clip.tif")),
+             "summary": out / ("daily_basin_summary.csv" if res == "800m" else f"ppt_{res}_daily_basin_summary.csv"),
              "gpkg": out / "validation" / "validation.gpkg",
              "totals_gpkg": out / "totals.gpkg",
              "other_tifs": [p for p in sorted(out.glob("*.tif")) if "_total_" not in p.name]}  # volume, rain, snow
@@ -149,13 +166,36 @@ def discover(out):
     return found
 
 
-def volume_range_km3(out, start, end):
-    """(low, high) km³ from storm_total.py's uncertainty file for the window, or None."""
-    files = sorted(Path(out).glob(f"ppt_*_uncertainty_{str(start).replace('-', '')}_{str(end).replace('-', '')}.json"))
-    if not files:
-        return None
-    lo, hi = json.loads(files[0].read_text())["range_m3"]
-    return lo / 1e9, hi / 1e9
+def volume_range_km3(out, start, end, res=None, volume_m3=None):
+    """(low, high) km³ from storm_total.py's uncertainty file for the window and resolution, or None.
+
+    Without res, the file whose volume matches volume_m3 (within 0.1%) is used, so a label never shows
+    another resolution's range.
+    """
+    span = f"{str(start).replace('-', '')}_{str(end).replace('-', '')}"
+    files = sorted(Path(out).glob(f"ppt_{res}_uncertainty_{span}.json" if res else f"ppt_*_uncertainty_{span}.json"))
+    for f in files:
+        u = json.loads(f.read_text())
+        if res or (volume_m3 and abs(u["volume_m3"] - volume_m3) <= 1e-3 * abs(volume_m3)):
+            lo, hi = u["range_m3"]
+            return lo / 1e9, hi / 1e9
+    return None
+
+
+def total_window(path):
+    """(start, end) dates from a ppt_<res>_total_<start>_<end>.tif name, or None."""
+    m = re.search(r"_total_(\d{8})_(\d{8})", Path(path).name)
+    return tuple(dt.datetime.strptime(m.group(i), "%Y%m%d").date() for i in (1, 2)) if m else None
+
+
+def primary_total(totals, start=None, end=None):
+    """The event total to show: the one for the window (start, end) if given and present, else the longest."""
+    spans = {p: total_window(p) for p in totals}
+    for p, w in spans.items():
+        if w and start and w == (start, end):
+            return p
+    dated = [p for p in totals if spans[p]]
+    return max(dated, key=lambda p: (spans[p][1] - spans[p][0], spans[p][1])) if dated else (totals[0] if totals else None)
 
 
 def releases(summary_csv):
@@ -222,15 +262,29 @@ def relaunch(argv, qgis_python):
 # ---------- QGIS ----------
 
 def build(a):
-    """Start QGIS, build the project, and shut QGIS down after every layer object is gone."""
+    """Start QGIS, build the project, and shut QGIS down after every layer object is gone.
+
+    Errors are caught and printed here, and the traceback dropped, before QGIS exits: a live traceback
+    keeps _build_project's layers alive past exitQgis(), which segfaults.
+    """
+    import traceback
     from qgis.core import QgsApplication, QgsProject
     app = QgsApplication([], False)
     app.initQgis()
+    code = 0
     try:
         _build_project(a)
-    finally:
-        QgsProject.instance().clear()
-        app.exitQgis()
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
+        if not isinstance(e.code, int) and e.code is not None:
+            print(e.code, file=sys.stderr)
+    except BaseException:
+        traceback.print_exc()
+        code = 1
+    QgsProject.instance().clear()
+    app.exitQgis()
+    if code:
+        sys.exit(code)
 
 
 def _build_project(a):
@@ -253,6 +307,8 @@ def _build_project(a):
     out = f["out"].resolve()
     if not f["days"] and not f["totals"]:
         sys.exit(f"No PRISM Data Wrangler outputs found in {out}.")
+    if f["other_res"]:
+        print(f"Mapping {f['res']} precipitation; {', '.join(f['other_res'])} outputs in the folder are left out.")
     name = a.name or out.name
     qdir = out / "QGIS"
     qdir.mkdir(exist_ok=True)
@@ -283,7 +339,8 @@ def _build_project(a):
     basin_lyr, basin_name, huc = None, name, ""
     if f["wbd"]:
         wbd = f["wbd"][0]
-        huc = re.search(r"wbd_huc(\d+)", wbd.name).group(1)
+        m = re.search(r"wbd_huc(\d+)", wbd.name)
+        huc = m.group(1) if m else ""
         basin_lyr = QgsVectorLayer(str(wbd), "basin", "ogr")
         feat = next(basin_lyr.getFeatures(), None)
         if feat is not None and "name" in basin_lyr.fields().names():
@@ -336,17 +393,28 @@ def _build_project(a):
     totals = [QgsRasterLayer(str(p), p.stem) for p in f["totals"]]
     tranges = [raster_minmax(p) for p in f["totals"]]
     tbreaks = nice_breaks(max([r[1] for r in tranges], default=1), min([r[0] for r in tranges], default=0))
+    # One event total is shown (the subbasin totals' window, else the longest); others are added switched off.
+    basin_window = None
+    if f["totals_gpkg"].exists():
+        bt = QgsVectorLayer(f"{f['totals_gpkg']}|layername=basin_total", "bt", "ogr")
+        ft = next(bt.getFeatures(), None) if bt.isValid() else None
+        if ft is not None and "prism_start" in bt.fields().names() and ft["prism_start"]:
+            basin_window = (dt.date.fromisoformat(str(ft["prism_start"])), dt.date.fromisoformat(str(ft["prism_end"])))
+        del ft, bt
+    shown = primary_total(f["totals"], *(basin_window or (None, None)))
     for p, t in zip(f["totals"], totals):
-        m = re.search(r"_total_(\d{8})_(\d{8})", p.name)
-        s0, s1 = (dt.datetime.strptime(m.group(i), "%Y%m%d").date() for i in (1, 2)) if m else (start, end)
-        t.setName(f"Precipitation depth (mm), {window_label(s0, s1)}")
+        s0, s1 = total_window(p) or (start, end)
+        t.setName(f"Precipitation depth (mm), {window_label(s0, s1)}" if s0 else f"Precipitation depth (mm): {p.stem}")
         precip_renderer(t, tbreaks)
-        tag(t, "storm_total_depth", f"PRISM storm-total precipitation (mm), PRISM days {s0} to {s1} "
-                                    f"(each ends 12:00 UTC). {rel_note}")
-        add(t, g_tot, visible=True)
+        tag(t, "storm_total_depth" if p == shown else "storm_total_other",
+            f"PRISM storm-total precipitation (mm), PRISM days {s0} to {s1} (each ends 12:00 UTC). {rel_note}")
+        add(t, g_tot, visible=p == shown)
     for p in f["other_tifs"]:  # storm_total.py --tif / --volume-tif / --rain-tif / --snow-tif outputs
-        lyr = QgsRasterLayer(str(p), p.stem)
         kind = tif_kind(p.stem)
+        if kind is None:
+            print(f"Not mapped (name doesn't say what it holds): {p.name}")
+            continue
+        lyr = QgsRasterLayer(str(p), p.stem)
         if kind in ("rain", "snow"):
             label = "Rain depth (mm)" if kind == "rain" else "Snow-water (mm)"
             lyr.setName(f"{label}: {p.stem}")
@@ -397,7 +465,9 @@ def _build_project(a):
                 return None
             qml = STYLE_DIR / f"{layer}.qml"
             if qml.exists():
-                lyr.loadNamedStyle(str(qml))
+                msg, ok = lyr.loadNamedStyle(str(qml))
+                if not ok:
+                    print(f"Warning: style {qml.name} did not load: {msg}")
             lyr.setName(label)
             tag(lyr, role, abstract)
             add(lyr, g_val, visible)
@@ -446,18 +516,23 @@ def _build_project(a):
             lyr.setRenderer(QgsRuleBasedRenderer(root_rule))
 
         def restyle_snotel(lyr):
-            """Diverging colors on PRISM-minus-observed snow share; blue = PRISM has more snow."""
-            diffs = [ft["prism_snow_pct"] - ft["observed_snow_pct"] for ft in lyr.getFeatures()
-                     if is_number(ft["prism_snow_pct"]) and is_number(ft["observed_snow_pct"])]
-            gains = [ft["swe_gain_mm"] for ft in lyr.getFeatures() if is_number(ft["swe_gain_mm"])]
+            """Diverging colors on PRISM-minus-observed snow share: brown = PRISM less snow, teal = more.
+            Stations without both shares (skipped, or no tmean for the PRISM split) are gray."""
+            fields = lyr.fields().names()
+            need = {"prism_snow_pct", "observed_snow_pct", "swe_gain_mm"}
+            diffs = ([ft["prism_snow_pct"] - ft["observed_snow_pct"] for ft in lyr.getFeatures()
+                      if is_number(ft["prism_snow_pct"]) and is_number(ft["observed_snow_pct"])]
+                     if need <= set(fields) else [])
+            gains = [ft["swe_gain_mm"] for ft in lyr.getFeatures() if is_number(ft["swe_gain_mm"])] \
+                if "swe_gain_mm" in fields else []
             top = nice_round(max(gains)) if gains else 100
-            edges = diff_breaks(diffs)
+            edges = [max(-100, min(100, e)) for e in diff_breaks(diffs)]  # shares differ by at most 100 points
             expr = '("prism_snow_pct" - "observed_snow_pct")'
             root_rule = QgsRuleBasedRenderer.Rule(None)
             bounds = [None] + edges + [None]
-            for i, color in enumerate(reversed(DIFF_COLORS)):  # brown = PRISM less snow, teal = more
+            for i, color in enumerate(DIFF_COLORS if diffs else []):
                 lo, hi = bounds[i], bounds[i + 1]
-                conds = ['"status" = \'ok\''] + ([f"{expr} >= {lo}"] if lo is not None else []) \
+                conds = [f"{expr} IS NOT NULL"] + ([f"{expr} >= {lo}"] if lo is not None else []) \
                     + ([f"{expr} < {hi}"] if hi is not None else [])
                 label = (f"< {hi:g}" if lo is None else f">= {lo:g}" if hi is None else f"{lo:g} to {hi:g}") + " points"
                 sym = QgsMarkerSymbol.createSimple({"name": "triangle", "color": color, "outline_color": "40,40,40",
@@ -467,8 +542,9 @@ def _build_project(a):
                 root_rule.appendChild(QgsRuleBasedRenderer.Rule(sym, 0, 0, " AND ".join(conds), label))
             gray = QgsMarkerSymbol.createSimple({"name": "triangle", "color": "0,0,0,0", "outline_color": "130,130,130",
                                                  "outline_width": "0.3", "size": "2"})
-            root_rule.appendChild(QgsRuleBasedRenderer.Rule(gray, 0, 0, '"status" <> \'ok\'',
-                                                            "Skipped (missing SNOTEL data)"))
+            gray_rule = QgsRuleBasedRenderer.Rule(gray, 0, 0, "", "Skipped, or no PRISM split (no tmean)")
+            gray_rule.setIsElse(True)
+            root_rule.appendChild(gray_rule)
             lyr.setRenderer(QgsRuleBasedRenderer(root_rule))
 
         if sn is not None:
@@ -531,7 +607,7 @@ def _build_project(a):
         if sub.isValid() and sub.featureCount():
             feats = list(sub.getFeatures())
             level = feats[0]["level"]
-            depths = [ft["mean_mm"] for ft in feats if is_number(ft["mean_mm"])]
+            depths = [ft["mean_mm"] for ft in feats if is_number(ft["mean_mm"])] or [0.0]
             bounds = nice_breaks(max(depths), min(depths))
             ranges, lo = [], min(0.0, min(depths))
             for i, hi in enumerate(bounds):
@@ -561,12 +637,16 @@ def _build_project(a):
         basin_lyr.setName(f"Study basin: {basin_name}" + (f" (HUC {huc})" if huc else ""))
         if "volume_km3" in basin_lyr.fields().names():
             t = next(basin_lyr.getFeatures())
-            af = t["volume_acre_ft"]
-            af_text = f"{af / 1e6:.2f} million acre-ft" if af >= 1e6 else f"{af:,.0f} acre-ft"
-            vr = volume_range_km3(out, t["prism_start"], t["prism_end"])
-            range_text = f" (range {vr[0]:.2f}–{vr[1]:.2f})" if vr else ""
-            basin_lyr.setName(f"{basin_lyr.name()}: {t['volume_km3']:.2f} km³{range_text} ({af_text}), "
-                              f"mean {t['mean_mm']:.0f} mm")
+            vr = None
+            if is_number(t["volume_km3"]) and is_number(t["volume_acre_ft"]) and is_number(t["mean_mm"]):
+                af = t["volume_acre_ft"]
+                af_text = f"{af / 1e6:.2f} million acre-ft" if af >= 1e6 else f"{af:,.0f} acre-ft"
+                res = str(t["res"]) if "res" in basin_lyr.fields().names() and t["res"] else None
+                vr = volume_range_km3(out, t["prism_start"], t["prism_end"], res, t["volume_m3"])
+                range_text = f" (range {vr[0]:.2f}–{vr[1]:.2f})" if vr else ""
+                basin_lyr.setName(f"{basin_lyr.name()}: {t['volume_km3']:.2f} km³{range_text} ({af_text}), "
+                                  f"mean {t['mean_mm']:.0f} mm")
+            del t
         outline = QgsFillSymbol.createSimple({"color": "0,0,0,0", "outline_color": "230,60,180",
                                               "outline_width": "0.8"})
         basin_lyr.setRenderer(QgsSingleSymbolRenderer(outline))

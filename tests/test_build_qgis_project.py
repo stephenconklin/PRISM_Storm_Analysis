@@ -4,7 +4,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from build_qgis_project import (diff_breaks, discover, is_number, nice_breaks, nice_round, tif_kind, utm_epsg, volume_range_km3,  # noqa: E402
+from build_qgis_project import (diff_breaks, discover, is_number, nice_breaks, nice_round, primary_total, tif_kind, utm_epsg,
+                                volume_range_km3, window_label,  # noqa: E402
                                 version_key, window_label)
 
 
@@ -75,5 +76,79 @@ def test_tif_kind():
 def test_volume_range_km3(tmp_path):
     import json
     (tmp_path / "ppt_800m_uncertainty_20261020_20261027.json").write_text(json.dumps({"range_m3": [4.6e9, 4.9e9]}))
-    assert volume_range_km3(tmp_path, "2026-10-20", "2026-10-27") == (4.6, 4.9)
+    assert volume_range_km3(tmp_path, "2026-10-20", "2026-10-27", "800m") == (4.6, 4.9)
     assert volume_range_km3(tmp_path, "2026-10-20", "2026-10-31") is None
+
+
+
+def test_nice_breaks_edges():
+    for lo, hi in ((0, 3000), (1500, 3000), (1000, 1000), (40, 40), (0, 0.3)):
+        b = nice_breaks(hi, lo)
+        assert b == sorted(b) and b[-1] >= hi and len(b) >= 2, (lo, hi, b)  # at least one colored class
+    assert nice_breaks(3000)[-1] == 3000
+
+
+def test_tif_kind_uses_whole_words():
+    assert tif_kind("terrain") is None and tif_kind("drainage_area") is None and tif_kind("hillshade") is None
+    assert tif_kind("storm3_depth_mm") == "depth" and tif_kind("rain_mm_20261020_20261027") == "rain"
+    assert tif_kind("snow_mm") == "snow" and tif_kind("ppt_800m_volume_m3_20261020_20261027") == "volume"
+
+
+def test_window_label_one_day():
+    assert window_label(dt.date(2026, 10, 20), dt.date(2026, 10, 20)) == "Oct 20, 2026"
+
+
+def test_discover_prefers_800m_and_picks_total(tmp_path):
+    import json
+    (tmp_path / "clipped").mkdir()
+    for res in ("800m", "4km"):
+        (tmp_path / "clipped" / f"ppt_{res}_20261020_clip.tif").write_bytes(b"x")
+        (tmp_path / f"ppt_{res}_uncertainty_20261020_20261027.json").write_text(json.dumps(
+            {"volume_m3": 4.7e9 if res == "800m" else 4.5e9, "range_m3": [1e9, 2e9] if res == "4km" else [4.6e9, 4.9e9]}))
+    totals = [tmp_path / n for n in ("ppt_800m_total_20261020_20261027.tif", "ppt_800m_total_20261026_20261027.tif",
+                                     "ppt_800m_total_20261020_20261031.tif")]
+    for t in totals:
+        t.write_bytes(b"x")
+    (tmp_path / "boundary.geojson").write_text("{}")
+    f = discover(tmp_path)
+    assert f["res"] == "800m" and f["other_res"] == ["4km"] and f["wbd"][0].name == "boundary.geojson"
+    assert all("800m" in p.name for p in f["daily"] + f["totals"])
+    assert primary_total(f["totals"]).name == "ppt_800m_total_20261020_20261031.tif"  # longest
+    assert primary_total(f["totals"], dt.date(2026, 10, 20), dt.date(2026, 10, 27)) == totals[0]
+    assert volume_range_km3(tmp_path, "2026-10-20", "2026-10-27", "800m") == (4.6, 4.9)
+    assert volume_range_km3(tmp_path, "2026-10-20", "2026-10-27", volume_m3=4.7e9) == (4.6, 4.9)  # not 4km's
+    assert volume_range_km3(tmp_path, "2026-10-20", "2026-10-27", volume_m3=3.0e9) is None
+
+
+def test_build_real_project(tmp_path):
+    """Build a project under QGIS (skipped without QGIS) from a folder with the awkward cases the review found."""
+    import subprocess
+    import zipfile
+    import geopandas as gpd
+    from shapely.geometry import Point, box
+    from build_qgis_project import find_qgis_python
+    from test_offline import OFFLINE, SCRIPT, make_zip
+    if not find_qgis_python():
+        pytest.skip("QGIS not installed")
+    out = tmp_path / "Test_Basin"
+    (out / "raw_zips").mkdir(parents=True)
+    for ymd in ("20261021", "20261022"):
+        make_zip(out / "raw_zips", ymd, 10.0)
+    boundary = tmp_path / "basin.geojson"
+    gpd.GeoDataFrame(geometry=[box(-108.4, 37.5, -108.0, 37.7)], crs=4269).to_file(boundary)
+    for s, e in (("2026-10-21", "2026-10-22"), ("2026-10-22", "2026-10-22")):
+        subprocess.run([sys.executable, str(SCRIPT), "--start", s, "--end", e, "--boundary", str(boundary),
+                        "--out", str(out), "--pause", "0"], check=True, capture_output=True, env=OFFLINE)
+    (out / "terrain.tif").write_bytes((out / "ppt_800m_total_20261021_20261022.tif").read_bytes())
+    (out / "validation").mkdir()
+    gpd.GeoDataFrame([{"triplet": "1:CO:SNTL", "name": "A", "status": "precipitation missing"}],
+                     geometry=[Point(-108.2, 37.6)], crs=4269).to_file(out / "validation" / "validation.gpkg",
+                                                                        layer="snotel")  # every station skipped
+    res = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "scripts" / "build_qgis_project.py"),
+                          "--out", str(out)], capture_output=True, text=True, timeout=300)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "Not mapped (name doesn't say what it holds): terrain.tif" in res.stdout
+    with zipfile.ZipFile(out / "QGIS" / "Test_Basin.qgz") as z:
+        qgs = z.read(next(n for n in z.namelist() if n.endswith(".qgs"))).decode()
+    assert "SNOTEL: PRISM" in qgs and "Study basin" in qgs and "terrain.tif" not in qgs
+    assert "Precipitation depth (mm), Oct 21–22, 2026" in qgs and "Precipitation depth (mm), Oct 22, 2026" in qgs
