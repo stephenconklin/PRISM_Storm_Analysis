@@ -39,6 +39,7 @@ import geopandas as gpd
 import numpy as np
 from shapely.geometry import Point
 
+import manifest
 from storm_total import prism_day_files, snow_fraction
 from validate_stations import INCH_MM, cube_days, load_basin, sample_grid, write_layer
 
@@ -119,6 +120,7 @@ def main():
                     help="leave stations with less precipitation out of the summary (default 10 mm)")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"])
     a = ap.parse_args()
+    run = manifest.start_run("validate_snow.py", a)
 
     out = Path(a.out)
     c0, c1 = cube_days(out, "ppt", a.res)
@@ -202,6 +204,9 @@ def main():
               f"{summary['observed_snow_pct']}%, station split {summary['station_split_snow_pct']}%, PRISM split "
               f"{summary['prism_snow_pct']}%; PRISM snow / observed SWE gain = {summary['prism_over_observed_snow']}")
     print(f"Outputs in {vdir.resolve()}")
+    run.update(window={"start": str(start), "end": str(end)},
+               outputs=manifest.files_entry([vdir / "snotel.csv", vdir / "snotel_summary.json", vdir / "validation.gpkg"], out))
+    manifest.append_run(out, run)
 
 
 if __name__ == "__main__":

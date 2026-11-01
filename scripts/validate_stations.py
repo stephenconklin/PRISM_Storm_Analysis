@@ -41,6 +41,7 @@ import numpy as np
 import rasterio
 from shapely.geometry import Point
 
+import manifest
 from storm_total import prism_day_files
 
 INCH_MM = 25.4
@@ -267,6 +268,7 @@ def main():
     ap.add_argument("--match-km", type=float, default=0.5, help="distance to a PRISM input station for in_sample (default 0.5)")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"])
     a = ap.parse_args()
+    run = manifest.start_run("validate_stations.py", a)
 
     out = Path(a.out)
     c0, c1 = cube_days(out, "ppt", a.res)
@@ -402,6 +404,10 @@ def main():
         print(line(k, summary["daily"][k]))
     print(f"Excluded from event stats: {dict(Counter(r['status'] for r in st_rows if not r['in_stats']))}")
     print(f"Outputs in {vdir.resolve()} (open validation.gpkg in QGIS)")
+    run.update(window={"start": str(start), "end": str(end)},
+               outputs=manifest.files_entry([vdir / "stations.csv", vdir / "station_days.csv",
+                                             vdir / "stations_summary.json", vdir / "validation.gpkg"], out))
+    manifest.append_run(out, run)
 
 
 if __name__ == "__main__":

@@ -65,6 +65,7 @@ import requests
 from shapely.geometry import Point
 import xarray as xr
 
+import manifest
 from storm_total import M3_PER_ACRE_FT, area_grid, prism_day_files, snow_fraction
 from validate_stations import load_basin, write_layer
 
@@ -485,6 +486,7 @@ def main():
                     help="re-fetch every gauge instead of reusing results saved by an earlier run with the same settings")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"])
     a = ap.parse_args()
+    run = manifest.start_run("validate_runoff.py", a)
     import observations
     observations.MAX_WAIT_S = a.max_wait_min * 60
 
@@ -652,6 +654,9 @@ def main():
     print(f"PRISM days {start} to {end}: {len(ok)} gauges compared {counts}; "
           f"{len(rows) - len(ok)} skipped (reasons in runoff_summary.csv)")
     print(f"Outputs in {vdir.resolve()}")
+    run.update(window={"start": str(start), "end": str(end)},
+               outputs=manifest.files_entry([vdir / "runoff_summary.csv", vdir / "validation.gpkg"], out))
+    manifest.append_run(out, run)
 
 
 if __name__ == "__main__":

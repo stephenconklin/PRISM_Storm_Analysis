@@ -467,6 +467,9 @@ def test_gauge_runs_update_only_their_gauges(tmp_path, monkeypatch):
     assert sorted(gpd.read_file(gpkg, layer="gauge_basins")["site"]) == ["A", "B"]
     gauges = gpd.read_file(gpkg, layer="gauges")
     assert sorted(gauges["site"]) == ["A", "B"] and gauges["ratio_low"].dtype.kind == "f"  # numbers, not text
+    import json
+    runs = [r for r in json.loads((out / "run_manifest.json").read_text())["runs"] if r["script"] == "validate_runoff.py"]
+    assert len(runs) == 3 and any(o["path"] == "validation/runoff_summary.csv" for o in runs[-1]["outputs"])
 
 
 def test_awdb_keeps_primary_sensor():

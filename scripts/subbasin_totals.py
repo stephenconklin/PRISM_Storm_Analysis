@@ -31,6 +31,7 @@ import geopandas as gpd
 import numpy as np
 import xarray as xr
 
+import manifest
 from storm_total import M3_PER_ACRE_FT, zone_totals
 from validate_stations import load_basin, write_layer
 
@@ -72,6 +73,7 @@ def main():
     ap.add_argument("--boundary", help="study basin polygon (default: the wbd_huc*.geojson in --out)")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"])
     a = ap.parse_args()
+    run = manifest.start_run("subbasin_totals.py", a)
 
     out = Path(a.out)
     nc = out / f"ppt_{a.res}_daily_clip.nc"
@@ -144,6 +146,9 @@ def main():
         print(f"{len(low)} subbasins are partly without PRISM data (coverage < 99%), "
               "usually outside the conterminous US or at the basin edge.")
     print(f"Outputs: {gpkg}, {out / 'subbasin_totals.csv'}")
+    run.update(window={"start": str(start), "end": str(end)},
+               outputs=manifest.files_entry([out / "totals.gpkg", out / "subbasin_totals.csv"], out))
+    manifest.append_run(out, run)
 
 
 if __name__ == "__main__":
