@@ -1,4 +1,4 @@
-# PRISM Data Wrangler
+# PRISM Storm Analysis
 
 Tools for programmatically downloading Oregon State University PRISM gridded
 climate data, clipping it to any US watershed, and summarizing storm events.
@@ -7,8 +7,7 @@ Keep code, CLI defaults and docs watershed-agnostic; specific basins appear only
 First use case (example only): the late-October 2026 San Juan River floods (remnants of
 Hurricane Trudy; rain began ~Oct 21, San Juan at Pagosa Springs crested
 15.02 ft ~Oct 22–23, showers cleared by ~Oct 26; another storm Oct 30–Nov 1).
-That run's outputs (HUC 1408; ppt and tmean for PRISM days Oct 20–31) are in
-`/Volumes/ConklinGeospatialData/Data/PRISM_data/San_Juan_Watershed`.
+That run covered HUC 1408, ppt and tmean for PRISM days Oct 20–31.
 
 ## Layout
 - `scripts/find_huc.py` — look up WBD HUC codes by name (network only)
@@ -87,11 +86,11 @@ extracted files without the resolution code. If you change cache naming or looku
 
 ## Setup
 ```
-conda env create -f environment.yml && conda activate prism-data-wrangler   # preferred (all conda-forge)
+conda env create -f environment.yml && conda activate prism-storm-analysis   # preferred (all conda-forge)
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 ```
 Keep `environment.yml` and `requirements.txt` in sync when adding dependencies.
-To run non-interactively without activating, use `conda run -n prism-data-wrangler python ...`.
+To run non-interactively without activating, use `conda run -n prism-storm-analysis python ...`.
 The "numpy.ndarray size changed" RuntimeWarning in tests comes from netCDF4 and is harmless.
 
 ## Run
@@ -113,7 +112,7 @@ python -m pytest tests -q
 ```
 On this Mac the shell sets `PROJ_DATA=/opt/anaconda3/share/proj`, an old `proj.db` that breaks pip
 rasterio ("EPSG code is unknown … comes from another PROJ installation"). Use the activated
-`prism-data-wrangler` env (or `conda run -n prism-data-wrangler`), `.venv`, or prefix with `env -u PROJ_DATA`.
+`prism-storm-analysis` env (or `conda run -n prism-storm-analysis`), `.venv`, or prefix with `env -u PROJ_DATA`.
 
 `services.nacse.org` chains to emSign Root CA - G1, which certifi's bundle lacks (CERTIFICATE_VERIFY_FAILED).
 The script calls `truststore.inject_into_ssl()` to use the OS trust store; never use `verify=False`.

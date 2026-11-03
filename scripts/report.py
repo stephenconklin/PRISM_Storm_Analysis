@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Storm report: one self-contained HTML page of charts and headline numbers from a PRISM Data
-Wrangler output folder, plus each chart as a standalone SVG for slides and documents.
+Storm report: one self-contained HTML page of charts and headline numbers from a PRISM Storm
+Analysis output folder, plus each chart as a standalone SVG for slides and documents.
 
 Charts (each skipped, with a note, when its inputs are missing or were made for another window):
     Storm timeline     basin precipitation per PRISM day (rain and snow with a tmean cube) above
@@ -502,7 +502,7 @@ def missing(title, why):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", required=True, help="folder the PRISM Data Wrangler tools wrote to")
+    ap.add_argument("--out", required=True, help="folder the PRISM Storm Analysis tools wrote to")
     ap.add_argument("--start", help="first PRISM day (default: the latest storm_total.py window, else the cube)")
     ap.add_argument("--end", help="last PRISM day")
     ap.add_argument("--gauges", nargs="+", help="USGS sites for the storm timeline (default: up to 3 of the largest "
@@ -669,7 +669,7 @@ def main():
             + PAGE_CSS % (css_vars(LIGHT), css_vars(DARK), css_vars(DARK))
             + f'</style></head><body><main><h1>{esc(title)}</h1><p>{esc(when)}. Each PRISM day is the 24 hours '
             f'ending 12:00 UTC on its date.</p><div class="tiles">{tiles_html}</div>{"".join(sections)}'
-            f'<p class="note" style="margin-top:40px">Made {esc(made)} by PRISM Data Wrangler report.py from '
+            f'<p class="note" style="margin-top:40px">Made {esc(made)} by PRISM Storm Analysis report.py from '
             f'{esc(out.resolve())}. PRISM data: PRISM Group, Oregon State University. Gauges: RCC-ACIS, USGS, '
             f'NRCS. Figures as SVG in report/figures/.</p></main><div id="tip"></div><script>{TIP_JS}</script>'
             f'</body></html>')

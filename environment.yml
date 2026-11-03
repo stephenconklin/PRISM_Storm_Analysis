@@ -1,8 +1,8 @@
-# Conda environment for PRISM Data Wrangler.
+# Conda environment for PRISM Storm Analysis.
 # Everything comes from conda-forge so GDAL, PROJ, rasterio and netCDF4 are built against each other.
 #   conda env create -f environment.yml
-#   conda activate prism-data-wrangler
-name: prism-data-wrangler
+#   conda activate prism-storm-analysis
+name: prism-storm-analysis
 channels:
   - conda-forge
 dependencies:

@@ -218,7 +218,7 @@ def write_default_style(gpkg, layer, qml_path):
     con.execute("DELETE FROM layer_styles WHERE f_table_name = ?", (layer,))
     con.execute("""INSERT INTO layer_styles (f_table_catalog, f_table_schema, f_table_name,
                    f_geometry_column, styleName, styleQML, styleSLD, useAsDefault, description, owner, update_time)
-                   VALUES ('', '', ?, ?, ?, ?, '', 1, 'PRISM Data Wrangler default', '',
+                   VALUES ('', '', ?, ?, ?, ?, '', 1, 'PRISM Storm Analysis default', '',
                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
                 (layer, geom_col, layer, qml))
     con.commit()

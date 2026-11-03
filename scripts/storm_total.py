@@ -93,10 +93,10 @@ def cf_time(ds_or_days):
 def cf_globals(title):
     """Global attributes shared by the NetCDF outputs (CF-1.10)."""
     return {"Conventions": "CF-1.10", "title": title,
-            "institution": "Data: PRISM Group, Oregon State University; processing: PRISM Data Wrangler",
+            "institution": "Data: PRISM Group, Oregon State University; processing: PRISM Storm Analysis",
             "source": "PRISM Group, Oregon State University, https://prism.oregonstate.edu",
             "references": "https://prism.oregonstate.edu/documents/PRISM_datasets.pdf",
-            "history": f"{dt.datetime.now(dt.timezone.utc):%Y-%m-%dT%H:%M:%SZ} written by PRISM Data Wrangler",
+            "history": f"{dt.datetime.now(dt.timezone.utc):%Y-%m-%dT%H:%M:%SZ} written by PRISM Storm Analysis",
             "prism_day": "Each time step covers 12:00 UTC the previous day to 12:00 UTC its date."}
 
 

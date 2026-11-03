@@ -50,7 +50,7 @@ NID_URL = ("https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/"
 WBD_URL = "https://hydro.nationalmap.gov/arcgis/rest/services/wbd/MapServer/{layer}/query"
 AWDB_URL = "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1"
 FT_TO_M = 0.3048
-HEADERS = {"User-Agent": "prism-data-wrangler"}
+HEADERS = {"User-Agent": "prism-storm-analysis"}
 MAX_WAIT_S = 900  # longest Retry-After to wait out before giving up (callers may change it)
 
 

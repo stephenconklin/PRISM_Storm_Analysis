@@ -1,6 +1,6 @@
 # Roadmap: toward an industry-standard storm precipitation tool
 
-Planned enhancements for PRISM Data Wrangler, written to be picked up and built one at a time.
+Planned enhancements for PRISM Storm Analysis, written to be picked up and built one at a time.
 Each item lists the goal, why it matters, an approach, data sources, outputs, and what "done" means.
 
 Endpoints and dataset details below are starting points from planning, not verified integrations.
@@ -24,8 +24,7 @@ Effort: **S** (an afternoon), **M** (a few days), **L** (a week or more).
 ## Multi-basin test (31 Oct 2026)
 
 The full workflow ran on three contrasting basins, reusing the national Oct 20–27 PRISM zips (no new
-downloads), plus the San Juan. Outputs are in `/Volumes/ConklinGeospatialData/Data/PRISM_data/`
-(`Upper_Skagit_test`, `Elkhorn_test`, `Upper_St_Johns_test`).
+downloads), plus the San Juan (`Upper_Skagit_test`, `Elkhorn_test`, `Upper_St_Johns_test`).
 
 | Basin (HUC) | Tests | Stations: storm totals | Gauges compared / skipped |
 |---|---|---|---|

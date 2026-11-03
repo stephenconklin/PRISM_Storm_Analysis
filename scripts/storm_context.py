@@ -130,7 +130,7 @@ def main():
     zdir = out / "normals_zips"
     zdir.mkdir(exist_ok=True)
     session = requests.Session()
-    session.headers["User-Agent"] = "prism-data-wrangler"
+    session.headers["User-Agent"] = "prism-storm-analysis"
 
     with xr.open_dataset(nc) as ds:
         days = ds.time.values.astype("datetime64[D]")

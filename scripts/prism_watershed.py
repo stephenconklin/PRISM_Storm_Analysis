@@ -446,7 +446,7 @@ def main():
     utm = basin.estimate_utm_crs()
     station_zone = basin.to_crs(utm).buffer(a.qc_station_buffer_km * 1000).to_crs(4269).union_all()
     session = requests.Session()
-    session.headers["User-Agent"] = "prism-data-wrangler"
+    session.headers["User-Agent"] = "prism-storm-analysis"
     available = available_releases(a.var, a.res, a.region, start, end, session)
 
     summary_csv = out / summary_name(a.var, a.res)

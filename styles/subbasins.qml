@@ -545,7 +545,7 @@
   </labeling>
   <customproperties>
     <Option type="Map">
-      <Option name="prism_wrangler/role" value="subbasin_totals" type="QString"/>
+      <Option name="prism_storm/role" value="subbasin_totals" type="QString"/>
     </Option>
   </customproperties>
   <blendMode>0</blendMode>

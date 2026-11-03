@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build an organized, styled QGIS project from a PRISM Data Wrangler output folder.
+Build an organized, styled QGIS project from a PRISM Storm Analysis output folder.
 
 Finds the outputs in --out by their standard names (prism_watershed.py, storm_total.py and its
 uncertainty file, subbasin_totals.py, validate_stations.py, validate_runoff.py, validate_snow.py) and
@@ -143,7 +143,7 @@ def window_label(start, end):
 
 
 def discover(out):
-    """Find the standard outputs in a PRISM Data Wrangler folder.
+    """Find the standard outputs in a PRISM Storm Analysis folder.
 
     Only precipitation is mapped (not tmean etc.), at one resolution: 800m if present, else 4km;
     "other_res" lists resolutions left out.
@@ -259,7 +259,7 @@ def relaunch(argv, qgis_python):
         sys.exit("PyQGIS is not available here and no QGIS Python was found. Pass --qgis-python or set "
                  "QGIS_PYTHON (on macOS: /Applications/QGIS-<version>.app/Contents/MacOS/python).")
     env = {k: v for k, v in os.environ.items() if k not in CLEAR_ENV}
-    env.update(QT_QPA_PLATFORM="offscreen", PRISM_WRANGLER_IN_QGIS="1")
+    env.update(QT_QPA_PLATFORM="offscreen", PRISM_STORM_IN_QGIS="1")
     sys.exit(subprocess.run([py, str(Path(__file__).resolve()), *argv], env=env).returncode)
 
 
@@ -310,7 +310,7 @@ def _build_project(a):
     f = discover(a.out)
     out = f["out"].resolve()
     if not f["days"] and not f["totals"]:
-        sys.exit(f"No PRISM Data Wrangler outputs found in {out}.")
+        sys.exit(f"No PRISM Storm Analysis outputs found in {out}.")
     if f["other_res"]:
         print(f"Mapping {f['res']} precipitation; {', '.join(f['other_res'])} outputs in the folder are left out.")
     name = a.name or out.name
@@ -327,7 +327,7 @@ def _build_project(a):
     managed = []
 
     def tag(lyr, role, abstract):
-        lyr.setCustomProperty("prism_wrangler/role", role)
+        lyr.setCustomProperty("prism_storm/role", role)
         md = QgsLayerMetadata(lyr.metadata())
         md.setAbstract(abstract)
         lyr.setMetadata(md)
@@ -727,7 +727,7 @@ def _build_project(a):
         for lyr in managed:
             node = root.findLayer(lyr.id())
             if node:
-                node.setItemVisibilityChecked(lyr.customProperty("prism_wrangler/role") in roles)
+                node.setItemVisibilityChecked(lyr.customProperty("prism_storm/role") in roles)
         for g in (g_val, g_tot, g_day, g_bnd, g_base):
             g.setItemVisibilityChecked(g in groups_on)
         themes.insert(theme_name, QgsMapThemeCollection.createThemeFromCurrentState(root, model))
@@ -758,14 +758,14 @@ def _build_project(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", required=True, help="folder the PRISM Data Wrangler tools wrote to")
+    ap.add_argument("--out", required=True, help="folder the PRISM Storm Analysis tools wrote to")
     ap.add_argument("--name", help="project name (default: the folder's name)")
     ap.add_argument("--qgis-python", help="QGIS's Python, if PyQGIS isn't importable here")
     a = ap.parse_args()
     try:
         import qgis.core  # noqa: F401
     except ImportError:
-        if os.environ.get("PRISM_WRANGLER_IN_QGIS"):
+        if os.environ.get("PRISM_STORM_IN_QGIS"):
             sys.exit("PyQGIS could not be imported even in QGIS's Python.")
         relaunch(sys.argv[1:], a.qgis_python)
     build(a)

@@ -278,7 +278,7 @@
   </labeling>
   <customproperties>
     <Option type="Map">
-      <Option name="prism_wrangler/role" value="study_basin" type="QString"/>
+      <Option name="prism_storm/role" value="study_basin" type="QString"/>
     </Option>
   </customproperties>
   <blendMode>0</blendMode>

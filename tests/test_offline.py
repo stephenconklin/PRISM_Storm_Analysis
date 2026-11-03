@@ -284,7 +284,7 @@ def basin_file(tmp_path, geom):
     return path
 
 
-def run_wrangler(out, boundary, start, end, *extra):
+def run_watershed(out, boundary, start, end, *extra):
     return subprocess.run([sys.executable, str(SCRIPT), "--start", start, "--end", end, "--boundary", str(boundary),
                            "--out", str(out), "--pause", "0", *extra], capture_output=True, text=True, env=OFFLINE)
 
@@ -297,7 +297,7 @@ def test_clip_keeps_the_right_cells(tmp_path):
     make_zip(out / "raw_zips", "20261021", grad)
     rows, cols = slice(10, 30), slice(20, 50)  # 20 x 30 cells
     geom = box(-108.5 + 20 / 120, 37.8 - 30 / 120, -108.5 + 50 / 120, 37.8 - 10 / 120)
-    res = run_wrangler(out, basin_file(tmp_path, geom), "2026-10-21", "2026-10-21")
+    res = run_watershed(out, basin_file(tmp_path, geom), "2026-10-21", "2026-10-21")
     assert res.returncode == 0, res.stdout + res.stderr
     area = np.repeat(cell_area_m2(GRID, 100)[:, None], 100, axis=1)
     expected_m3 = float((grad[rows, cols] / 1000 * area[rows, cols]).sum())
@@ -321,7 +321,7 @@ def test_cube_coverage_uses_every_day(tmp_path):
     make_zip(out / "raw_zips", "20261021", day1)
     make_zip(out / "raw_zips", "20261022", day2)
     geom = box(-108.5 + 20 / 120, 37.8 - 50 / 120, -108.5 + 60 / 120, 37.8 - 10 / 120)  # 40 x 40 cells
-    res = run_wrangler(out, basin_file(tmp_path, geom), "2026-10-21", "2026-10-22")
+    res = run_watershed(out, basin_file(tmp_path, geom), "2026-10-21", "2026-10-22")
     assert "WARN  nodata_inside" in res.stdout or "FAIL  nodata_inside" in res.stdout
     area = np.repeat(cell_area_m2(GRID, 100)[:, None], 100, axis=1)
     expected = float(area[20:30, 30:40].sum() / area[10:50, 20:60].sum() * 100)
@@ -348,7 +348,7 @@ def test_dry_window_and_missing_day(tmp_path):
     make_zip(out / "raw_zips", "20261021", 0.0)
     make_zip(out / "raw_zips", "20261022", 0.0)
     boundary = basin_file(tmp_path, box(-108.4, 37.5, -108.0, 37.7))
-    res = run_wrangler(out, boundary, "2026-10-21", "2026-10-23")  # Oct 23 can't be downloaded
+    res = run_watershed(out, boundary, "2026-10-21", "2026-10-23")  # Oct 23 can't be downloaded
     assert res.returncode == 1 and "Traceback" not in res.stderr
     assert "2026-10-23" in res.stdout and "request failed" in res.stdout
     assert "Event total not written: 1 of 3 days missing" in res.stdout
@@ -370,7 +370,7 @@ def test_refresh_with_corrupt_files(tmp_path):
     old = dt.datetime(2026, 10, 1).timestamp()
     for z in raw.glob("*.zip"):
         os.utime(z, (old, old))
-    res = run_wrangler(out, basin_file(tmp_path, box(-108.4, 37.5, -108.0, 37.7)), "2026-10-21", "2026-10-22",
+    res = run_watershed(out, basin_file(tmp_path, box(-108.4, 37.5, -108.0, 37.7)), "2026-10-21", "2026-10-22",
                        "--refresh")
     assert "Traceback" not in res.stderr and (raw / "prism_ppt_us_30s_20261022.zip.bad").exists()
     assert res.returncode == 1  # Oct 21 refresh fails (offline), Oct 22 is corrupt
@@ -385,7 +385,7 @@ def test_tiny_basin_exits_cleanly(tmp_path):
     (out / "raw_zips").mkdir(parents=True)
     make_zip(out / "raw_zips", "20261021", 5.0)
     tiny = box(-108.5 + 10.1 / 120, 37.8 - 10.4 / 120, -108.5 + 10.3 / 120, 37.8 - 10.1 / 120)  # misses every center
-    res = run_wrangler(out, basin_file(tmp_path, tiny), "2026-10-21", "2026-10-21")
+    res = run_watershed(out, basin_file(tmp_path, tiny), "2026-10-21", "2026-10-21")
     assert res.returncode == 1 and "covers no PRISM cell center" in res.stderr and "Traceback" not in res.stderr
 
 
