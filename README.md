@@ -4,6 +4,8 @@ Download PRISM daily climate grids (800 m / 4 km) from Oregon State University, 
 watershed, and summarize storm events: daily basin statistics, storm-total rainfall, and the volume
 of water that fell on the basin for any date range.
 
+Project page: https://conklingeospatial.com/projects/prism-storm-analysis/
+
 Commands:
 
 | Command | What it does |
