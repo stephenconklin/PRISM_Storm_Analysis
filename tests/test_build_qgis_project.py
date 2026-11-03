@@ -3,6 +3,8 @@ import datetime as dt
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from build_qgis_project import (diff_breaks, discover, is_number, nice_breaks, nice_round, primary_total, tif_kind, utm_epsg,
                                 volume_range_km3, window_label,  # noqa: E402
