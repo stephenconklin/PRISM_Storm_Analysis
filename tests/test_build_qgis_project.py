@@ -129,7 +129,7 @@ def test_build_real_project(tmp_path):
     from shapely.geometry import Point, box
     from build_qgis_project import find_qgis_python
     from test_offline import OFFLINE, SCRIPT, make_zip
-    if not find_qgis_python():
+    if not find_qgis_python()[0]:
         pytest.skip("QGIS not installed")
     out = tmp_path / "Test_Basin"
     (out / "raw_zips").mkdir(parents=True)
