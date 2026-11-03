@@ -80,7 +80,7 @@ python scripts/report.py --out data/huc<HUC>
 ```
 
 ## Choosing a watershed
-Any watershed in the conterminous US works.
+Any watershed in the contiguous US works.
 
 - **`--huc <code>`:** any USGS Watershed Boundary Dataset (WBD) hydrologic unit code, 2 to 16 digits.
   The number of digits picks the level: 2 region, 4 subregion, 6 basin, 8 subbasin, 10 watershed,
@@ -114,7 +114,7 @@ Other ways to find codes:
 - [The National Map viewer](https://apps.nationalmap.gov/viewer/): turn on the Watershed Boundary Dataset layer and click a watershed to see its code
 - [WBD map service](https://hydro.nationalmap.gov/arcgis/rest/services/wbd/MapServer): the service both scripts query
 
-PRISM covers the conterminous US only, so parts of a basin in Canada or Mexico, or in Alaska, Hawaii, or
+PRISM covers the contiguous US only, so parts of a basin in Canada or Mexico, or in Alaska, Hawaii, or
 Puerto Rico, get no data. `prism_watershed.py` prints a warning with the share of the basin that has no
 PRISM data, and `storm_total.py` repeats it: depth and volume then cover only the US part. Gauges whose
 basins reach more than `--max-missing-pct` outside PRISM coverage are skipped by `validate_runoff.py`.
@@ -878,7 +878,7 @@ gauges, terrain, and climate patterns. Everything else on the map is there to ch
 - **Transparent cells mean one of two things:** the value is below the lowest class in the legend, or
   there is no PRISM data at all. Classes run from the storm's minimum to its maximum, so in a storm that
   wet the whole basin (the San Juan's lowest cell got 29 mm, so classes start at 25 mm) nothing is
-  transparent except no-data areas; where some cells stayed dry, the lowest class starts at 0.5–1 mm. PRISM covers only the conterminous US, so
+  transparent except no-data areas; where some cells stayed dry, the lowest class starts at 0.5–1 mm. PRISM covers only the contiguous US, so
   basin area in Canada or Mexico is empty inside the basin outline. Click a cell with Identify to tell
   them apart: dry cells return a small number, no-data cells return nothing.
 - **Dates are PRISM days.** "PRISM day Oct 23" is the 24 hours ending 12:00 UTC on Oct 23 (in late

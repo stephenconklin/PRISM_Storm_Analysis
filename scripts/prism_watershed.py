@@ -382,7 +382,7 @@ def prism_coverage(arr, transform, basin, grid_bounds=None):
     """Share of the basin with no PRISM data: (missing %, missing km², basin km²).
 
     arr is a masked array on the clipped grid (masked = no data). Cells count by center, so
-    the basin area here is the PRISM-cell area. PRISM covers the conterminous US only, so
+    the basin area here is the PRISM-cell area. PRISM covers the contiguous US only, so
     basins reaching into Canada or Mexico have a gap. The clip stops at the edge of PRISM's
     grid, so the part of the basin beyond grid_bounds (the national grid's left, bottom, right,
     top) is added from the polygon's ellipsoidal area.
@@ -408,7 +408,7 @@ def main():
     basin_src.add_argument("--boundary", help="your own boundary polygon file instead of WBD")
     ap.add_argument("--var", default="ppt", help="PRISM variable: ppt (default), tmin, tmax, tmean, tdmean, vpdmin, vpdmax")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"], help="grid resolution (default 800m)")
-    ap.add_argument("--region", default="us", help="PRISM region (default us, the conterminous US)")
+    ap.add_argument("--region", default="us", help="PRISM region (default us, the contiguous US)")
     ap.add_argument("--format", default="", help="blank = COG GeoTIFF (default); or nc, bil, asc")
     ap.add_argument("--out", help="output folder (default data/huc<code> or data/<boundary name>)")
     ap.add_argument("--pause", type=float, default=2.0, help="seconds between requests")
@@ -591,7 +591,7 @@ def main():
         nc.setncatts({"basin_area_km2": round(basin_km2, 1), "basin_without_prism_pct": round(missing_pct, 2)})
     if missing_pct > 0.5:
         print(f"WARNING: {missing_pct:.1f}% of the basin ({missing_km2:,.0f} of {basin_km2:,.0f} km²) has no PRISM "
-              "data, usually because it lies outside the conterminous US. Totals and volumes cover only the rest.")
+              "data, usually because it lies outside the contiguous US. Totals and volumes cover only the rest.")
     print(f"Daily cube: {cube.name} (use storm_total.py for any date range)")
     for name in stale_totals(out, a.var, a.res, [c[0] for c in changes], total_tif.name):
         span = name.rsplit("_", 2)[-2:]

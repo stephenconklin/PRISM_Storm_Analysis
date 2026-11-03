@@ -544,7 +544,7 @@ def main():
     print(f"PRISM days {start} to {end} ({r['days']} days; each ends 12:00 UTC on its date)")
     print(f"Basin area:  {r['area_m2'] / 1e6:,.0f} km²"
           + (f" with PRISM data, of {basin_km2:,.0f} km² ({gap:.1f}% has no PRISM data, usually outside the "
-             "conterminous US; depth and volume cover only the area with data)" if gap > 0.5 else ""))
+             "contiguous US; depth and volume cover only the area with data)" if gap > 0.5 else ""))
     print(f"Mean depth:  {r['mean_mm']:.1f} mm ({r['mean_mm'] / 25.4:.2f} in)")
     print(f"Max depth:   {r['max_mm']:.1f} mm ({r['max_mm'] / 25.4:.2f} in)")
     print(f"Volume:      {v:.4g} m³ = {v / 1e9:.3f} km³ = {v / M3_PER_ACRE_FT:,.0f} acre-ft")

@@ -125,7 +125,7 @@ def is_number(value):
 
 
 def utm_epsg(lon):
-    """NAD83 / UTM zone EPSG code for a longitude in the conterminous US (zones 10-19)."""
+    """NAD83 / UTM zone EPSG code for a longitude in the contiguous US (zones 10-19)."""
     zone = int((lon + 180) // 6) + 1
     return 26900 + max(1, min(23, zone))
 

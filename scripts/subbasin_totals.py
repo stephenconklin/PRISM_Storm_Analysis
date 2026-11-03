@@ -144,7 +144,7 @@ def main():
     low = [r for r in rows if r["coverage_pct"] < 99]
     if low:
         print(f"{len(low)} subbasins are partly without PRISM data (coverage < 99%), "
-              "usually outside the conterminous US or at the basin edge.")
+              "usually outside the contiguous US or at the basin edge.")
     print(f"Outputs: {gpkg}, {out / 'subbasin_totals.csv'}")
     run.update(window={"start": str(start), "end": str(end)},
                outputs=manifest.files_entry([out / "totals.gpkg", out / "subbasin_totals.csv"], out))
