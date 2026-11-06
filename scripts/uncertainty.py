@@ -73,7 +73,7 @@ def revision_component(rc, releases):
 
 
 def product_component():
-    return not_assessed("products", "comparison with other precipitation products (roadmap 1.3) not built")
+    return not_assessed("products", "comparison with other precipitation products not built yet")
 
 
 def bounding_range(components):

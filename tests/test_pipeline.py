@@ -459,3 +459,4 @@ def test_report_gauge_names():
         "Animas River below Durango Pump Plant near Durango, CO"
     assert gauge_name("MCELMO CREEK NEAR BLUFF, UTAH") == "McElmo Creek near Bluff, Utah"
     assert gauge_name("LA PLATA RIVER AT HESPERUS") == "La Plata River at Hesperus"
+    assert gauge_name("PIEDRA RIVER NEAR ARBOLES, CO.") == "Piedra River near Arboles, CO"

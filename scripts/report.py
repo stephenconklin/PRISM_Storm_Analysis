@@ -18,9 +18,19 @@ storm_total.py used for the window (from its uncertainty file), else storm.toml'
 <out>/report/figures/<chart>_<start>_<end>.svg. The page has no external dependencies, follows the
 viewer's light/dark setting, and has a data table under each chart.
 
+Section anchors (a stable interface: other pages link to them): each section's <h2> has the id of its
+figure name, also when the section is "Not shown": #timeline, #gauges, #runoff, #uncertainty, #snow,
+matching report/figures/<name>_<start>_<end>.svg.
+
+--web writes a copy for publishing instead: no local paths or notes for whoever runs the tools, links to
+the repository and docs/UNCERTAINTY.md, and an optional back link (--back-url, --back-label). It goes to
+<--web-out>/storm_report_<start>_<end>.html, else <out>/report/storm_report_<start>_<end>_web.html, so the
+local report is kept.
+
 Usage examples:
     python report.py --out data/huc1408
     python report.py --out data/huc1408 --start 2026-10-20 --end 2026-10-27 --gauges 09342500 09361500
+    python report.py --out data/huc1408 --event trudy --web --web-out site/reports --back-url /projects/x/ --back-label "Project"
 """
 import argparse
 import csv
@@ -28,6 +38,7 @@ import datetime as dt
 import html
 import json
 import math
+import re
 from pathlib import Path
 
 import numpy as np
@@ -237,6 +248,7 @@ def gauge_name(name):
         t = w.title()
         return "Mc" + t[2:].title() if t.startswith("Mc") and len(t) > 3 else t  # McElmo, McPhee
     words = [NAME_WORDS.get(w, word(w)) if k else word(w) for k, w in enumerate(place.split())]
+    state = state.rstrip(".")  # some names end "CO."
     state = state if len(state) <= 2 else state.title()
     return " ".join(words) + (f", {state}" if state else "")
 
@@ -514,7 +526,8 @@ PAGE_CSS = """
 *{box-sizing:border-box} body{margin:0;background:var(--page);color:var(--ink);
  font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
 main{max-width:820px;margin:0 auto;padding:24px 16px 64px} h1{font-size:24px;margin:0 0 4px}
-h2{font-size:18px;margin:36px 0 4px} p{margin:4px 0 12px;color:var(--ink2)} .note{color:var(--muted);font-size:13px}
+h2{font-size:18px;margin:36px 0 4px} h2[id]{scroll-margin-top:16px} p{margin:4px 0 12px;color:var(--ink2)}
+.note{color:var(--muted);font-size:13px} a{color:var(--s1)} .back{font-size:13px;margin:0 0 16px} .back a{color:var(--s1)}
 .card{background:var(--surface);border-radius:12px;padding:16px;box-shadow:0 0 0 1px rgba(127,127,127,.15)}
 .card svg{width:100%%;height:auto;display:block}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:16px 0}
@@ -542,13 +555,29 @@ def css_vars(colors):
     return ";".join(f"--{k}:{v}" for k, v in colors.items())
 
 
-def section(title, intro, chart, tbl, note=""):
-    return (f"<h2>{esc(title)}</h2><p>{intro}</p><div class=\"card\">{chart}{tbl}</div>"
+def section(id_, title, intro, chart, tbl, note=""):
+    """A chart section; id_ is its anchor, the figure's name (see the module docstring)."""
+    return (f'<h2 id="{id_}">{esc(title)}</h2><p>{intro}</p><div class="card">{chart}{tbl}</div>'
             + (f'<p class="note">{note}</p>' if note else ""))
 
 
-def missing(title, why):
-    return f'<h2>{esc(title)}</h2><p class="note">Not shown: {why}</p>'
+def missing(id_, title, why):
+    """A section whose inputs are missing, keeping its anchor so links to it still land."""
+    return f'<h2 id="{id_}">{esc(title)}</h2><p class="note">Not shown: {why}</p>'
+
+
+REPO_URL = "https://github.com/stephenconklin/PRISM_Storm_Analysis"
+NOT_RUN = "this check hasn't been run for these days."
+
+
+def reader_detail(detail, web=False):
+    """An uncertainty component's detail for the page: no roadmap numbers and, for the web, no instructions
+    to run a script ('(run validate_stations.py)')."""
+    detail = re.sub(r"\s*\(roadmap [\d.]+\)", "", detail)
+    detail = re.sub(r"\bnot built$", "not built yet", detail)
+    if web:
+        detail = re.sub(r"\s*\(run [\w.]+\.py[^)]*\)", "", detail)
+    return detail
 
 
 def main():
@@ -562,6 +591,11 @@ def main():
     ap.add_argument("--title", help="report title (default: name in storm.toml, else the basin name from the folder)")
     ap.add_argument("--keep-previous", action="store_true",
                     help="move an existing report for this window to report/history/ instead of replacing it")
+    ap.add_argument("--web", action="store_true",
+                    help="write a copy for publishing: no local paths or operator notes, links to the repository")
+    ap.add_argument("--web-out", help="folder for the --web page (default: report/, named ..._web.html)")
+    ap.add_argument("--back-url", help="with --web: a link above the title, e.g. back to the project page")
+    ap.add_argument("--back-label", default="Back", help="text of the --back-url link")
     runtime.add_common_args(ap)
     a = config.parse_args(ap)
     run = manifest.start_run("report.py", a)
@@ -638,11 +672,14 @@ def main():
     figures["timeline"] = timeline_chart(basin, gauges, flows)
     trows = [[d, f"{p:.1f}"] + ([f"{r_:.1f}", f"{s_:.1f}"] if basin["rain"] is not None else [])
              for d, p, r_, s_ in zip(basin["days"], basin["ppt"], basin["rain"] or basin["ppt"], basin["snow"] or basin["ppt"])]
-    note = ("" if gauges else "No gauge comparison for this window yet (run validate_runoff.py with the same dates); "
+    web = a.web
+    note = ("" if gauges else "No gauge comparison for these days yet; showing precipitation only." if web else
+            "No gauge comparison for this window yet (run validate_runoff.py with the same dates); "
             "showing precipitation only.")
     if any(g.get("flow_complete") == "False" for g in gauges):
-        note += " The flow record ends before the requested recession window; rerun validate_runoff.py later."
-    sections.append(section("Storm timeline",
+        note += (" The flow record ends before the recession is over, so these runoff ratios are provisional." if web
+                 else " The flow record ends before the requested recession window; rerun validate_runoff.py later.")
+    sections.append(section("timeline", "Storm timeline",
                             "When the precipitation fell over the basin, and how the rivers answered. The shaded area "
                             "above the baseflow line is the event runoff used in the runoff ratio.",
                             figures["timeline"],
@@ -655,19 +692,19 @@ def main():
               and num(r["prism_mm"]) is not None]
         figures["gauges"] = scatter_chart(st, st_sum.get("event_totals"))
         sections.append(section(
-            "PRISM vs rain gauges",
+            "gauges", "PRISM vs rain gauges",
             "Storm totals at each gauge in the basin and a 10 km buffer. Most gauges are PRISM inputs, so their "
             "agreement is optimistic; independent gauges are the fairer test.", figures["gauges"],
             table(["Gauge", "Network", "Gauge (mm)", "PRISM (mm)", "PRISM input"],
                   [[r["station"].title(), r["network"], r["obs_mm"], r["prism_mm"], r["in_sample"]] for r in st])))
     else:
-        sections.append(missing("PRISM vs rain gauges", "run validate_stations.py for this window."))
+        sections.append(missing("gauges", "PRISM vs rain gauges", NOT_RUN if web else "run validate_stations.py for this window."))
     # 3. Runoff.
     ok = [r for r in runoff if r["status"] == "ok"]
     if ok:
         figures["runoff"] = runoff_chart(ok)
         sections.append(section(
-            "Where the water went",
+            "runoff", "Where the water went",
             "Runoff ratio at each compared USGS gauge, largest basin first. Dams hold water back (regulated gauges "
             "near 0); snow that stays on the ground lowers the all-precipitation ratio, so the rain-only ratio "
             "brackets it from above.", figures["runoff"],
@@ -678,20 +715,23 @@ def main():
                    for r in sorted(ok, key=lambda r: -(num(r["area_km2"]) or 0))]),
             "Flow recorded to " + ", ".join(sorted({r["flow_end_utc"][:16] for r in ok})) + " UTC."))
     else:
-        sections.append(missing("Where the water went", "run validate_runoff.py for this window."))
+        sections.append(missing("runoff", "Where the water went", NOT_RUN if web else "run validate_runoff.py for this window."))
     # 4. Uncertainty.
     if unc:
+        unc = {**unc, "components": [{**c, "detail": reader_detail(c["detail"], web)} for c in unc["components"]]}
         figures["uncertainty"] = uncertainty_chart(unc)
+        how = (f'<a href="{REPO_URL}/blob/main/docs/UNCERTAINTY.md">how the range is built</a>' if web
+               else "docs/UNCERTAINTY.md")
         sections.append(section(
-            "Volume and its uncertainty",
+            "uncertainty", "Volume and its uncertainty",
             f"{v / 1e9:.3f} km³ ({v / M3_PER_ACRE_FT:,.0f} acre-ft) fell on the basin. Each bar is how far one "
             "source of error could move it; the total adds them. It is a bound on what has been measured, not a "
-            "confidence interval (docs/UNCERTAINTY.md).", figures["uncertainty"],
+            f"confidence interval ({how}).", figures["uncertainty"],
             table(["Component", "Low", "High", "Detail"],
                   [[c["name"], f"{c['low_pct']:+.2f}%", f"{c['high_pct']:+.2f}%", c["detail"]]
                    for c in unc["components"]])))
     else:
-        sections.append(missing("Volume and its uncertainty", "run storm_total.py for this window."))
+        sections.append(missing("uncertainty", "Volume and its uncertainty", NOT_RUN if web else "run storm_total.py for this window."))
     # 5. Snow.
     sn = runtime.window_json(vdir / "snotel_summary.json", start, end)
     if sn:
@@ -700,7 +740,7 @@ def main():
             figures["snow"] = snow_chart(rows)
             ratio = sn.get("prism_over_observed_snow")
             sections.append(section(
-                "Snow check at SNOTEL stations",
+                "snow", "Snow check at SNOTEL stations",
                 "Snow as a share of each station's precipitation: observed (snow-water the pillow gained, a lower "
                 "bound since some melts) and PRISM's rain/snow split at the station's cell."
                 + (f" Over {sn['stations']} stations PRISM's snow is {ratio}× the observed gain." if ratio else ""),
@@ -709,7 +749,7 @@ def main():
                       [[r["name"], r["elevation_m"], r["precip_mm"], r["swe_gain_mm"], r["observed_snow_pct"],
                         r["prism_snow_pct"]] for r in rows])))
     else:
-        sections.append(missing("Snow check at SNOTEL stations", "run validate_snow.py for this window."))
+        sections.append(missing("snow", "Snow check at SNOTEL stations", NOT_RUN if web else "run validate_snow.py for this window."))
 
     rdir = out / "report"
     fdir = rdir / "figures"
@@ -720,24 +760,38 @@ def main():
         runtime.write_atomic(p, standalone(s))
         fig_paths.append(p)
     made = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    sources = "PRISM data: PRISM Group, Oregon State University. Gauges: RCC-ACIS, USGS, NRCS."
+    footer = (f'Made {esc(made)} by <a href="{REPO_URL}">PRISM Storm Analysis</a>. {sources}' if web else
+              f'Made {esc(made)} by PRISM Storm Analysis report.py from {esc(out.resolve())}. {sources} '
+              f'Figures as SVG in report/figures/.')
+    back = (f'<p class="back"><a href="{esc(a.back_url)}">&larr; {esc(a.back_label)}</a></p>'
+            if web and a.back_url else "")
     page = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
-            f'<title>{esc(title)} storm report</title><style>'
+            f'<title>{esc(title)} storm report, {esc(when)}</title><style>'
             + PAGE_CSS % (css_vars(LIGHT), css_vars(DARK), css_vars(DARK))
-            + f'</style></head><body><main><h1>{esc(title)}</h1><p>{esc(when)}. Each PRISM day is the 24 hours '
+            + f'</style></head><body><main>{back}<h1>{esc(title)}</h1><p>{esc(when)}. Each PRISM day is the 24 hours '
             f'ending 12:00 UTC on its date.</p><div class="tiles">{tiles_html}</div>{"".join(sections)}'
-            f'<p class="note" style="margin-top:40px">Made {esc(made)} by PRISM Storm Analysis report.py from '
-            f'{esc(out.resolve())}. PRISM data: PRISM Group, Oregon State University. Gauges: RCC-ACIS, USGS, '
-            f'NRCS. Figures as SVG in report/figures/.</p></main><div id="tip"></div><script>{TIP_JS}</script>'
+            f'<p class="note" style="margin-top:40px">{footer}</p></main><div id="tip"></div><script>{TIP_JS}</script>'
             f'</body></html>')
-    html_path = rdir / f"storm_report_{span}.html"
+    if web:
+        html_path = (Path(a.web_out) / f"storm_report_{span}.html" if a.web_out
+                     else rdir / f"storm_report_{span}_web.html")
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        local = {str(out.resolve()), str(out.absolute())}
+        leaks = [m for m in re.findall(r"/(?:Volumes|Users|home|private|tmp)/[^\s<\"')]*", page)] + \
+                [x for x in local if x in page]
+        if leaks:
+            die(f"The --web page would show local paths: {', '.join(sorted(set(leaks))[:3])}", runtime.EXIT_ERROR)
+    else:
+        html_path = rdir / f"storm_report_{span}.html"
     if a.keep_previous and html_path.exists():
         kept = keep_previous(html_path)
         print(f"Previous report kept as {kept.relative_to(out)}")
     runtime.write_atomic(html_path, page)
     run.update(window={"start": start, "end": end}, outputs=manifest.files_entry([html_path] + fig_paths, out))
     manifest.append_run(out, run)
-    print(f"Report: {html_path}")
+    print(f"{'Web report' if web else 'Report'}: {html_path}")
     print(f"Figures: {', '.join(p.name for p in fig_paths)}")
 
 

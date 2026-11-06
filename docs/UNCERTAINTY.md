@@ -7,7 +7,7 @@ Uncertainty: 4.685 km³, range 4.625-4.916 km³ (-1.3% to +4.9%; components adde
   gauges     -0.5% to +4.2%   all gauges (n=88) PRISM -4.0% -> volume +4.2%; independent gauges (n=7) PRISM +0.5% -> volume -0.5%. ...
   boundary   +0.0% to +0.0%   area-weighted +0.01% (any cell touched +1.68%, not used: it counts land outside the basin)
   revisions  -0.7% to +0.7%   window volume changed -0.72% from first recorded to latest releases; 8 of 8 days not final (release 2), ...
-  products   not assessed     comparison with other precipitation products (roadmap 1.3) not built
+  products   not assessed     comparison with other precipitation products not built yet
   rain       4.521-4.573 km³ across ramps 0,3 (used) and -1,3, 1,1 °C; shifts water between rain and snow, not the total
 ```
 (San Juan, HUC 1408, PRISM days Oct 20–27, 2026, release 2.) The same numbers are saved to
