@@ -159,11 +159,18 @@ def test_build_real_project(tmp_path):
 
 # ---------- several storms in one folder ----------
 
+def run_script(args):
+    """Run a script offline; on failure, show its output (CI keeps nothing else)."""
+    import subprocess
+    from test_offline import OFFLINE
+    res = subprocess.run([sys.executable, *map(str, args)], capture_output=True, text=True, env=OFFLINE)
+    assert res.returncode == 0, f"{Path(str(args[0])).name} exited {res.returncode}\n{res.stdout[-4000:]}\n{res.stderr[-4000:]}"
+
+
 def two_storm_folder(tmp_path):
     """A folder with two events in storm.toml, their totals, window-named validation and totals layers, an untagged
     layer from an older run, and a total for a window that is no event."""
     import json
-    import subprocess
     import geopandas as gpd
     from shapely.geometry import Point, box
     from test_offline import OFFLINE, SCRIPT, make_zip
@@ -177,8 +184,7 @@ def two_storm_folder(tmp_path):
     boundary = tmp_path / "basin.geojson"
     poly = box(-108.4, 37.5, -108.0, 37.7)
     gpd.GeoDataFrame(geometry=[poly], crs=4269).to_file(boundary)
-    subprocess.run([sys.executable, str(SCRIPT), "--start", "2026-10-21", "--end", "2026-10-24", "--boundary", str(boundary),
-                    "--out", str(out), "--pause", "0"], check=True, capture_output=True, env=OFFLINE)
+    run_script([SCRIPT, "--start", "2026-10-21", "--end", "2026-10-24", "--boundary", boundary, "--out", out, "--pause", "0"])
     s = {"name": "Two storms", "boundary": str(boundary), "res": "800m",
          "download": {"start": dt.date(2026, 10, 21), "end": dt.date(2026, 10, 24)},
          "events": [{"name": "first", "start": dt.date(2026, 10, 21), "end": dt.date(2026, 10, 22)},
@@ -187,9 +193,8 @@ def two_storm_folder(tmp_path):
     (out / "storm.toml").write_text(config.render(s))
     for start, end in (("2026-10-21", "2026-10-22"), ("2026-10-24", "2026-10-24")):
         sp = f"{start.replace('-', '')}_{end.replace('-', '')}"
-        subprocess.run([sys.executable, str(SCRIPT.parent / "storm_total.py"), "--out", str(out), "--start", start, "--end",
-                        end, "--tif", str(out / f"ppt_800m_total_{sp}.tif"), "--volume-tif",
-                        str(out / f"ppt_800m_volume_{sp}.tif")], check=True, capture_output=True, env=OFFLINE)
+        run_script([SCRIPT.parent / "storm_total.py", "--out", out, "--start", start, "--end", end,
+                    "--tif", out / f"ppt_800m_total_{sp}.tif", "--volume-tif", out / f"ppt_800m_volume_{sp}.tif"])
         mean = 40.0 if sp.startswith("20261021") else 20.0
         bt = {"name": "Test basin", "huc": None, "prism_start": start, "prism_end": end, "area_km2": 784.1,
               "coverage_pct": 100.0, "mean_mm": mean, "max_mm": mean, "volume_m3": mean * 784.1e3,
