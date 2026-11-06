@@ -450,3 +450,12 @@ def test_gauge_results_are_kept_per_window(tmp_path):
     (tmp_path / "runoff_1_20261101_20261103.json").unlink()                  # as saved before per-window files
     assert load_cached(tmp_path, "1", k1) is None and load_cached(tmp_path, "1", k2)[0]["n"] == 2
     assert json.loads((tmp_path / "runoff_1_20261101_20261103.json").read_text())["n"] == 2  # copy kept from now on
+
+
+def test_report_gauge_names():
+    from report import gauge_name
+    assert gauge_name("SAN JUAN RIVER AT PAGOSA SPRINGS, CO") == "San Juan River at Pagosa Springs, CO"
+    assert gauge_name("ANIMAS RIVER BLW DURANGO PUMP PLANT NR DURANGO, CO") == \
+        "Animas River below Durango Pump Plant near Durango, CO"
+    assert gauge_name("MCELMO CREEK NEAR BLUFF, UTAH") == "McElmo Creek near Bluff, Utah"
+    assert gauge_name("LA PLATA RIVER AT HESPERUS") == "La Plata River at Hesperus"

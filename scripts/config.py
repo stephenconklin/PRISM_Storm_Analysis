@@ -36,6 +36,7 @@ Keys (all optional except the basin and the download window):
     buffer_km = 10.0
     after_days = 7
     gauges = []                  # USGS sites for validate_runoff.py; empty = every gauge in the basin
+    max_gap_hours = 12.0         # optional: longest flow gap validate_runoff.py interpolates across
 
     [subbasins]
     digits = 10
@@ -145,6 +146,7 @@ def defaults_for(s, role, event_name=None, window=None):
     out = {"res": s.get("res"), "region": s.get("region"), "cache": s.get("prism_cache"),
            "all_snow_c": rs.get("all_snow_c"), "all_rain_c": rs.get("all_rain_c"),
            "buffer_km": val.get("buffer_km"), "after_days": val.get("after_days"),
+           "max_gap_hours": val.get("max_gap_hours"),
            "digits": (s.get("subbasins") or {}).get("digits"),
            "gauges": (s.get("report") or {}).get("gauges") or None}
     gauges = [str(g) for g in val.get("gauges") or []]

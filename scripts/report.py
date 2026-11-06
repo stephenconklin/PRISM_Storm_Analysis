@@ -223,6 +223,24 @@ def read_csv(path):
     return list(csv.DictReader(open(path, newline=""))) if Path(path).exists() else []
 
 
+# USGS station-name words: abbreviations spelled out, small words lower case.
+NAME_WORDS = {"NR": "near", "BLW": "below", "ABV": "above", "AT": "at", "NEAR": "near", "BELOW": "below",
+              "ABOVE": "above", "AND": "and", "OF": "of", "IN": "in", "TO": "to"}
+
+
+def gauge_name(name):
+    """'SAN JUAN RIVER AT PAGOSA SPRINGS, CO' -> 'San Juan River at Pagosa Springs, CO'."""
+    place, _, state = name.rpartition(", ")
+    if not place:
+        place, state = name, ""
+    def word(w):
+        t = w.title()
+        return "Mc" + t[2:].title() if t.startswith("Mc") and len(t) > 3 else t  # McElmo, McPhee
+    words = [NAME_WORDS.get(w, word(w)) if k else word(w) for k, w in enumerate(place.split())]
+    state = state if len(state) <= 2 else state.title()
+    return " ".join(words) + (f", {state}" if state else "")
+
+
 def pick_gauges(rows, wanted=None, n=3):
     """Gauges for the timeline: the ones asked for, else the n compared gauges not regulated by dams that
     carried the most event runoff (the storm's main rivers, not large dry basins)."""
@@ -298,7 +316,7 @@ def timeline_chart(basin, gauges, flows):
     # One discharge panel per gauge.
     for k, (g, f) in enumerate(zip(gauges, flows)):
         t0 = top + ph + gap + k * (gh + gap)
-        name = g["name"].title()
+        name = gauge_name(g["name"])
         ratio = f"runoff ratio {num(g['ratio_low']):.2f}–{num(g['ratio_high']):.2f}"
         body.append(f'<text x="{L}" y="{t0 - 8}" class="th">{esc(name)} ({esc(g["site"])}), discharge (cfs); '
                     f'{esc(ratio)}</text>')
@@ -319,9 +337,12 @@ def timeline_chart(basin, gauges, flows):
         body.append('<path d="M' + " L".join(f"{px:.1f},{by:.1f}" for px, _, by in pts) + '" class="lm"/>')
         body.append('<path d="M' + " L".join(f"{px:.1f},{qy:.1f}" for px, qy, _ in pts) + '" class="l1"/>')
         i = int(np.argmax(qs))
+        label = f"peak {qs[i]:,.0f} cfs, {f[i][0]:%b} {f[i][0].day} {f[i][0]:%H:%M} UTC"
+        # Right of the point, or left of it where the label would run past the panel (about 6.5 px a character).
+        right = pts[i][0] + 8 + 6.5 * len(label) <= L + pw
         body.append(f'<circle cx="{pts[i][0]:.1f}" cy="{pts[i][1]:.1f}" r="4" class="f1 ring"/>'
-                    f'<text x="{pts[i][0] + 8:.1f}" y="{pts[i][1] + 4:.1f}" class="t">peak {qs[i]:,.0f} cfs, '
-                    f'{f[i][0]:%b} {f[i][0].day} {f[i][0]:%H:%M} UTC</text>')
+                    f'<text x="{pts[i][0] + (8 if right else -8):.1f}" y="{pts[i][1] + 4:.1f}" class="t" '
+                    f'text-anchor="{"start" if right else "end"}">{esc(label)}</text>')
         step = max(1, len(f) // 120)
         for j in range(0, len(f), step):
             xa = pts[j][0]
@@ -394,7 +415,7 @@ def runoff_chart(rows):
     for i, r in enumerate(rows):
         yc = top + i * rh + rh / 2
         fcls, ocls, lcls = cls_of.get(r["regulation"], ("f1", "o1", "l1"))
-        name = r["name"].title()
+        name = gauge_name(r["name"])
         name = name if len(name) <= 34 else name[:33] + "…"
         body.append(f'<text x="{L - 10}" y="{yc + 4:.1f}" class="t" text-anchor="end">{esc(name)}</text>'
                     f'<text x="{L - 10}" y="{yc + 15:.1f}" class="tm" text-anchor="end">'
@@ -402,7 +423,7 @@ def runoff_chart(rows):
         lo, hi_ = num(r["ratio_low"]), num(r["ratio_high"])
         w = max(x(hi_) - x(lo), 4)
         body.append(f'<rect x="{x(lo):.1f}" y="{yc - 6:.1f}" width="{w:.1f}" height="8" rx="4" class="{fcls}"/>')
-        tip = f"{r['name'].title()}: runoff ratio {lo:.2f}–{hi_:.2f}"
+        tip = f"{gauge_name(r['name'])}: runoff ratio {lo:.2f}–{hi_:.2f}"
         rl, rr = num(r.get("rain_ratio_low")), num(r.get("rain_ratio_high"))
         if rl is not None:
             body.append(f'<line x1="{x(rl):.1f}" y1="{yc + 6:.1f}" x2="{x(rr):.1f}" y2="{yc + 6:.1f}" class="{lcls}"/>'
@@ -651,7 +672,7 @@ def main():
             "near 0); snow that stays on the ground lowers the all-precipitation ratio, so the rain-only ratio "
             "brackets it from above.", figures["runoff"],
             table(["Gauge", "Area (km²)", "Regulation", "Precip (mm)", "Ratio", "Rain-only ratio", "Snow %"],
-                  [[r["name"].title(), r["area_km2"], r["regulation"], r["precip_mm"],
+                  [[gauge_name(r["name"]), r["area_km2"], r["regulation"], r["precip_mm"],
                     f"{r['ratio_low']}–{r['ratio_high']}",
                     f"{r.get('rain_ratio_low') or ''}–{r.get('rain_ratio_high') or ''}", r.get("snow_pct", "")]
                    for r in sorted(ok, key=lambda r: -(num(r["area_km2"]) or 0))]),
