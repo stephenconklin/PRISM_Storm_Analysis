@@ -76,7 +76,7 @@ import config
 import manifest
 import runtime
 from runtime import die
-from storm_total import M3_PER_ACRE_FT, area_grid, prism_day_files, snow_fraction
+from storm_total import M3_PER_ACRE_FT, area_grid, prism_day_files, snow_fraction, utm_crs
 from validate_stations import load_basin, write_layer
 
 CFS_TO_M3S = 0.028316846592
@@ -241,7 +241,7 @@ def regulation_from(inside, area_m2, minor_mm=1.0, regulated_mm=10.0, precip_mm=
 
 def basin_share_inside(basin, study_poly):
     """Fraction of a gauge basin's area that lies inside the study basin polygon (EPSG:4269)."""
-    utm = basin.estimate_utm_crs()
+    utm = utm_crs(basin)
     b = basin.to_crs(utm).geometry.union_all()
     study = gpd.GeoSeries([study_poly], crs=4269).to_crs(utm).iloc[0]
     return float(b.intersection(study).area / b.area) if b.area else 0.0
@@ -315,7 +315,7 @@ def run_gauge(site_no, site, grids, study_poly, dams_for, a, vdir, tmean=None):
     result = {
         "gauge": site, "prism_window": {"start": str(start), "end": str(end)},
         "flow_window_utc": {"start": t0.isoformat(), "end": t1.isoformat(), "after_days": a.after_days},
-        "basin_area_km2": {"nldi_polygon": round(float(basin.to_crs(basin.estimate_utm_crs()).area.sum() / 1e6), 1),
+        "basin_area_km2": {"nldi_polygon": round(float(basin.to_crs(utm_crs(basin)).area.sum() / 1e6), 1),
                            "prism_cells": round(grid_area_m2 / 1e6, 1),
                            "usgs_drainage_area": round(site["drainage_area_mi2"] * KM2_PER_MI2, 1)
                            if site.get("drainage_area_mi2") else None},

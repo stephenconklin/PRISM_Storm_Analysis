@@ -131,6 +131,14 @@ def prism_day_files(extracted, var, res, day):
     return grid, (stn[0] if stn else None)
 
 
+def utm_crs(gdf):
+    """UTM zone for a GeoDataFrame in its own datum (NAD83 for PRISM and WBD, else WGS 84). Reprojecting is then a
+    plain projection: NAD83 to a WGS 84 zone needs a datum transformation, which PROJ may pick from a grid it
+    can't fetch, giving infinite coordinates (seen on the GitHub runner)."""
+    datum = gdf.crs.datum.name if gdf.crs is not None and gdf.crs.datum is not None else ""
+    return gdf.estimate_utm_crs(datum_name="NAD83" if "1983" in datum else "WGS 84")
+
+
 def area_grid(transform, shape):
     """Ellipsoidal area (m^2) of every cell of a (rows, cols) north-up lat/lon grid."""
     return np.repeat(cell_area_m2(transform, shape[0])[:, None], shape[1], axis=1)

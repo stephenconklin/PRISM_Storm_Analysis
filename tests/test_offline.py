@@ -426,3 +426,13 @@ def test_parse_release_rows():
     rows = [["2026-10-26", "2026-10-31", "ppt", "2", "https://services.nacse.org/prism/data/get/us/800m/ppt/20261026"],
             ["2026-10-28", "2026-10-29", "ppt", "1", "url"], ["bad"], None]
     assert parse_release_rows(rows) == {dt.date(2026, 10, 26): 2, dt.date(2026, 10, 28): 1}
+
+
+def test_utm_crs_keeps_the_datum():
+    # NAD83 data gets a NAD83 zone, so a buffer there and back needs no datum transformation (none PROJ can't make)
+    from storm_total import utm_crs
+    basin = gpd.GeoDataFrame(geometry=[box(-108.4, 37.5, -108.0, 37.7)], crs=4269)
+    assert utm_crs(basin).to_epsg() == 26912
+    assert utm_crs(basin.to_crs(4326)).to_epsg() == 32612
+    zone = basin.to_crs(utm_crs(basin)).buffer(10_000).to_crs(4269)
+    assert np.isfinite(zone.total_bounds).all() and zone.total_bounds[0] < -108.4

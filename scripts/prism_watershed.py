@@ -79,7 +79,7 @@ import manifest
 import qc
 import runtime
 from runtime import EXIT_NETWORK, EXIT_QC, die
-from storm_total import RES_CODES, VAR_UNITS, area_grid, build_cube, geodesic_km2
+from storm_total import RES_CODES, VAR_UNITS, area_grid, build_cube, geodesic_km2, utm_crs
 
 try:
     # Use the OS trust store: services.nacse.org chains to emSign Root CA - G1,
@@ -552,7 +552,7 @@ def main():
                      "cached_file": manifest.files_entry(sorted(out.glob(f"wbd_huc{a.huc}.geojson")), out)}
                     if a.huc else {"boundary": str(Path(a.boundary).resolve()),
                                    "sha256": manifest.sha256(a.boundary)})
-    utm = basin.estimate_utm_crs()
+    utm = utm_crs(basin)
     station_zone = basin.to_crs(utm).buffer(a.qc_station_buffer_km * 1000).to_crs(4269).union_all()
     session = requests.Session()
     session.headers["User-Agent"] = "prism-storm-analysis"

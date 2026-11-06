@@ -41,7 +41,7 @@ import config
 import manifest
 import runtime
 from runtime import die
-from storm_total import prism_day_files, snow_fraction
+from storm_total import prism_day_files, snow_fraction, utm_crs
 from validate_stations import INCH_MM, cube_days, load_basin, sample_grid, write_layer
 
 
@@ -139,7 +139,7 @@ def main():
         print("No PRISM tmean grids for every day; PRISM split skipped (run prism_watershed.py --var tmean).")
 
     basin = load_basin(out, a.boundary)
-    zone = basin.to_crs(basin.estimate_utm_crs()).buffer(a.buffer_km * 1000).to_crs(4269).union_all()
+    zone = basin.to_crs(utm_crs(basin)).buffer(a.buffer_km * 1000).to_crs(4269).union_all()
     study = basin.geometry.iloc[0]
     stations = [s for s in snotel_stations(tuple(zone.bounds)) if zone.contains(Point(s["lon"], s["lat"]))]
     if not stations:

@@ -44,7 +44,7 @@ import config
 import manifest
 import runtime
 from runtime import die
-from storm_total import prism_day_files
+from storm_total import prism_day_files, utm_crs
 
 INCH_MM = 25.4
 STYLE_DIR = Path(__file__).resolve().parents[1] / "styles"
@@ -293,7 +293,7 @@ def main():
         grids[d] = (g, s)
 
     basin = load_basin(out, a.boundary)
-    utm = basin.estimate_utm_crs()
+    utm = utm_crs(basin)
     zone = basin.to_crs(utm).buffer(a.buffer_km * 1000).to_crs(4269)
     w, s_, e, n = zone.total_bounds
     # Fetch a day either side: midnight observers report a PRISM day under the previous date.
