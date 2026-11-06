@@ -8,7 +8,7 @@ Per `CLAUDE.md`, check every external endpoint before building on it.
 
 Effort: **S** (an afternoon), **M** (a few days), **L** (a week or more).
 
-## Where the tool stands (1 Nov 2026)
+## Where the tool stands (5 Nov 2026)
 
 | Area | Today |
 |---|---|
@@ -19,7 +19,8 @@ Effort: **S** (an afternoon), **M** (a few days), **L** (a week or more).
 | Uncertainty | `uncertainty.py`: volume with a bounding range (gauges, boundary, revisions); other products not yet assessed |
 | Validation | `validate_stations.py` (1.1), `validate_runoff.py` (1.2, with rain-only ratios), `validate_snow.py` (SNOTEL check of the rain/snow split); 1.3 not started |
 | Provenance | `run_manifest.json` (one entry per run); releases in the CSV, clipped tifs and cube; release history CSV |
-| Engineering | Git (tag `v0.1.0`); offline pytest, including a real QGIS build when QGIS is installed; GitHub Actions workflow (runs once pushed); no packaging or logging |
+| Workflow | `pipeline.py` (`init`, `run`, `status`, `update`) from per-folder settings (`storm.toml`); resume, logs, exit codes, folder lock, atomic writes, shared zip cache; `check_endpoints.py` (section 9) |
+| Engineering | Git (tag `v0.1.0`); offline pytest, including a real QGIS build when QGIS is installed; GitHub Actions workflow (runs once pushed); no packaging |
 
 ## Multi-basin test (31 Oct 2026)
 
@@ -55,7 +56,8 @@ gauges whose basins lie mostly outside the study basin are skipped; `--gauge` ru
    product spread; next **multi-product comparison** (1.3), which feeds 3.3.
 6. **Storm context** (6): ~~percent of normal (6.2)~~ built; return period (6.1) open. ~~**Reports** (7)~~ built
    (maps and PDF still open).
-7. **Engineering** (8). Git, a first tag and a CI workflow are in place (CI runs once the repo has a GitHub
+7. ~~**Workflow and pipeline** (9)~~ — built 5 Nov 2026.
+8. **Engineering** (8). Git, a first tag and a CI workflow are in place (CI runs once the repo has a GitHub
    remote); packaging and logging as the tool grows.
 
 ---
@@ -514,18 +516,74 @@ builder headless when PyQGIS is available and are skipped otherwise.
 | Item | Notes | Effort |
 |---|---|---|
 | Packaging | `pyproject.toml`; commands `prism-watershed`, `storm-total`, `find-huc`; scripts become a package | S |
-| Config files | YAML run configs (basin, window, outputs) for repeat runs; CLI flags override | S |
-| Logging | `logging` with levels and a log file per run, in place of `print` | S |
-| HTTP robustness | Retries with exponential backoff for network errors, never for the download-limit response; clear messages | S |
-| Shared download cache | One national zip cache (for example `~/.cache/prism`) shared by all basins, so several basins over the same dates download each file once | S |
-| Resume | Interrupted runs pick up where they stopped (cache already covers downloads; add processing state) | S |
-| Batch runs | Many basins or windows from one config | M |
+| ~~Config files~~ | Built 5 Nov 2026 as `storm.toml` (TOML, not YAML; section 9) | S |
+| Logging | Built in part (section 9): a log file per run with HTTP detail; messages are still `print`, without levels | S |
+| ~~HTTP robustness~~ | Built 5 Nov 2026 (section 9) | S |
+| ~~Shared download cache~~ | Built 5 Nov 2026: `--cache` / `PRISM_CACHE` (section 9) | S |
+| ~~Resume~~ | Built 5 Nov 2026: atomic writes, pipeline state (section 9) | S |
+| Batch runs | Several windows per folder built (events in `storm.toml`); several basins from one list still open | M |
 | CI | GitHub Actions running pytest on every push, in the conda environment | S |
 | Type checking and lint | Type hints, `mypy`, `ruff` | S |
 | Dependency pinning | A lock file (for example `conda-lock`) for exact reproducibility, alongside `environment.yml` | S |
 | Performance | Window clipping (read only the basin window from each COG) instead of full-grid reads; parallel downloads within PRISM's limits | M |
 
 ---
+
+## 9. Workflow and pipeline — M (built 5 Nov 2026)
+
+> **Status: built 5 Nov 2026** as `scripts/pipeline.py` (`init`, `run`, `status`, `update`),
+> `scripts/config.py` (`storm.toml`), `scripts/runtime.py` (lock, logs, atomic writes, exit codes,
+> prompts) and `scripts/check_endpoints.py`, with Claude Code skills in `.claude/skills/`. Tested offline in
+> `tests/test_pipeline.py` (including a real Ctrl-C and resume); `check_endpoints.py` run against the
+> live services on 5 Nov 2026 (all nine answered).
+
+**Goal:** One command runs a first analysis in the right order; another brings a folder up to date as
+PRISM, USGS and the other sources revise their data; interrupted or failed runs resume; every run is
+logged and recorded.
+
+**Why:** A first run was ten commands with ordering traps (gauges before totals, `storm_total.py` twice),
+settings repeated in several scripts (the rain/snow ramp in three, hard-coded in the report), and no
+record of runs that failed. A refresh meant retyping the basin and dates for each variable and rerunning
+everything downstream by hand, with nothing saying which outputs were out of date.
+
+**What was built:**
+
+| Piece | What it does |
+|---|---|
+| Settings, `<out>/storm.toml` | Basin, resolution, download window, named events, rain/snow ramp, validation and report options. Every script takes its defaults from it (`config.parse_args`); flags override. TOML rather than the YAML planned in section 8: Python 3.11+ reads it with no new dependency (`tomli` on 3.10) |
+| `pipeline.py init` | Guided set-up: WBD name search and choice, storm dates, padding, event name; or all by options. Writes `storm.toml`, shows the plan, offers to run |
+| `pipeline.py run` | The ten steps in dependency order, per event where it applies; standard raster names; a failed download or total stops the run, failed network steps are recorded and the run goes on (exit 3); `--from`, `--only`, `--skip`, `--event`, `--force`, `--keep-going`, `--open`, `--no-qgis` |
+| Resume | `pipeline_state.json`: per step, status and a fingerprint of its options, `storm.toml`, the PRISM release history and (for totals) the gauge comparison. Reruns skip what is done; report and QGIS rebuild after any change |
+| `--dry-run` | The plan with each command, a check of the services the planned steps use, and the disk space the remaining downloads need |
+| `pipeline.py status` | Days and releases per variable against PRISM's release service; per event, which outputs exist, failed last time, or were made from older releases (manifest `input_releases`); gauges whose flow window was cut short or whose flow is provisional; the next command to run |
+| `pipeline.py update` | Status, a confirmation, `--refresh` for both variables, every event rerun (runoff re-fetches cut-short and month-old provisional gauges), the previous report kept in `report/history/`, and a per-event summary of what changed. `--check --notify` for a scheduled job (launchd example in the README) |
+| Logs | Every script copies its output, time-stamped, to `<out>/logs/` (pipeline steps to `logs/<time>/`), plus DEBUG detail: HTTP requests, retries, waits. `--verbose`, `--quiet`. The manifest entry names its log |
+| Exit codes and status | 0 ok, 1 QC failed, 2 bad input, 3 incomplete, 4 network, 5 error, 130 interrupted; every run, including failed and interrupted ones, gets a manifest entry with its status |
+| Atomic writes | Zips, clipped tifs, CSVs, JSON, cubes, rasters and the manifest go through `.part` files; zips unzip into a temporary folder; an unreadable manifest is set aside, never overwritten |
+| Lock | `<out>/.lock`; a second run in the folder stops with a message; stale locks are taken over; pipeline steps share the pipeline's |
+| Retries | Validation services: dropped connections, timeouts, 502/504 with backoff; PRISM downloads: one retry, never after PRISM's own reply (its limit message) |
+| Prompts | At a terminal only: before `--refresh` re-downloads (download limit), before `validate_runoff.py --refresh`; `--yes`; progress `[i/n]` with time left; a countdown during rate-limit waits |
+| Shared zip cache | `--cache`, `PRISM_CACHE` or `prism_cache`: zips hard-linked into each folder; a newer release from one basin's refresh reaches the others without a download |
+| Window-named validation outputs | Station, SNOTEL and runoff summaries and flow CSVs also as `<name>_<start>_<end>.<ext>`, so a folder holds several events; readers prefer them |
+| Fixes | The report used a hard-coded 0–3 °C ramp; it now uses the window's (uncertainty JSON, else `storm.toml`). `storm_total.py` now says when the gauge comparison is for another window instead of dropping it silently |
+| `check_endpoints.py` | One light request per service (nine); nothing counts toward a download limit |
+
+**Several storms per basin (5 Nov 2026):** events may set their own `after_days` (chosen by `--event` or a
+matching `--start`/`--end`); validation and subbasin GeoPackage layers are also written per window
+(`<layer>_<start>_<end>`); the QGIS builder maps one group, label and theme set per storm window
+(`plan_events`), with shared color scales and an "Other windows" group. First used for the San Juan
+(Trudy Oct 20–27, the Nov 1–3 storm, and both together, Oct 20–Nov 3).
+
+**Follow-ups:**
+- Logging: scripts still `print`; the output is captured to the log, but messages have no levels except
+  the HTTP and retry ones. Move to `logging` levels script by script.
+- GeoPackage layers are written in place (SQLite transactions, not a rename); `build_qgis_project.py` and
+  `find_huc.py` don't take the lock or write a log.
+- ~~The per-gauge runoff cache holds one window~~ — keyed by window 6 Nov 2026
+  (`runoff_<site>_<start>_<end>.json`).
+- `status` doesn't yet flag the SNOTEL lag in ACIS for windows ending within a few days of the run.
+- Batch: several basins from one list (each folder already has its own settings; a loop over folders
+  with the shared cache is the remaining piece).
 
 ## Open questions
 - Which second precipitation product to support first (Stage IV for timing, AORC for resolution)?

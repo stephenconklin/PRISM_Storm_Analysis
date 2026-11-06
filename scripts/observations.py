@@ -29,11 +29,18 @@ Rate limits: the USGS Water Data API allows 1,000 requests per hour per IP witho
 (HTTP 429 with Retry-After when exceeded). Set USGS_API_KEY to an api.data.gov key; it is
 sent as the X-Api-Key header and gets its own 1,000-per-hour allowance (checked 31 Oct 2026). Waits up to MAX_WAIT_S are
 waited out; longer ones raise RateLimited.
+
+Dropped connections, timeouts and 502/504 replies are retried with exponential backoff (TRANSIENT_TRIES
+attempts in all). Every request is logged at debug level to the run's log file (the API key travels in a
+header and is never logged).
 """
+import logging
 import os
 import time
 
 import requests
+
+import runtime
 
 try:
     # Use the OS trust store, as prism_watershed.py does.
@@ -52,6 +59,9 @@ AWDB_URL = "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1"
 FT_TO_M = 0.3048
 HEADERS = {"User-Agent": "prism-storm-analysis"}
 MAX_WAIT_S = 900  # longest Retry-After to wait out before giving up (callers may change it)
+TRANSIENT_TRIES = 3  # attempts for a dropped connection, timeout or 502/504
+TRANSIENT_WAIT_S = float(os.environ.get("PRISM_STORM_RETRY_WAIT", 5))  # first backoff; doubles each retry
+log = logging.getLogger("prism_storm.observations")
 
 
 class RateLimited(RuntimeError):
@@ -78,13 +88,35 @@ def retry_after_s(value, default):
             return default
 
 
-def _get(url, params=None, timeout=120):
-    """GET with the USGS key (if set) and retries on 429/503."""
+def _get(url, params=None, timeout=120, method="GET", json_body=None):
+    """GET (or POST json_body) with the USGS key (if set), waits on 429/503 (Retry-After) and retries of
+    transient failures."""
     headers = dict(HEADERS)
     if os.environ.get("USGS_API_KEY") and "api.waterdata.usgs.gov" in url:
         headers["X-Api-Key"] = os.environ["USGS_API_KEY"]
-    for attempt in range(5):
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
+    host = url.split("/")[2]
+    transient = 0
+    for attempt in range(5 + TRANSIENT_TRIES):
+        t0 = time.monotonic()
+        try:
+            r = requests.request(method, url, params=params, json=json_body, headers=headers, timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            r, error = None, e
+        else:
+            error = None
+            log.debug(f"{method} {r.url} -> {r.status_code}, {len(r.content):,} bytes in {time.monotonic() - t0:.1f} s")
+        if error is not None or r.status_code in (502, 504):
+            transient += 1
+            what = error.__class__.__name__ if error is not None else f"HTTP {r.status_code}"
+            log.debug(f"{method} {url} {params or ''} failed: {what}")
+            if transient >= TRANSIENT_TRIES:
+                if error is not None:
+                    raise error
+                r.raise_for_status()
+            wait = TRANSIENT_WAIT_S * 2 ** (transient - 1)
+            log.info(f"    {host}: {what}; retrying in {wait} s ({transient}/{TRANSIENT_TRIES - 1})")
+            time.sleep(wait)
+            continue
         if r.status_code not in (429, 503):
             r.raise_for_status()
             return r
@@ -92,8 +124,9 @@ def _get(url, params=None, timeout=120):
         if wait > MAX_WAIT_S:
             raise RateLimited(url, wait)
         if wait > 10:
-            print(f"    {url.split('/')[2]} asked to wait {wait // 60} min {wait % 60} s; waiting", flush=True)
-        time.sleep(wait)
+            runtime.countdown(wait, f"{host} asked to wait {wait // 60} min {wait % 60} s")
+        else:
+            time.sleep(wait)
     r.raise_for_status()
     return r
 
@@ -107,9 +140,7 @@ def acis_daily_precip(bbox, sdate, edate):
     body = {"bbox": ",".join(f"{v:.4f}" for v in bbox), "sdate": sdate, "edate": edate,
             "elems": [{"name": "pcpn", "interval": "dly", "add": "t"}],
             "meta": ["name", "ll", "elev", "sids", "state", "tzo"]}
-    r = requests.post(ACIS_URL, json=body, headers=HEADERS, timeout=120)
-    r.raise_for_status()
-    js = r.json()
+    js = _get(ACIS_URL, method="POST", json_body=body).json()
     if "error" in js:
         raise RuntimeError(f"ACIS error: {js['error']}")
     return js.get("data", [])
@@ -206,9 +237,7 @@ def nid_dams(bbox):
               "resultOffset": 0}
     dams = []
     while True:
-        r = requests.get(NID_URL, params=params, headers=HEADERS, timeout=120)
-        r.raise_for_status()
-        js = r.json()
+        js = _get(NID_URL, params).json()
         if "error" in js:
             raise RuntimeError(f"NID query failed: {js['error']}")
         for f in js.get("features", []):

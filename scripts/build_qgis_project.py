@@ -5,10 +5,18 @@ Build an organized, styled QGIS project from a PRISM Storm Analysis output folde
 Finds the outputs in --out by their standard names (prism_watershed.py, storm_total.py and its
 uncertainty file, subbasin_totals.py, validate_stations.py, validate_runoff.py, validate_snow.py) and
 writes <out>/QGIS/<folder name>.qgz with:
-    - groups: Validation, Storm totals, Daily precipitation, Boundaries, Basemap
+    - one group per storm window: the events in storm.toml, else every window storm_total.py analyzed
+      (its uncertainty files). Each holds that window's basin label (volume and range), depth, volume,
+      rain, snow and percent-of-normal rasters, subbasins, and validation layers (the window-named
+      GeoPackage layers, <layer>_<start>_<end>); the first window is shown, the others are switched off
+    - shared groups: Other windows (totals for windows that aren't events), Daily precipitation,
+      Boundaries and dams, Basemap
+    - map themes for each window ("<event>: Storm total", ": Validation", ...; without the prefix when
+      there is one window)
     - readable layer names with units and dates; provenance in each layer's metadata
-    - one shared color scale for daily precipitation and one for storm totals, with
-      class breaks set from the data; station difference classes set from the data
+    - one shared color scale for daily precipitation and one per kind of total (depth, rain, snow,
+      volume, subbasin depth) across all windows, so a color means the same in every storm, with class
+      breaks set from the data; station difference classes set from each window's data
     - relative paths (the folder can be moved), a NAD83 UTM CRS for the basin,
       map themes, a basin bookmark, and the Temporal Controller set to the storm window
 
@@ -202,6 +210,130 @@ def primary_total(totals, start=None, end=None):
     return max(dated, key=lambda p: (spans[p][1] - spans[p][0], spans[p][1])) if dated else (totals[0] if totals else None)
 
 
+SPAN_RE = re.compile(r"_(\d{8})_(\d{8})$")
+# Layers each storm window gets, by GeoPackage: validation.gpkg and totals.gpkg.
+VALIDATION_LAYERS = ("gauges", "stations", "station_days", "gauge_basins", "snotel")
+TOTALS_LAYERS = ("basin_total", "subbasins")
+# Untagged layers written before window-named copies existed: which summary file gives their window.
+LAYER_SUMMARY = {"stations": "stations_summary.json", "station_days": "stations_summary.json",
+                 "snotel": "snotel_summary.json"}
+
+
+def stem_window(stem):
+    """(start, end) dates from a name ending in _<YYYYMMDD>_<YYYYMMDD>, else None."""
+    m = SPAN_RE.search(stem)
+    if not m:
+        return None
+    try:
+        return tuple(dt.datetime.strptime(m.group(i), "%Y%m%d").date() for i in (1, 2))
+    except ValueError:
+        return None
+
+
+def gpkg_layers(gpkg):
+    """Names of the feature layers in a GeoPackage (empty if there is none). Plain SQLite, no QGIS."""
+    import sqlite3
+    if not Path(gpkg).exists():
+        return set()
+    con = sqlite3.connect(f"file:{gpkg}?mode=ro", uri=True)
+    try:
+        return {r[0] for r in con.execute("SELECT table_name FROM gpkg_contents WHERE data_type = 'features'")}
+    except sqlite3.Error:
+        return set()
+    finally:
+        con.close()
+
+
+def gpkg_window(gpkg, layer):
+    """The (start, end) most of a layer's rows were made for (columns prism_start, prism_end), else None."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{gpkg}?mode=ro", uri=True)
+    try:
+        row = con.execute(f'SELECT prism_start, prism_end, COUNT(*) AS n FROM "{layer}" WHERE prism_start <> "" '
+                          "GROUP BY prism_start, prism_end ORDER BY n DESC LIMIT 1").fetchone()
+    except sqlite3.Error:
+        row = None
+    finally:
+        con.close()
+    if not row or not row[0]:
+        return None
+    try:
+        return dt.date.fromisoformat(str(row[0])[:10]), dt.date.fromisoformat(str(row[1])[:10])
+    except ValueError:
+        return None
+
+
+def json_window(path):
+    """(start, end) from a summary JSON's "window", else None."""
+    try:
+        w = json.loads(Path(path).read_text()).get("window") or {}
+        return dt.date.fromisoformat(str(w["start"])), dt.date.fromisoformat(str(w["end"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def settings_events(out):
+    """[(name, start, end)] from <out>/storm.toml, or [] (no file, or no tomllib here)."""
+    try:
+        import config
+        return [(n, dt.date.fromisoformat(s), dt.date.fromisoformat(e)) for n, s, e in config.events(config.load(out))]
+    except Exception:
+        return []
+
+
+def plan_events(f):
+    """The storm windows to map and what each has. Returns (events, other_rasters).
+
+    Windows come from storm.toml's events, else from the storm_total.py uncertainty files (one per window
+    analyzed), else, for folders made before either, the one event total primary_total picks. Each event:
+    {"name", "start", "end", "span", "label", "rasters": {kind: path}, "layers": {layer: (gpkg, table)},
+    "uncertainty": path or None}. A window's layer is the window-named copy (<layer>_<span>), else the
+    plain layer when it was made for that window. Rasters whose window matches no event are returned as
+    other_rasters [(kind, path)]; rasters with no recognizable content are left out (and reported).
+    """
+    out, res = Path(f["out"]), f["res"]
+    windows = [(n, s, e) for n, s, e in settings_events(out)]
+    if not windows:
+        for u in sorted(out.glob(f"ppt_{res}_uncertainty_*.json")):
+            w = stem_window(u.stem)
+            if w:
+                windows.append((None, *w))
+    rasters = [(("depth" if "_total_" in p.name else tif_kind(p.stem)), p) for p in f["totals"] + f["other_tifs"]]
+    rasters = [(k, p) for k, p in rasters if k]
+    legacy = not windows
+    if legacy:
+        shown = primary_total(f["totals"], *(gpkg_window(f["totals_gpkg"], "basin_total")
+                                             if "basin_total" in gpkg_layers(f["totals_gpkg"]) else (None, None)))
+        w = total_window(shown) if shown else None
+        windows = [(None, *w)] if w else []
+    vlayers, tlayers = gpkg_layers(f["gpkg"]), gpkg_layers(f["totals_gpkg"])
+
+    def untagged_window(gpkg, layer):
+        summary = LAYER_SUMMARY.get(layer)
+        return json_window(out / "validation" / summary) if summary else gpkg_window(gpkg, layer)
+
+    events, used = [], set()
+    for name, s0, s1 in windows:
+        sp = f"{s0:%Y%m%d}_{s1:%Y%m%d}"
+        ev = {"name": name, "start": s0, "end": s1, "span": sp, "rasters": {}, "layers": {},
+              "label": (f"{name} — {window_label(s0, s1)}" if name else f"PRISM days {window_label(s0, s1)}"),
+              "uncertainty": next(iter(out.glob(f"ppt_{res}_uncertainty_{sp}.json")), None)}
+        for kind, p in rasters:
+            if stem_window(p.stem) == (s0, s1) and kind not in ev["rasters"]:
+                ev["rasters"][kind] = p
+                used.add(p)
+        for gpkg, names, present in ((f["gpkg"], VALIDATION_LAYERS, vlayers), (f["totals_gpkg"], TOTALS_LAYERS, tlayers)):
+            for layer in names:
+                if f"{layer}_{sp}" in present:
+                    ev["layers"][layer] = (gpkg, f"{layer}_{sp}")
+                elif layer in present and (legacy or untagged_window(gpkg, layer) == (s0, s1)):
+                    ev["layers"][layer] = (gpkg, layer)
+        if ev["rasters"] or ev["layers"] or ev["uncertainty"]:
+            events.append(ev)
+    other = [(k, p) for k, p in rasters if p not in used]
+    return events, other
+
+
 def releases(summary_csv):
     """{date: release} from daily_basin_summary.csv, if present."""
     if not Path(summary_csv).exists():
@@ -326,18 +458,12 @@ def _build_project(a):
     proj.setFilePathStorage(Qgis.FilePathType.Relative)
     managed = []
 
-    def tag(lyr, role, abstract):
-        lyr.setCustomProperty("prism_storm/role", role)
-        md = QgsLayerMetadata(lyr.metadata())
-        md.setAbstract(abstract)
-        lyr.setMetadata(md)
-        managed.append(lyr)
-        return lyr
-
     days = sorted(f["days"])
     start, end = (days[0], days[-1]) if days else (None, None)
     rel = releases(f["summary"])
     when = window_label(start, end) if start else ""
+    events, other = plan_events(f)
+    multi = len(events) > 1
 
     # ---- study basin and CRS ----
     basin_lyr, basin_name, huc = None, name, ""
@@ -349,6 +475,7 @@ def _build_project(a):
         feat = next(basin_lyr.getFeatures(), None)
         if feat is not None and "name" in basin_lyr.fields().names():
             basin_name = str(feat["name"])
+        del feat
     title = f"{basin_name}" + (f" (HUC {huc})" if huc else "") + (f" — PRISM days {when}" if when else "")
     proj.setTitle(title)
     ref = basin_lyr if basin_lyr is not None else QgsRasterLayer(str(f["totals"][0] if f["totals"]
@@ -358,13 +485,29 @@ def _build_project(a):
     crs = QgsCoordinateReferenceSystem(f"EPSG:{utm_epsg(ext_ll.center().x())}")
     proj.setCrs(crs)
 
+    # Layer tree: one group per storm window (the first shown), then what the windows share.
     root = proj.layerTreeRoot()
     top = root.addGroup(title)
-    g_val = top.addGroup("Validation")
-    g_tot = top.addGroup("Storm totals")
+    ev_groups = []
+    for i, ev in enumerate(events):
+        g = top.addGroup(f"Storm: {ev['label']}" if multi or ev["name"] else ev["label"])
+        ev_groups.append([g, g.addGroup("Totals"), g.addGroup("Validation")])
+        g.setItemVisibilityChecked(i == 0)
+        g.setExpanded(i == 0)
+    g_other = top.addGroup("Other windows") if other else None
     g_day = top.addGroup("Daily precipitation")
-    g_bnd = top.addGroup("Boundaries")
+    g_bnd = top.addGroup("Boundaries and dams")
     g_base = top.addGroup("Basemap")
+    shared_groups = [g for g in (g_other, g_day, g_bnd, g_base) if g is not None]
+
+    def tag(lyr, role, abstract, event=None):
+        lyr.setCustomProperty("prism_storm/role", role)
+        lyr.setCustomProperty("prism_storm/event", event or "")
+        md = QgsLayerMetadata(lyr.metadata())
+        md.setAbstract(abstract)
+        lyr.setMetadata(md)
+        managed.append(lyr)
+        return lyr
 
     def add(lyr, group, visible=True):
         proj.addMapLayer(lyr, False)
@@ -372,11 +515,10 @@ def _build_project(a):
         node.setItemVisibilityChecked(visible)
         return lyr
 
-    # ---- precipitation rasters ----
+    # ---- renderers ----
     def raster_minmax(path):
         ds = gdal.Open(str(path))  # keep the dataset referenced while its band is read
         return ds.GetRasterBand(1).ComputeRasterMinMax(False)
-
 
     def precip_renderer(lyr, breaks, colors=PRECIP_COLORS):
         items = []
@@ -406,179 +548,58 @@ def _build_project(a):
         shader.setRasterShaderFunction(fn)
         lyr.setRenderer(QgsSingleBandPseudoColorRenderer(lyr.dataProvider(), 1, shader))
 
-    rel_note = ("PRISM releases: " + ", ".join(f"{day_label(d)} r{rel[d]}" for d in days if rel.get(d))) if rel else ""
-    totals = [QgsRasterLayer(str(p), p.stem) for p in f["totals"]]
-    tranges = [raster_minmax(p) for p in f["totals"]]
-    tbreaks = nice_breaks(max([r[1] for r in tranges], default=1), min([r[0] for r in tranges], default=0))
-    # One event total is shown (the subbasin totals' window, else the longest); others are added switched off.
-    basin_window = None
-    if f["totals_gpkg"].exists():
-        bt = QgsVectorLayer(f"{f['totals_gpkg']}|layername=basin_total", "bt", "ogr")
-        ft = next(bt.getFeatures(), None) if bt.isValid() else None
-        if ft is not None and "prism_start" in bt.fields().names() and ft["prism_start"]:
-            basin_window = (dt.date.fromisoformat(str(ft["prism_start"])), dt.date.fromisoformat(str(ft["prism_end"])))
-        del ft, bt
-    shown = primary_total(f["totals"], *(basin_window or (None, None)))
-    for p, t in zip(f["totals"], totals):
-        s0, s1 = total_window(p) or (start, end)
-        t.setName(f"Precipitation depth (mm), {window_label(s0, s1)}" if s0 else f"Precipitation depth (mm): {p.stem}")
-        precip_renderer(t, tbreaks)
-        tag(t, "storm_total_depth" if p == shown else "storm_total_other",
-            f"PRISM storm-total precipitation (mm), PRISM days {s0} to {s1} (each ends 12:00 UTC). {rel_note}")
-        add(t, g_tot, visible=p == shown)
-    for p in f["other_tifs"]:  # storm_total.py --tif / --volume-tif / --rain-tif / --snow-tif outputs
-        kind = tif_kind(p.stem)
-        if kind is None:
-            print(f"Not mapped (name doesn't say what it holds): {p.name}")
-            continue
-        lyr = QgsRasterLayer(str(p), p.stem)
-        if kind == "percent":
-            lyr.setName(f"Percent of 1991–2020 normal: {p.stem}")
-            percent_renderer(lyr, raster_minmax(p)[1])
-            tag(lyr, "percent_normal", "Storm total as a percent of PRISM's 1991-2020 normal for the same days "
-                                       "(storm_context.py --pct-tif).")
-            add(lyr, g_tot, visible=False)
-            continue
-        if kind in ("rain", "snow"):
-            label = "Rain depth (mm)" if kind == "rain" else "Snow-water (mm)"
-            lyr.setName(f"{label}: {p.stem}")
-            precip_renderer(lyr, nice_breaks(max(raster_minmax(p)[1], 1)),
-                            PRECIP_COLORS if kind == "rain" else SNOW_COLORS)
-            tag(lyr, kind, f"Window-total {'rain' if kind == 'rain' else 'snow-water equivalent'} (mm) from "
-                           "storm_total.py: PRISM precipitation split by PRISM daily mean temperature.")
-            add(lyr, g_tot, visible=False)
-            continue
-        if kind == "volume":
-            lyr.setName(f"Water volume per cell (m³): {p.stem}")
-            vmin, vmax = raster_minmax(p)
-            ramp = QgsStyle.defaultStyle().colorRamp("YlGnBu")
-            fn = QgsColorRampShader(vmin, vmax, ramp,
-                                    Qgis.ShaderInterpolationMethod.Linear, Qgis.ShaderClassificationMethod.Continuous)
-            fn.classifyColorRamp(5, 1)
-            shader = QgsRasterShader()
-            shader.setRasterShaderFunction(fn)
-            lyr.setRenderer(QgsSingleBandPseudoColorRenderer(lyr.dataProvider(), 1, shader))
-            tag(lyr, "storm_total_volume", "Water volume per PRISM cell (m³) = depth × ellipsoidal cell area.")
-        else:
-            lyr.setName(f"Precipitation depth (mm): {p.stem}")
+    def volume_renderer(lyr, vmin, vmax):
+        ramp = QgsStyle.defaultStyle().colorRamp("YlGnBu")
+        fn = QgsColorRampShader(vmin, vmax, ramp, Qgis.ShaderInterpolationMethod.Linear,
+                                Qgis.ShaderClassificationMethod.Continuous)
+        fn.classifyColorRamp(5, 1)
+        shader = QgsRasterShader()
+        shader.setRasterShaderFunction(fn)
+        lyr.setRenderer(QgsSingleBandPseudoColorRenderer(lyr.dataProvider(), 1, shader))
+
+    # One color scale per kind of raster across every window, so a color means the same thing in each storm.
+    all_rasters = [(k, p) for ev in events for k, p in ev["rasters"].items()] + other
+    ranges = {}
+    for k, p in all_rasters:
+        lo, hi = raster_minmax(p)
+        r = ranges.setdefault(k, [lo, hi])
+        r[0], r[1] = min(r[0], lo), max(r[1], hi)
+    depth_paths = [p for k, p in all_rasters if k == "depth"] + list(f["totals"])
+    dranges = [raster_minmax(p) for p in dict.fromkeys(depth_paths)]
+    tbreaks = nice_breaks(max([r[1] for r in dranges], default=1), min([r[0] for r in dranges], default=0))
+    kind_breaks = {k: nice_breaks(max(ranges[k][1], 1)) for k in ("rain", "snow") if k in ranges}
+
+    def window_rel_note(s0, s1):
+        d = [x for x in days if s0 <= x <= s1 and rel.get(x)]
+        return ("PRISM releases: " + ", ".join(f"{day_label(x)} r{rel[x]}" for x in d)) if d else ""
+
+    def add_raster(kind, path, group, visible, event_key, when_text, s0, s1):
+        lyr = QgsRasterLayer(str(path), path.stem)
+        note = window_rel_note(s0, s1) if s0 else ""
+        if kind == "depth":
+            lyr.setName(f"Precipitation depth (mm), {when_text}")
             precip_renderer(lyr, tbreaks)
-            tag(lyr, "storm_total_window", "Storm-total depth for a window from storm_total.py --tif (mm).")
-        add(lyr, g_tot, visible=False)
+            tag(lyr, "storm_total_depth", f"PRISM storm-total precipitation (mm), PRISM days {s0} to {s1} "
+                                          f"(each ends 12:00 UTC). {note}", event_key)
+        elif kind == "percent":
+            lyr.setName(f"Percent of 1991–2020 normal, {when_text}")
+            percent_renderer(lyr, ranges["percent"][1])
+            tag(lyr, "percent_normal", "Storm total as a percent of PRISM's 1991-2020 normal for the same days "
+                                       "(storm_context.py --pct-tif).", event_key)
+        elif kind in ("rain", "snow"):
+            lyr.setName(f"{'Rain depth' if kind == 'rain' else 'Snow-water'} (mm), {when_text}")
+            precip_renderer(lyr, kind_breaks[kind], PRECIP_COLORS if kind == "rain" else SNOW_COLORS)
+            tag(lyr, kind, f"Window-total {'rain' if kind == 'rain' else 'snow-water equivalent'} (mm) from "
+                           "storm_total.py: PRISM precipitation split by PRISM daily mean temperature.", event_key)
+        else:  # volume
+            lyr.setName(f"Water volume per cell (m³), {when_text}")
+            volume_renderer(lyr, *ranges["volume"])
+            tag(lyr, "storm_total_volume", "Water volume per PRISM cell (m³) = depth × ellipsoidal cell area.",
+                event_key)
+        add(lyr, group, visible)
+        return lyr
 
-    dailies = [(d, QgsRasterLayer(str(f["days"][d]), f["days"][d].stem)) for d in days]
-    dbreaks = nice_breaks(max([raster_minmax(l.source())[1] for _, l in dailies] + [1]))
-    for d, lyr in reversed(dailies):  # latest day on top
-        lyr.setName(f"Precipitation (mm), PRISM day {day_label(d)}")
-        precip_renderer(lyr, dbreaks)
-        tp = lyr.temporalProperties()
-        tp.setMode(Qgis.RasterTemporalMode.FixedTemporalRange)
-        t0 = QDateTime(QDate(d.year, d.month, d.day).addDays(-1), QTime(12, 0), Qt.TimeSpec.UTC)
-        t1 = QDateTime(QDate(d.year, d.month, d.day), QTime(12, 0), Qt.TimeSpec.UTC)
-        tp.setFixedTemporalRange(QgsDateTimeRange(t0, t1, True, False))
-        tp.setIsActive(True)
-        tag(lyr, "daily_precip", f"PRISM daily precipitation (mm) for the 24 h ending 12:00 UTC on {d}. "
-                                 + (f"PRISM release {rel[d]}." if rel.get(d) else ""))
-        add(lyr, g_day, visible=True)
-    g_day.setItemVisibilityChecked(False)
-
-    # ---- validation layers ----
-    if f["gpkg"].exists():
-        def vec(layer, label, role, abstract, visible):
-            lyr = QgsVectorLayer(f"{f['gpkg']}|layername={layer}", label, "ogr")
-            if not lyr.isValid():
-                return None
-            qml = STYLE_DIR / f"{layer}.qml"
-            if qml.exists():
-                msg, ok = lyr.loadNamedStyle(str(qml))
-                if not ok:
-                    print(f"Warning: style {qml.name} did not load: {msg}")
-            lyr.setName(label)
-            tag(lyr, role, abstract)
-            add(lyr, g_val, visible)
-            return lyr
-
-        vec("gauges", "USGS gauges: runoff ratio, by regulation", "gauges",
-            "USGS stream gauges in the study basin; status, regulation class and runoff ratio range "
-            "from validate_runoff.py.", True)
-        st = vec("stations", "Rain gauges: PRISM − gauge, storm total (mm)", "stations",
-                 "PRISM minus gauge storm totals from validate_stations.py. Circles: PRISM inputs; "
-                 "squares: independent gauges.", True)
-        sd = vec("station_days", "Rain gauges: PRISM − gauge, daily (Temporal)", "station_days",
-                 "PRISM minus gauge per PRISM day; animate with the Temporal Controller.", False)
-        vec("dams", "Dams (NID), size = storage", "dams", "National Inventory of Dams in the study basin.", False)
-        vec("gauge_basins", "Gauge drainage basins", "gauge_basins",
-            "USGS NLDI drainage basins of compared gauges, colored by regulation.", False)
-        sn = vec("snotel", "SNOTEL: PRISM − observed snow share (points)", "snotel",
-                 "Snow as a share of precipitation over the window from validate_snow.py: PRISM split minus "
-                 "SNOTEL SWE gain (percentage points). Size = SWE gain. Gray: skipped.", False)
-
-        def restyle_stations(lyr, size_max):
-            """Rule-based renderer like styles/stations.qml, with classes set from this run's data."""
-            diffs = [ft["diff_mm"] for ft in lyr.getFeatures() if ft["in_stats"] and is_number(ft["diff_mm"])]
-            obs = [ft["obs_mm"] for ft in lyr.getFeatures() if ft["in_stats"] and is_number(ft["obs_mm"])]
-            edges = diff_breaks(diffs)
-            top_obs = nice_round(max(obs)) if obs else size_max
-            root_rule = QgsRuleBasedRenderer.Rule(None)
-            bounds = [None] + edges + [None]
-            for i, color in enumerate(DIFF_COLORS):
-                lo, hi = bounds[i], bounds[i + 1]
-                conds = ['"in_stats"'] + ([f'"diff_mm" >= {lo}'] if lo is not None else []) \
-                    + ([f'"diff_mm" < {hi}'] if hi is not None else [])
-                label = (f"< {hi:g}" if lo is None else f">= {lo:g}" if hi is None else f"{lo:g} to {hi:g}") + " mm"
-                sym = QgsMarkerSymbol.createSimple({"name": "circle", "color": color, "outline_color": "40,40,40",
-                                                    "outline_width": "0.3", "size": "3"})
-                sl = sym.symbolLayer(0)
-                sl.setDataDefinedProperty(QgsSymbolLayer.Property.Name, QgsProperty.fromExpression(
-                    "CASE WHEN \"in_sample\" THEN 'circle' ELSE 'square' END"))
-                sl.setDataDefinedProperty(QgsSymbolLayer.Property.Size, QgsProperty.fromExpression(
-                    f'scale_linear(coalesce("obs_mm", 0), 0, {top_obs}, 2.2, 6)'))
-                root_rule.appendChild(QgsRuleBasedRenderer.Rule(sym, 0, 0, " AND ".join(conds), label))
-            gray = QgsMarkerSymbol.createSimple({"name": "circle", "color": "0,0,0,0", "outline_color": "130,130,130",
-                                                 "outline_width": "0.3", "size": "1.8"})
-            root_rule.appendChild(QgsRuleBasedRenderer.Rule(gray, 0, 0, 'NOT "in_stats"',
-                                                            "Not compared (missing data or day mismatch)"))
-            lyr.setRenderer(QgsRuleBasedRenderer(root_rule))
-
-        def restyle_snotel(lyr):
-            """Diverging colors on PRISM-minus-observed snow share: brown = PRISM less snow, teal = more.
-            Stations without both shares (skipped, or no tmean for the PRISM split) are gray."""
-            fields = lyr.fields().names()
-            need = {"prism_snow_pct", "observed_snow_pct", "swe_gain_mm"}
-            diffs = ([ft["prism_snow_pct"] - ft["observed_snow_pct"] for ft in lyr.getFeatures()
-                      if is_number(ft["prism_snow_pct"]) and is_number(ft["observed_snow_pct"])]
-                     if need <= set(fields) else [])
-            gains = [ft["swe_gain_mm"] for ft in lyr.getFeatures() if is_number(ft["swe_gain_mm"])] \
-                if "swe_gain_mm" in fields else []
-            top = nice_round(max(gains)) if gains else 100
-            edges = [max(-100, min(100, e)) for e in diff_breaks(diffs)]  # shares differ by at most 100 points
-            expr = '("prism_snow_pct" - "observed_snow_pct")'
-            root_rule = QgsRuleBasedRenderer.Rule(None)
-            bounds = [None] + edges + [None]
-            for i, color in enumerate(DIFF_COLORS if diffs else []):
-                lo, hi = bounds[i], bounds[i + 1]
-                conds = [f"{expr} IS NOT NULL"] + ([f"{expr} >= {lo}"] if lo is not None else []) \
-                    + ([f"{expr} < {hi}"] if hi is not None else [])
-                label = (f"< {hi:g}" if lo is None else f">= {lo:g}" if hi is None else f"{lo:g} to {hi:g}") + " points"
-                sym = QgsMarkerSymbol.createSimple({"name": "triangle", "color": color, "outline_color": "40,40,40",
-                                                    "outline_width": "0.3", "size": "3"})
-                sym.symbolLayer(0).setDataDefinedProperty(QgsSymbolLayer.Property.Size, QgsProperty.fromExpression(
-                    f'scale_linear(coalesce("swe_gain_mm", 0), 0, {top}, 2.5, 6)'))
-                root_rule.appendChild(QgsRuleBasedRenderer.Rule(sym, 0, 0, " AND ".join(conds), label))
-            gray = QgsMarkerSymbol.createSimple({"name": "triangle", "color": "0,0,0,0", "outline_color": "130,130,130",
-                                                 "outline_width": "0.3", "size": "2"})
-            gray_rule = QgsRuleBasedRenderer.Rule(gray, 0, 0, "", "Skipped, or no PRISM split (no tmean)")
-            gray_rule.setIsElse(True)
-            root_rule.appendChild(gray_rule)
-            lyr.setRenderer(QgsRuleBasedRenderer(root_rule))
-
-        if sn is not None:
-            restyle_snotel(sn)
-        if st is not None:
-            restyle_stations(st, 150)
-        if sd is not None:
-            restyle_stations(sd, 50)
-
-    # ---- subbasin totals (subbasin_totals.py) ----
+    # ---- vector styling helpers ----
     def text_format(rgb, size, bold=False, box=False):
         fmt = QgsTextFormat()
         font = QFont("Arial")
@@ -624,77 +645,240 @@ def _build_project(a):
         lyr.setLabeling(QgsVectorLayerSimpleLabeling(pal))
         lyr.setLabelsEnabled(True)
 
-    totals_lyr = None
-    if f["totals_gpkg"].exists():
-        sub = QgsVectorLayer(f"{f['totals_gpkg']}|layername=subbasins", "subbasins", "ogr")
-        totals_lyr = QgsVectorLayer(f"{f['totals_gpkg']}|layername=basin_total", "basin_total", "ogr")
-        if sub.isValid() and sub.featureCount():
-            feats = list(sub.getFeatures())
-            level = feats[0]["level"]
-            depths = [ft["mean_mm"] for ft in feats if is_number(ft["mean_mm"])] or [0.0]
-            bounds = nice_breaks(max(depths), min(depths))
-            ranges, lo = [], min(0.0, min(depths))
-            for i, hi in enumerate(bounds):
-                sym = QgsFillSymbol.createSimple({"color": PRECIP_COLORS[min(i, len(PRECIP_COLORS) - 1)],
-                                                  "outline_color": "120,120,120", "outline_width": "0.2"})
-                ranges.append(QgsRendererRange(lo, hi, sym, f"{lo:g}–{hi:g} mm"))
-                lo = hi
-            sub.setRenderer(QgsGraduatedSymbolRenderer("mean_mm", ranges))
-            label(sub, "CASE WHEN \"rank\" <= 12 THEN \"name\" || '\\n' || format_number(\"volume_acre_ft\", 0) "
-                       "|| ' acre-ft (' || format_number(\"share_pct\", 1) || '%)' END", (20, 40, 90), 8)
-            sub.setMapTipTemplate(
-                "<b>[% \"name\" %]</b> ([% \"level\" %] [% \"huc\" %])<br>"
-                "Mean depth [% format_number(\"mean_mm\", 1) %] mm (max [% format_number(\"max_mm\", 1) %] mm)<br>"
-                "Volume [% format_number(\"volume_acre_ft\", 0) %] acre-ft = [% format_number(\"volume_m3\", 0) %] m³<br>"
-                "[% format_number(\"share_pct\", 2) %]% of the basin total; rank [% \"rank\" %]<br>"
-                "Area with PRISM data [% format_number(\"area_km2\", 1) %] km² "
-                "([% format_number(\"coverage_pct\", 1) %]% coverage)")
-            sub.setName(f"Precipitation by subbasin ({level}): depth (color), volume (labels)")
-            tag(sub, "subbasin_totals", f"Mean storm precipitation depth (fill) and water volume (labels, top 12 "
-                                        f"by volume) for each {level} in the basin, from subbasin_totals.py.")
-            add(sub, g_tot, visible=False)
+    def restyle_stations(lyr, size_max):
+        """Rule-based renderer like styles/stations.qml, with classes set from this run's data."""
+        diffs = [ft["diff_mm"] for ft in lyr.getFeatures() if ft["in_stats"] and is_number(ft["diff_mm"])]
+        obs = [ft["obs_mm"] for ft in lyr.getFeatures() if ft["in_stats"] and is_number(ft["obs_mm"])]
+        edges = diff_breaks(diffs)
+        top_obs = nice_round(max(obs)) if obs else size_max
+        root_rule = QgsRuleBasedRenderer.Rule(None)
+        bounds = [None] + edges + [None]
+        for i, color in enumerate(DIFF_COLORS):
+            lo, hi = bounds[i], bounds[i + 1]
+            conds = ['"in_stats"'] + ([f'"diff_mm" >= {lo}'] if lo is not None else []) \
+                + ([f'"diff_mm" < {hi}'] if hi is not None else [])
+            text = (f"< {hi:g}" if lo is None else f">= {lo:g}" if hi is None else f"{lo:g} to {hi:g}") + " mm"
+            sym = QgsMarkerSymbol.createSimple({"name": "circle", "color": color, "outline_color": "40,40,40",
+                                                "outline_width": "0.3", "size": "3"})
+            sl = sym.symbolLayer(0)
+            sl.setDataDefinedProperty(QgsSymbolLayer.Property.Name, QgsProperty.fromExpression(
+                "CASE WHEN \"in_sample\" THEN 'circle' ELSE 'square' END"))
+            sl.setDataDefinedProperty(QgsSymbolLayer.Property.Size, QgsProperty.fromExpression(
+                f'scale_linear(coalesce("obs_mm", 0), 0, {top_obs}, 2.2, 6)'))
+            root_rule.appendChild(QgsRuleBasedRenderer.Rule(sym, 0, 0, " AND ".join(conds), text))
+        gray = QgsMarkerSymbol.createSimple({"name": "circle", "color": "0,0,0,0", "outline_color": "130,130,130",
+                                             "outline_width": "0.3", "size": "1.8"})
+        root_rule.appendChild(QgsRuleBasedRenderer.Rule(gray, 0, 0, 'NOT "in_stats"',
+                                                        "Not compared (missing data or day mismatch)"))
+        lyr.setRenderer(QgsRuleBasedRenderer(root_rule))
 
-    # ---- boundary and basemap ----
-    if totals_lyr is not None and totals_lyr.isValid() and totals_lyr.featureCount():
-        basin_lyr = totals_lyr  # same polygon, with the storm totals as attributes
+    def restyle_snotel(lyr):
+        """Diverging colors on PRISM-minus-observed snow share: brown = PRISM less snow, teal = more.
+        Stations without both shares (skipped, or no tmean for the PRISM split) are gray."""
+        fields = lyr.fields().names()
+        need = {"prism_snow_pct", "observed_snow_pct", "swe_gain_mm"}
+        diffs = ([ft["prism_snow_pct"] - ft["observed_snow_pct"] for ft in lyr.getFeatures()
+                  if is_number(ft["prism_snow_pct"]) and is_number(ft["observed_snow_pct"])]
+                 if need <= set(fields) else [])
+        gains = [ft["swe_gain_mm"] for ft in lyr.getFeatures() if is_number(ft["swe_gain_mm"])] \
+            if "swe_gain_mm" in fields else []
+        top_gain = nice_round(max(gains)) if gains else 100
+        edges = [max(-100, min(100, e)) for e in diff_breaks(diffs)]  # shares differ by at most 100 points
+        expr = '("prism_snow_pct" - "observed_snow_pct")'
+        root_rule = QgsRuleBasedRenderer.Rule(None)
+        bounds = [None] + edges + [None]
+        for i, color in enumerate(DIFF_COLORS if diffs else []):
+            lo, hi = bounds[i], bounds[i + 1]
+            conds = [f"{expr} IS NOT NULL"] + ([f"{expr} >= {lo}"] if lo is not None else []) \
+                + ([f"{expr} < {hi}"] if hi is not None else [])
+            text = (f"< {hi:g}" if lo is None else f">= {lo:g}" if hi is None else f"{lo:g} to {hi:g}") + " points"
+            sym = QgsMarkerSymbol.createSimple({"name": "triangle", "color": color, "outline_color": "40,40,40",
+                                                "outline_width": "0.3", "size": "3"})
+            sym.symbolLayer(0).setDataDefinedProperty(QgsSymbolLayer.Property.Size, QgsProperty.fromExpression(
+                f'scale_linear(coalesce("swe_gain_mm", 0), 0, {top_gain}, 2.5, 6)'))
+            root_rule.appendChild(QgsRuleBasedRenderer.Rule(sym, 0, 0, " AND ".join(conds), text))
+        gray = QgsMarkerSymbol.createSimple({"name": "triangle", "color": "0,0,0,0", "outline_color": "130,130,130",
+                                             "outline_width": "0.3", "size": "2"})
+        gray_rule = QgsRuleBasedRenderer.Rule(gray, 0, 0, "", "Skipped, or no PRISM split (no tmean)")
+        gray_rule.setIsElse(True)
+        root_rule.appendChild(gray_rule)
+        lyr.setRenderer(QgsRuleBasedRenderer(root_rule))
+
+    VAL = {"gauges": ("USGS gauges: runoff ratio, by regulation", True,
+                      "USGS stream gauges in the study basin; status, regulation class and runoff ratio range "
+                      "from validate_runoff.py."),
+           "stations": ("Rain gauges: PRISM − gauge, storm total (mm)", True,
+                        "PRISM minus gauge storm totals from validate_stations.py. Circles: PRISM inputs; "
+                        "squares: independent gauges."),
+           "station_days": ("Rain gauges: PRISM − gauge, daily (Temporal)", False,
+                            "PRISM minus gauge per PRISM day; animate with the Temporal Controller."),
+           "gauge_basins": ("Gauge drainage basins", False,
+                            "USGS NLDI drainage basins of compared gauges, colored by regulation."),
+           "snotel": ("SNOTEL: PRISM − observed snow share (points)", False,
+                      "Snow as a share of precipitation over the window from validate_snow.py: PRISM split minus "
+                      "SNOTEL SWE gain (percentage points). Size = SWE gain. Gray: skipped.")}
+
+    def vec(source, base, label_text, role, abstract, group, visible, event_key):
+        gpkg, table = source
+        lyr = QgsVectorLayer(f"{gpkg}|layername={table}", label_text, "ogr")
+        if not lyr.isValid():
+            return None
+        qml = STYLE_DIR / f"{base}.qml"
+        if qml.exists():
+            msg, ok = lyr.loadNamedStyle(str(qml))
+            if not ok:
+                print(f"Warning: style {qml.name} did not load: {msg}")
+        lyr.setName(label_text)
+        tag(lyr, role, abstract, event_key)
+        add(lyr, group, visible)
+        return lyr
+
+    # Subbasin depth classes shared across windows, like the rasters.
+    sub_depths = []
+    for ev in events:
+        if "subbasins" in ev["layers"]:
+            gpkg, table = ev["layers"]["subbasins"]
+            sl = QgsVectorLayer(f"{gpkg}|layername={table}", "s", "ogr")
+            sub_depths += [ft["mean_mm"] for ft in sl.getFeatures() if is_number(ft["mean_mm"])] if sl.isValid() else []
+            del sl
+    sub_bounds = nice_breaks(max(sub_depths or [1]), min(sub_depths or [0]))
+
+    def add_subbasins(source, group, event_key, when_text):
+        gpkg, table = source
+        sub = QgsVectorLayer(f"{gpkg}|layername={table}", "subbasins", "ogr")
+        if not (sub.isValid() and sub.featureCount()):
+            return
+        first = next(sub.getFeatures())
+        level = first["level"]
+        del first
+        sub_ranges, lo = [], min(0.0, min(sub_depths or [0.0]))
+        for i, hi in enumerate(sub_bounds):
+            sym = QgsFillSymbol.createSimple({"color": PRECIP_COLORS[min(i, len(PRECIP_COLORS) - 1)],
+                                              "outline_color": "120,120,120", "outline_width": "0.2"})
+            sub_ranges.append(QgsRendererRange(lo, hi, sym, f"{lo:g}–{hi:g} mm"))
+            lo = hi
+        sub.setRenderer(QgsGraduatedSymbolRenderer("mean_mm", sub_ranges))
+        label(sub, "CASE WHEN \"rank\" <= 12 THEN \"name\" || '\\n' || format_number(\"volume_acre_ft\", 0) "
+                   "|| ' acre-ft (' || format_number(\"share_pct\", 1) || '%)' END", (20, 40, 90), 8)
+        sub.setMapTipTemplate(
+            "<b>[% \"name\" %]</b> ([% \"level\" %] [% \"huc\" %])<br>"
+            "Mean depth [% format_number(\"mean_mm\", 1) %] mm (max [% format_number(\"max_mm\", 1) %] mm)<br>"
+            "Volume [% format_number(\"volume_acre_ft\", 0) %] acre-ft = [% format_number(\"volume_m3\", 0) %] m³<br>"
+            "[% format_number(\"share_pct\", 2) %]% of the basin total; rank [% \"rank\" %]<br>"
+            "Area with PRISM data [% format_number(\"area_km2\", 1) %] km² "
+            "([% format_number(\"coverage_pct\", 1) %]% coverage)")
+        sub.setName(f"Precipitation by subbasin ({level}), {when_text}: depth (color), volume (labels)")
+        tag(sub, "subbasin_totals", f"Mean storm precipitation depth (fill) and water volume (labels, top 12 "
+                                    f"by volume) for each {level} in the basin, from subbasin_totals.py.", event_key)
+        add(sub, group, visible=False)
+
+    def add_basin_label(source, group, visible, event_key):
+        """The basin polygon with this window's totals as attributes, labeled with volume and range."""
+        gpkg, table = source
+        lyr = QgsVectorLayer(f"{gpkg}|layername={table}", "basin_total", "ogr")
+        if not (lyr.isValid() and lyr.featureCount()) or "volume_km3" not in lyr.fields().names():
+            return None
+        t = next(lyr.getFeatures())
+        vr, text = None, f"Basin total: {basin_name}"
+        if is_number(t["volume_km3"]) and is_number(t["volume_acre_ft"]) and is_number(t["mean_mm"]):
+            af = t["volume_acre_ft"]
+            af_text = f"{af / 1e6:.2f} million acre-ft" if af >= 1e6 else f"{af:,.0f} acre-ft"
+            res = str(t["res"]) if "res" in lyr.fields().names() and t["res"] else None
+            vr = volume_range_km3(out, t["prism_start"], t["prism_end"], res, t["volume_m3"])
+            range_text = f" (range {vr[0]:.2f}–{vr[1]:.2f})" if vr else ""
+            text = f"Basin total: {t['volume_km3']:.2f} km³{range_text} ({af_text}), mean {t['mean_mm']:.0f} mm"
+        del t
+        lyr.setName(text)
+        outline = QgsFillSymbol.createSimple({"color": "0,0,0,0", "outline_color": "230,60,180", "outline_width": "0.8"})
+        lyr.setRenderer(QgsSingleSymbolRenderer(outline))
+        label(lyr,
+              "\"name\" || ': ' || format_number(\"volume_km3\", 2) || ' km³ = ' || "
+              "CASE WHEN \"volume_acre_ft\" >= 1000000 THEN format_number(\"volume_acre_ft\" / 1000000, 2) "
+              "|| ' million acre-ft' ELSE format_number(\"volume_acre_ft\", 0) || ' acre-ft' END || '\\n' || "
+              "'mean ' || format_number(\"mean_mm\", 0) || ' mm, max ' || format_number(\"max_mm\", 0) "
+              "|| ' mm, PRISM days ' || \"prism_start\" || ' to ' || \"prism_end\" || "
+              "CASE WHEN \"coverage_pct\" < 99.5 THEN '\\n(' || format_number(100 - \"coverage_pct\", 1) "
+              "|| '% of the basin has no PRISM data)' ELSE '' END"
+              + (f" || '\\nrange {vr[0]:.2f}–{vr[1]:.2f} km³ (uncertainty components: storm_total.py)'" if vr else ""),
+              (150, 20, 110), 11, bold=True, box=True, priority=10, outside_top_left=True)
+        lyr.setMapTipTemplate(
+            "<b>[% \"name\" %]</b><br>Storm total: [% format_number(\"volume_km3\", 3) %] km³ = "
+            "[% format_number(\"volume_acre_ft\", 0) %] acre-ft<br>Mean [% \"mean_mm\" %] mm, max "
+            "[% \"max_mm\" %] mm over [% format_number(\"area_km2\", 0) %] km² with PRISM data<br>"
+            "PRISM days [% \"prism_start\" %] to [% \"prism_end\" %]")
+        tag(lyr, "basin_label", "The study basin with this window's storm totals (subbasin_totals.py) and volume "
+                                "range (storm_total.py) as its label.", event_key)
+        add(lyr, group, visible)
+        return lyr
+
+    # ---- one group per storm window ----
+    for ev, trio in zip(events, ev_groups):
+        g_ev, g_tot, g_val = trio
+        key, when_text = ev["span"], window_label(ev["start"], ev["end"])
+        if "basin_total" in ev["layers"]:
+            add_basin_label(ev["layers"]["basin_total"], g_tot, True, key)
+        for kind in ("depth", "volume", "rain", "snow", "percent"):
+            if kind in ev["rasters"]:
+                add_raster(kind, ev["rasters"][kind], g_tot, kind == "depth", key, when_text, ev["start"], ev["end"])
+        if "subbasins" in ev["layers"]:
+            add_subbasins(ev["layers"]["subbasins"], g_tot, key, when_text)
+        layers = {}
+        for layer, (label_text, visible, abstract) in VAL.items():
+            if layer in ev["layers"]:
+                layers[layer] = vec(ev["layers"][layer], layer, label_text, layer, abstract, g_val, visible, key)
+        if layers.get("snotel") is not None:
+            restyle_snotel(layers["snotel"])
+        if layers.get("stations") is not None:
+            restyle_stations(layers["stations"], 150)
+        if layers.get("station_days") is not None:
+            restyle_stations(layers["station_days"], 50)
+        del layers
+        for i, g in ((1, g_tot), (2, g_val)):
+            if not g.children():  # forget it before removing it: the node is deleted with it
+                trio[i] = None
+                g_ev.removeChildNode(g)
+        del g_ev, g_tot, g_val, g
+
+    for kind, p in other:  # rasters for windows that aren't events (a download window, an earlier one-off total)
+        w = stem_window(p.stem)
+        when_text = window_label(*w) if w else p.stem
+        add_raster(kind, p, g_other, False, None, when_text, *(w or (None, None)))
+    if g_other is not None:
+        g_other.setItemVisibilityChecked(False)
+        g_other.setExpanded(False)
+    for p in f["other_tifs"]:
+        if tif_kind(p.stem) is None:
+            print(f"Not mapped (name doesn't say what it holds): {p.name}")
+
+    dailies = [(d, QgsRasterLayer(str(f["days"][d]), f["days"][d].stem)) for d in days]
+    dbreaks = nice_breaks(max([raster_minmax(l.source())[1] for _, l in dailies] + [1]))
+    for d, lyr in reversed(dailies):  # latest day on top
+        lyr.setName(f"Precipitation (mm), PRISM day {day_label(d)}")
+        precip_renderer(lyr, dbreaks)
+        tp = lyr.temporalProperties()
+        tp.setMode(Qgis.RasterTemporalMode.FixedTemporalRange)
+        t0 = QDateTime(QDate(d.year, d.month, d.day).addDays(-1), QTime(12, 0), Qt.TimeSpec.UTC)
+        t1 = QDateTime(QDate(d.year, d.month, d.day), QTime(12, 0), Qt.TimeSpec.UTC)
+        tp.setFixedTemporalRange(QgsDateTimeRange(t0, t1, True, False))
+        tp.setIsActive(True)
+        tag(lyr, "daily_precip", f"PRISM daily precipitation (mm) for the 24 h ending 12:00 UTC on {d}. "
+                                 + (f"PRISM release {rel[d]}." if rel.get(d) else ""))
+        add(lyr, g_day, visible=True)
+    del dailies
+    g_day.setItemVisibilityChecked(False)
+    g_day.setExpanded(False)
+
+    # ---- boundary, dams and basemap (shared by every window) ----
     if basin_lyr is not None:
         basin_lyr.setName(f"Study basin: {basin_name}" + (f" (HUC {huc})" if huc else ""))
-        if "volume_km3" in basin_lyr.fields().names():
-            t = next(basin_lyr.getFeatures())
-            vr = None
-            if is_number(t["volume_km3"]) and is_number(t["volume_acre_ft"]) and is_number(t["mean_mm"]):
-                af = t["volume_acre_ft"]
-                af_text = f"{af / 1e6:.2f} million acre-ft" if af >= 1e6 else f"{af:,.0f} acre-ft"
-                res = str(t["res"]) if "res" in basin_lyr.fields().names() and t["res"] else None
-                vr = volume_range_km3(out, t["prism_start"], t["prism_end"], res, t["volume_m3"])
-                range_text = f" (range {vr[0]:.2f}–{vr[1]:.2f})" if vr else ""
-                basin_lyr.setName(f"{basin_lyr.name()}: {t['volume_km3']:.2f} km³{range_text} ({af_text}), "
-                                  f"mean {t['mean_mm']:.0f} mm")
-            del t
         outline = QgsFillSymbol.createSimple({"color": "0,0,0,0", "outline_color": "230,60,180",
                                               "outline_width": "0.8"})
         basin_lyr.setRenderer(QgsSingleSymbolRenderer(outline))
-        if "volume_km3" in basin_lyr.fields().names():
-            label(basin_lyr,
-                  "\"name\" || ': ' || format_number(\"volume_km3\", 2) || ' km³ = ' || "
-                  "CASE WHEN \"volume_acre_ft\" >= 1000000 THEN format_number(\"volume_acre_ft\" / 1000000, 2) "
-                  "|| ' million acre-ft' ELSE format_number(\"volume_acre_ft\", 0) || ' acre-ft' END || '\\n' || "
-                  "'mean ' || format_number(\"mean_mm\", 0) || ' mm, max ' || format_number(\"max_mm\", 0) "
-                  "|| ' mm, PRISM days ' || \"prism_start\" || ' to ' || \"prism_end\" || "
-                  "CASE WHEN \"coverage_pct\" < 99.5 THEN '\\n(' || format_number(100 - \"coverage_pct\", 1) "
-                  "|| '% of the basin has no PRISM data)' ELSE '' END"
-                  + (f" || '\\nrange {vr[0]:.2f}–{vr[1]:.2f} km³ (uncertainty components: storm_total.py)'" if vr else ""),
-                  (150, 20, 110), 11, bold=True, box=True,
-                  priority=10, outside_top_left=True)
-            basin_lyr.setMapTipTemplate(
-                "<b>[% \"name\" %]</b><br>Storm total: [% format_number(\"volume_km3\", 3) %] km³ = "
-                "[% format_number(\"volume_acre_ft\", 0) %] acre-ft<br>Mean [% \"mean_mm\" %] mm, max "
-                "[% \"max_mm\" %] mm over [% format_number(\"area_km2\", 0) %] km² with PRISM data<br>"
-                "PRISM days [% \"prism_start\" %] to [% \"prism_end\" %]")
-        tag(basin_lyr, "study_basin", "USGS Watershed Boundary Dataset polygon used to clip PRISM"
-            + ("; attributes and label carry the storm totals from subbasin_totals.py."
-               if "volume_km3" in basin_lyr.fields().names() else "."))
+        tag(basin_lyr, "study_basin", "USGS Watershed Boundary Dataset polygon (or your boundary) used to clip PRISM.")
         add(basin_lyr, g_bnd, True)
+    if "dams" in gpkg_layers(f["gpkg"]):
+        vec((f["gpkg"], "dams"), "dams", "Dams (NID), size = storage", "dams",
+            "National Inventory of Dams in the study basin.", g_bnd, False, None)
     osm = QgsRasterLayer(OSM_URL, "OpenStreetMap", "wms")
     if osm.isValid():
         tag(osm, "basemap", "OpenStreetMap tiles © OpenStreetMap contributors.")
@@ -719,35 +903,47 @@ def _build_project(a):
 
     model = QgsLayerTreeModel(root)
     themes = proj.mapThemeCollection()
+    all_groups = [g for trio in ev_groups for g in trio if g is not None] + shared_groups
     default = {lyr.id(): root.findLayer(lyr.id()).itemVisibilityChecked() for lyr in managed
                if root.findLayer(lyr.id())}
-    group_default = {g: g.itemVisibilityChecked() for g in (g_val, g_tot, g_day, g_bnd, g_base)}
+    group_default = {g: g.itemVisibilityChecked() for g in all_groups}
 
-    def theme(theme_name, roles, groups_on):
+    def theme(theme_name, roles, event_key, groups_on):
+        """Show the layers with these roles: the event's own (event_key) and shared ones (no event)."""
         for lyr in managed:
             node = root.findLayer(lyr.id())
             if node:
-                node.setItemVisibilityChecked(lyr.customProperty("prism_storm/role") in roles)
-        for g in (g_val, g_tot, g_day, g_bnd, g_base):
+                ev_of = lyr.customProperty("prism_storm/event") or None
+                node.setItemVisibilityChecked(lyr.customProperty("prism_storm/role") in roles
+                                              and ev_of in (None, event_key))
+        for trio, ev in zip(ev_groups, events):
+            for g in trio:
+                if g is not None:
+                    g.setItemVisibilityChecked(ev["span"] == event_key)
+        for g in shared_groups:
             g.setItemVisibilityChecked(g in groups_on)
         themes.insert(theme_name, QgsMapThemeCollection.createThemeFromCurrentState(root, model))
 
-    theme("Storm total", {"storm_total_depth", "study_basin", "basemap"}, {g_tot, g_bnd, g_base})
-    theme("Validation", {"gauges", "stations", "storm_total_depth", "study_basin", "basemap"},
-          {g_val, g_tot, g_bnd, g_base})
-    theme("Rivers and dams", {"gauges", "gauge_basins", "dams", "study_basin", "basemap"},
-          {g_val, g_bnd, g_base})
-    theme("Volume by subbasin", {"subbasin_totals", "study_basin", "basemap"}, {g_tot, g_bnd, g_base})
-    theme("Rain and snow", {"rain", "snow", "snotel", "study_basin", "basemap"}, {g_tot, g_val, g_bnd, g_base})
-    theme("Percent of normal", {"percent_normal", "study_basin", "basemap"}, {g_tot, g_bnd, g_base})
-    theme("Daily animation (Temporal Controller)", {"daily_precip", "station_days", "study_basin", "basemap"},
-          {g_day, g_val, g_bnd, g_base})
+    THEMES = [("Storm total", {"storm_total_depth", "basin_label", "study_basin", "basemap"}, {g_bnd, g_base}),
+              ("Validation", {"gauges", "stations", "storm_total_depth", "study_basin", "basemap"}, {g_bnd, g_base}),
+              ("Rivers and dams", {"gauges", "gauge_basins", "dams", "study_basin", "basemap"}, {g_bnd, g_base}),
+              ("Volume by subbasin", {"subbasin_totals", "basin_label", "study_basin", "basemap"}, {g_bnd, g_base}),
+              ("Rain and snow", {"rain", "snow", "snotel", "study_basin", "basemap"}, {g_bnd, g_base}),
+              ("Percent of normal", {"percent_normal", "study_basin", "basemap"}, {g_bnd, g_base}),
+              ("Daily animation (Temporal Controller)", {"daily_precip", "station_days", "study_basin", "basemap"},
+               {g_day, g_bnd, g_base})]
+    for ev in events:
+        for theme_name, roles, groups_on in THEMES:
+            theme(f"{ev['name'] or ev['label']}: {theme_name}" if multi else theme_name, roles, ev["span"], groups_on)
     for lyr in managed:
         node = root.findLayer(lyr.id())
         if node and lyr.id() in default:
             node.setItemVisibilityChecked(default[lyr.id()])
     for g, v in group_default.items():
         g.setItemVisibilityChecked(v)
+    if events:
+        print(f"Storm windows: {'; '.join(ev['label'] for ev in events)}"
+              + (f" (first shown; a set of map themes for each)" if multi else ""))
 
     if not proj.write(str(qgz)):
         sys.exit(f"Could not write {qgz}")

@@ -24,14 +24,16 @@ Usage examples:
 import argparse
 import csv
 import re
-import sys
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 import xarray as xr
 
+import config
 import manifest
+import runtime
+from runtime import die
 from storm_total import M3_PER_ACRE_FT, zone_totals
 from validate_stations import load_basin, write_layer
 
@@ -72,13 +74,15 @@ def main():
     ap.add_argument("--digits", type=int, choices=[4, 6, 8, 10, 12, 14, 16], help="subbasin HUC level")
     ap.add_argument("--boundary", help="study basin polygon (default: the wbd_huc*.geojson in --out)")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"])
-    a = ap.parse_args()
+    runtime.add_common_args(ap)
+    a = config.parse_args(ap)
     run = manifest.start_run("subbasin_totals.py", a)
+    runtime.attach(a.out, run, a)
 
     out = Path(a.out)
     nc = out / f"ppt_{a.res}_daily_clip.nc"
     if not nc.exists():
-        sys.exit(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
+        die(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
     basin = load_basin(out, a.boundary)
     wbd = sorted(out.glob("wbd_huc*.geojson"))
     huc = re.search(r"wbd_huc(\d+)", wbd[0].name).group(1) if wbd and not a.boundary else None
@@ -90,10 +94,10 @@ def main():
     bbox = tuple(basin.total_bounds)
     if huc:
         if not a.digits and len(huc) >= 12:
-            sys.exit(f"HUC {huc} has {len(huc)} digits; subbasins need --digits 14 or 16 (mapped only in places).")
+            die(f"HUC {huc} has {len(huc)} digits; subbasins need --digits 14 or 16 (mapped only in places).")
         digits = a.digits or pick_digits(huc, lambda d: wbd_count(d, prefix=huc))
         if digits <= len(huc):
-            sys.exit(f"--digits must be longer than the study basin's HUC ({len(huc)} digits).")
+            die(f"--digits must be longer than the study basin's HUC ({len(huc)} digits).")
         units = wbd_units(digits, prefix=huc)
     else:
         digits = a.digits or 12
@@ -102,7 +106,7 @@ def main():
         units = [u for u in units if gpd.GeoSeries.from_features([u], crs=4269).iloc[0].intersection(poly).area
                  >= 0.5 * gpd.GeoSeries.from_features([u], crs=4269).iloc[0].area]
     if not units:
-        sys.exit(f"No HUC{digits} units found in the study basin.")
+        die(f"No HUC{digits} units found in the study basin.")
     ugdf = gpd.GeoDataFrame.from_features(units, crs=4269)
 
     with xr.open_dataset(nc) as ds:
@@ -123,9 +127,10 @@ def main():
         r.update(prism_start=start, prism_end=end)
 
     gpkg = out / "totals.gpkg"
-    write_layer(gpd.GeoDataFrame([total_row], geometry=[basin.geometry.iloc[0]], crs=4269), gpkg, "basin_total")
-    write_layer(gpd.GeoDataFrame(rows, geometry=list(ugdf.geometry), crs=4269), gpkg, "subbasins")
-    with open(out / "subbasin_totals.csv", "w", newline="") as f:
+    write_layer(gpd.GeoDataFrame([total_row], geometry=[basin.geometry.iloc[0]], crs=4269), gpkg, "basin_total",
+                window=(start, end))
+    write_layer(gpd.GeoDataFrame(rows, geometry=list(ugdf.geometry), crs=4269), gpkg, "subbasins", window=(start, end))
+    with runtime.atomic_open(out / "subbasin_totals.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=rows[0].keys())
         w.writeheader()
         w.writerows(sorted(rows, key=lambda r: r["rank"]))
@@ -152,4 +157,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    runtime.run_main(main)

@@ -21,8 +21,7 @@ Usage examples:
 import argparse
 import calendar
 import datetime as dt
-import json
-import sys
+import shutil
 import time
 import zipfile
 from pathlib import Path
@@ -33,7 +32,10 @@ from rasterio.windows import from_bounds
 import requests
 import xarray as xr
 
+import config
 import manifest
+import runtime
+from runtime import die
 from storm_total import RES_CODES, cube_transform, window_total, write_tif
 
 try:
@@ -74,10 +76,8 @@ def fetch(url, path, session, pause=2.0):
     print(f"  downloading {path.name} ...", flush=True)
     r = session.get(url, timeout=600)
     if r.status_code != 200 or "zip" not in r.headers.get("Content-Type", ""):
-        sys.exit(f"Could not download {url} ({r.status_code}): {r.text[:200].strip()}")
-    part = path.with_name(path.name + ".part")
-    part.write_bytes(r.content)
-    part.replace(path)
+        die(f"Could not download {url} ({r.status_code}): {r.text[:200].strip()}", runtime.EXIT_NETWORK)
+    runtime.write_atomic(path, r.content)
     time.sleep(pause)
     return path
 
@@ -88,14 +88,16 @@ def normal_on_cube(zpath, ds):
         tif = next(n for n in z.namelist() if n.endswith(".tif"))
         dest = zpath.parent.parent / "normals" / zpath.stem
         if not (dest / tif).exists():
-            z.extract(tif, dest)
+            (dest / tif).parent.mkdir(parents=True, exist_ok=True)
+            with runtime.atomic_path(dest / tif) as tmp, z.open(tif) as src, open(tmp, "wb") as dst:
+                shutil.copyfileobj(src, dst)
     t = cube_transform(ds)
     h, w = ds.sizes["lat"], ds.sizes["lon"]
     with rasterio.open(dest / tif) as src:
         win = from_bounds(t.c, t.f + h * t.e, t.c + w * t.a, t.f, src.transform).round_offsets().round_lengths()
         arr = src.read(1, window=win, masked=True, boundless=True).astype("float64").filled(np.nan)
         if arr.shape != (h, w) or abs(src.window_transform(win).c - t.c) > abs(t.a) / 100:
-            sys.exit(f"{tif} is not on the cube's grid; normals must match the cube's resolution.")
+            die(f"{tif} is not on the cube's grid; normals must match the cube's resolution.")
     return arr
 
 
@@ -120,13 +122,15 @@ def main():
     ap.add_argument("--daily-normals", action="store_true",
                     help="sum daily normals for the window instead of prorating monthly ones (larger downloads)")
     ap.add_argument("--pct-tif", help="also write percent of normal per cell to this GeoTIFF")
-    a = ap.parse_args()
+    runtime.add_common_args(ap)
+    a = config.parse_args(ap)
     run = manifest.start_run("storm_context.py", a)
+    runtime.attach(a.out, run, a)
 
     out = Path(a.out)
     nc = out / f"ppt_{a.res}_daily_clip.nc"
     if not nc.exists():
-        sys.exit(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
+        die(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
     zdir = out / "normals_zips"
     zdir.mkdir(exist_ok=True)
     session = requests.Session()
@@ -173,7 +177,7 @@ def main():
               "percent_of_normal": None if pct is None else round(pct, 1), "months": month_rows}
     span = f"{start:%Y%m%d}_{end:%Y%m%d}"
     jpath = out / f"ppt_{a.res}_normals_{span}.json"
-    jpath.write_text(json.dumps(result, indent=2))
+    runtime.write_json(jpath, result)
     print(f"PRISM days {start} to {end}: basin {s_mm:.1f} mm vs a normal of {n_mm:.1f} mm for these days "
           f"({method}): {pct:.0f}% of normal")
     for m in month_rows:
@@ -186,4 +190,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    runtime.run_main(main)

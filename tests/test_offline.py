@@ -386,7 +386,7 @@ def test_tiny_basin_exits_cleanly(tmp_path):
     make_zip(out / "raw_zips", "20261021", 5.0)
     tiny = box(-108.5 + 10.1 / 120, 37.8 - 10.4 / 120, -108.5 + 10.3 / 120, 37.8 - 10.1 / 120)  # misses every center
     res = run_watershed(out, basin_file(tmp_path, tiny), "2026-10-21", "2026-10-21")
-    assert res.returncode == 1 and "covers no PRISM cell center" in res.stderr and "Traceback" not in res.stderr
+    assert res.returncode == 2 and "covers no PRISM cell center" in res.stderr and "Traceback" not in res.stderr
 
 
 def test_summary_names():

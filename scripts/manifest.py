@@ -1,12 +1,17 @@
 """
 Run manifest: how a folder's outputs were made.
 
-<out>/run_manifest.json holds {"runs": [...]}, one entry appended per run of
-prism_watershed.py or storm_total.py, so a folder refreshed over months keeps its
-whole history. Each entry records the command and arguments, start and end time,
-git commit, Python and package versions, the inputs (basin source, per-day PRISM
-URL, zip SHA-256, release and info.txt fields), output files with checksums, and
-the QC results.
+<out>/run_manifest.json holds {"runs": [...]}, one entry appended per run of any script
+that writes to the folder, so a folder refreshed over months keeps its whole history.
+Each entry records the command and arguments, start and end time, status (ok, qc_fail,
+input_error, incomplete, network_error, error, interrupted; see runtime.py), the log file,
+git commit, Python and package versions, the inputs (basin source, per-day PRISM URL, zip
+SHA-256, release and info.txt fields), output files with checksums, and the QC results.
+Entries with a window also record the PRISM releases of those days in the folder's cubes
+(input_releases), so pipeline.py status can tell which outputs predate a revision.
+
+The file is rewritten through a temporary file and a rename, so an interrupted write
+never loses the history; an unreadable manifest is set aside, never written over.
 """
 import datetime as dt
 import hashlib
@@ -101,11 +106,55 @@ def start_run(script, args):
             "git_commit": git_commit(), "versions": versions()}
 
 
+def window_releases(out, start, end, res=None):
+    """{"<var>_<res>": [release per day]} for start..end in the folder's ppt and tmean cubes (0 = unknown)."""
+    try:
+        import xarray as xr
+    except ImportError:
+        return {}
+    found = {}
+    for nc in sorted(Path(out).glob("*_daily_clip.nc")):
+        var, nc_res = nc.name.split("_")[:2]
+        if var not in ("ppt", "tmean") or (res and nc_res != res):
+            continue
+        try:
+            with xr.open_dataset(nc) as ds:
+                if "release" in ds:
+                    found[f"{var}_{nc_res}"] = [int(v) for v in ds.release.sel(time=slice(str(start), str(end))).values]
+        except (OSError, ValueError, KeyError):
+            continue
+    return found
+
+
+def read_runs(out):
+    """The runs list of <out>/run_manifest.json ([] if there is none or it can't be read)."""
+    path = Path(out) / "run_manifest.json"
+    try:
+        return json.loads(path.read_text()).get("runs", []) if path.exists() else []
+    except ValueError:
+        return []
+
+
 def append_run(out, entry):
     """Finish the entry and append it to <out>/run_manifest.json. Returns the manifest path."""
     entry["finished"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    if "status" not in entry:
+        entry["status"] = "qc_fail" if any(c.get("level") == "fail" for c in entry.get("qc") or []) else "ok"
+    window = entry.get("window") or {}
+    if window.get("start") and window.get("end") and "input_releases" not in entry:
+        entry["input_releases"] = window_releases(out, window["start"], window["end"],
+                                                  (entry.get("args") or {}).get("res"))
+    entry.pop("_appended", None)
     path = Path(out) / "run_manifest.json"
-    runs = json.loads(path.read_text()).get("runs", []) if path.exists() else []
+    runs = read_runs(out)
+    if not runs and path.exists() and path.stat().st_size:
+        try:
+            json.loads(path.read_text())
+        except ValueError:  # unreadable: keep it for inspection instead of writing over it
+            path.replace(path.with_name(f"run_manifest.corrupt-{dt.datetime.now():%Y%m%d-%H%M%S}.json"))
     runs.append(entry)
-    path.write_text(json.dumps({"runs": runs}, indent=2, default=str))
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_text(json.dumps({"runs": runs}, indent=2, default=str))
+    tmp.replace(path)
+    entry["_appended"] = True
     return path

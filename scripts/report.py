@@ -11,8 +11,10 @@ Charts (each skipped, with a note, when its inputs are missing or were made for 
     Volume and uncertainty  the storm volume and its uncertainty components (storm_total.py)
     Snow check         snow share at SNOTEL stations, observed vs PRISM split (validate_snow.py)
 
-The window defaults to the latest storm_total.py run recorded in run_manifest.json, else every day
-in the cube. Outputs: <out>/report/storm_report_<start>_<end>.html and
+The window defaults to the first event in <out>/storm.toml, else the latest storm_total.py run
+recorded in run_manifest.json, else every day in the cube. The rain/snow split uses the ramp
+storm_total.py used for the window (from its uncertainty file), else storm.toml's, else 0-3 °C.
+--keep-previous moves an existing report for the window to report/history/ first. Outputs: <out>/report/storm_report_<start>_<end>.html and
 <out>/report/figures/<chart>_<start>_<end>.svg. The page has no external dependencies, follows the
 viewer's light/dark setting, and has a data table under each chart.
 
@@ -26,13 +28,15 @@ import datetime as dt
 import html
 import json
 import math
-import sys
 from pathlib import Path
 
 import numpy as np
 import xarray as xr
 
+import config
 import manifest
+import runtime
+from runtime import die
 from storm_total import M3_PER_ACRE_FT, partition_window, window_total
 
 UTC = dt.timezone.utc
@@ -156,7 +160,7 @@ def default_window(out, cube_days):
     return str(min(cube_days)), str(max(cube_days))
 
 
-def daily_basin(out, res, start, end):
+def daily_basin(out, res, start, end, all_snow_c=0.0, all_rain_c=3.0):
     """Per PRISM day: basin precipitation and (with a tmean cube) rain and snow, in area-weighted mm."""
     with xr.open_dataset(Path(out) / f"ppt_{res}_daily_clip.nc") as ds:
         r = window_total(ds, start, end)
@@ -170,10 +174,36 @@ def daily_basin(out, res, start, end):
         out_rows = {"days": days, "ppt": mean(r["daily_mm"]), "volume_m3": r["volume_m3"],
                     "area_m2": r["area_m2"], "mean_mm": r["mean_mm"], "max_mm": r["max_mm"],
                     "releases": r["releases"], "rain": None, "snow": None}
-        part = partition_window(out, res, ds, r, 0.0, 3.0)
+        part = partition_window(out, res, ds, r, all_snow_c, all_rain_c)
         if not isinstance(part, str):
             out_rows["rain"], out_rows["snow"] = mean(part["rain_mm"]), mean(part["snow_mm"])
     return out_rows
+
+
+def rain_snow_ramp(out, unc=None):
+    """(all-snow °C, all-rain °C): what storm_total.py used for the window, else storm.toml's, else 0-3."""
+    if unc and unc.get("rain_snow_ramp_c"):
+        return tuple(unc["rain_snow_ramp_c"])
+    try:
+        rs = (config.load(out) or {}).get("rain_snow") or {}
+    except config.SettingsError:
+        rs = {}
+    return float(rs.get("all_snow_c", 0.0)), float(rs.get("all_rain_c", 3.0))
+
+
+def window_file(path, start, end):
+    """The window-named copy of a validation file if there is one, else the file itself."""
+    w = runtime.windowed(path, start, end)
+    return w if w.exists() else path
+
+
+def keep_previous(html_path):
+    """Move a report to report/history/<name>_<its time stamp>.html; returns the new path."""
+    made = dt.datetime.fromtimestamp(html_path.stat().st_mtime).strftime("%Y%m%d-%H%M%S")
+    dest = html_path.parent / "history" / f"{html_path.stem}_{made}.html"
+    dest.parent.mkdir(exist_ok=True)
+    html_path.replace(dest)
+    return dest
 
 
 def latest_qc(out):
@@ -508,23 +538,33 @@ def main():
     ap.add_argument("--gauges", nargs="+", help="USGS sites for the storm timeline (default: up to 3 of the largest "
                     "compared gauges not regulated by dams)")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"])
-    ap.add_argument("--title", help="report title (default: the basin name from the folder)")
-    a = ap.parse_args()
+    ap.add_argument("--title", help="report title (default: name in storm.toml, else the basin name from the folder)")
+    ap.add_argument("--keep-previous", action="store_true",
+                    help="move an existing report for this window to report/history/ instead of replacing it")
+    runtime.add_common_args(ap)
+    a = config.parse_args(ap)
     run = manifest.start_run("report.py", a)
+    runtime.attach(a.out, run, a)
 
     out = Path(a.out)
     nc = out / f"ppt_{a.res}_daily_clip.nc"
     if not nc.exists():
-        sys.exit(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
+        die(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
     with xr.open_dataset(nc) as ds:
         cube_days = ds.time.values.astype("datetime64[D]")
     d0, d1 = default_window(out, cube_days)
     start, end = a.start or d0, a.end or d1
     span = f"{start.replace('-', '')}_{end.replace('-', '')}"
-    basin = daily_basin(out, a.res, start, end)
+    unc_path = out / f"ppt_{a.res}_uncertainty_{span}.json"
+    unc = json.loads(unc_path.read_text()) if unc_path.exists() else None
+    ramp = rain_snow_ramp(out, unc)
+    basin = daily_basin(out, a.res, start, end, *ramp)
     vdir = out / "validation"
 
-    title = a.title
+    try:
+        title = a.title or (config.load(out) or {}).get("name")
+    except config.SettingsError:
+        title = a.title
     if not title:
         totals = out / "totals.gpkg"
         title = out.name.replace("_", " ")
@@ -537,8 +577,6 @@ def main():
     d_start, d_end = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
     when = f"PRISM days {d_start:%b} {d_start.day} – {d_end:%b} {d_end.day}, {d_end.year}"
 
-    unc_path = out / f"ppt_{a.res}_uncertainty_{span}.json"
-    unc = json.loads(unc_path.read_text()) if unc_path.exists() else None
     v = basin["volume_m3"]
     qc = latest_qc(out)
     worst = max(qc.values(), key={"skip": 0, "pass": 1, "warn": 2, "fail": 3}.get) if qc else None
@@ -559,7 +597,7 @@ def main():
                           f"of normal for these days ({nj['window_normal_mm']:.1f} mm); {months}"))
     if basin["rain"] is not None:
         snow = sum(basin["snow"]) / max(sum(basin["ppt"]), 1e-9) * 100
-        tiles.append(("Snow share", f"{snow:.1f}%", "of precipitation (0–3 °C ramp)"))
+        tiles.append(("Snow share", f"{snow:.1f}%", f"of precipitation ({ramp[0]:g}–{ramp[1]:g} °C ramp)"))
     if worst:
         tiles.append(("QC", f'<span class="st-{worst}">{worst.upper()}</span>',
                       "; ".join(f"{k.replace('.py', '')} {v_}" for k, v_ in qc.items())))
@@ -568,12 +606,12 @@ def main():
 
     sections, figures = [], {}
     # 1. Timeline.
-    runoff = [r for r in read_csv(vdir / "runoff_summary.csv")
+    runoff = [r for r in read_csv(window_file(vdir / "runoff_summary.csv", start, end))
               if r.get("prism_start") == start and r.get("prism_end") == end]
     gauges = pick_gauges(runoff, a.gauges)
     flows = []
     for g in gauges:
-        rows = read_csv(vdir / f"runoff_{g['site']}_flow.csv")
+        rows = read_csv(window_file(vdir / f"runoff_{g['site']}_flow.csv", start, end))
         flows.append([(dt.datetime.fromisoformat(r["time_utc"]), float(r["q_cfs"]), float(r["baseflow_line_cfs"]))
                       for r in rows])
     figures["timeline"] = timeline_chart(basin, gauges, flows)
@@ -590,10 +628,9 @@ def main():
                             table(["PRISM day", "Precipitation (mm)"] + (["Rain (mm)", "Snow (mm)"] if basin["rain"]
                                                                          is not None else []), trows), note))
     # 2. PRISM vs gauges.
-    sj = vdir / "stations_summary.json"
-    st_sum = json.loads(sj.read_text()) if sj.exists() else None
-    if st_sum and st_sum.get("window", {}).get("start") == start and st_sum["window"].get("end") == end:
-        st = [r for r in read_csv(vdir / "stations.csv") if r["status"] == "ok" and num(r["obs_mm"]) is not None
+    st_sum = runtime.window_json(vdir / "stations_summary.json", start, end)
+    if st_sum:
+        st = [r for r in read_csv(window_file(vdir / "stations.csv", start, end)) if r["status"] == "ok" and num(r["obs_mm"]) is not None
               and num(r["prism_mm"]) is not None]
         figures["gauges"] = scatter_chart(st, st_sum.get("event_totals"))
         sections.append(section(
@@ -635,10 +672,9 @@ def main():
     else:
         sections.append(missing("Volume and its uncertainty", "run storm_total.py for this window."))
     # 5. Snow.
-    sn_sum = vdir / "snotel_summary.json"
-    sn = json.loads(sn_sum.read_text()) if sn_sum.exists() else None
-    if sn and sn.get("window", {}).get("start") == start and sn["window"].get("end") == end:
-        rows = [r for r in read_csv(vdir / "snotel.csv") if r["status"] == "ok"]
+    sn = runtime.window_json(vdir / "snotel_summary.json", start, end)
+    if sn:
+        rows = [r for r in read_csv(window_file(vdir / "snotel.csv", start, end)) if r["status"] == "ok"]
         if rows:
             figures["snow"] = snow_chart(rows)
             ratio = sn.get("prism_over_observed_snow")
@@ -660,7 +696,7 @@ def main():
     fig_paths = []
     for name, s in figures.items():
         p = fdir / f"{name}_{span}.svg"
-        p.write_text(standalone(s))
+        runtime.write_atomic(p, standalone(s))
         fig_paths.append(p)
     made = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
     page = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -674,7 +710,10 @@ def main():
             f'NRCS. Figures as SVG in report/figures/.</p></main><div id="tip"></div><script>{TIP_JS}</script>'
             f'</body></html>')
     html_path = rdir / f"storm_report_{span}.html"
-    html_path.write_text(page)
+    if a.keep_previous and html_path.exists():
+        kept = keep_previous(html_path)
+        print(f"Previous report kept as {kept.relative_to(out)}")
+    runtime.write_atomic(html_path, page)
     run.update(window={"start": start, "end": end}, outputs=manifest.files_entry([html_path] + fig_paths, out))
     manifest.append_run(out, run)
     print(f"Report: {html_path}")
@@ -682,4 +721,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    runtime.run_main(main)

@@ -43,7 +43,8 @@ given across --ramp-alternatives. Method: docs/UNCERTAINTY.md.
 
 Each run ends with QC checks for the window (qc.py; --qc-strict turns warnings into
 failures, and any failure gives exit status 1) and appends a record of the run to
-<out>/run_manifest.json.
+<out>/run_manifest.json. With <out>/storm.toml, the window defaults to its first event (--event
+for another) and the rain/snow ramp comes from its [rain_snow] section.
 """
 import argparse
 import csv
@@ -60,9 +61,12 @@ from rasterio.windows import from_bounds
 import shapely
 import xarray as xr
 
+import config
 import manifest
 import qc
+import runtime
 import uncertainty
+from runtime import EXIT_QC, die
 
 # PRISM file names carry a resolution code instead of the resolution: 30s = 800 m, 25m = 4 km.
 RES_CODES = {"800m": "30s", "4km": "25m"}
@@ -142,8 +146,8 @@ def build_cube(clipped_dir, var, res, nc_path, attrs=None):
         ymd = tif.name[len(f"{var}_{res}_"):][:8]
         with rasterio.open(tif) as src:
             if transform is not None and (src.transform != transform or src.shape != layers[0].shape):
-                sys.exit(f"{tif.name} is on a different grid than the other clipped days; "
-                         "use a separate --out folder for each basin.")
+                die(f"{tif.name} is on a different grid than the other clipped days; "
+                    "use a separate --out folder for each basin.")
             transform, crs = src.transform, src.crs
             layers.append(src.read(1, masked=True).astype("float32").filled(np.nan))
             rel = src.tags().get("PRISM_DATASET_RELEASE_NUMBER", "")
@@ -179,9 +183,11 @@ def build_cube(clipped_dir, var, res, nc_path, attrs=None):
         },
         attrs={**cf_globals(f"PRISM daily {var} ({res}) clipped to a basin"), **(attrs or {})},
     )
-    ds.to_netcdf(nc_path, encoding={var: {"zlib": True, "complevel": 4, "_FillValue": np.nan},
-                                    "time": {"units": "days since 1970-01-01 00:00:00", "dtype": "float64"},
-                                    "time_bnds": {"units": "days since 1970-01-01 00:00:00", "dtype": "float64"}})
+    with runtime.atomic_path(nc_path) as tmp:
+        ds.to_netcdf(tmp, format="NETCDF4",
+                     encoding={var: {"zlib": True, "complevel": 4, "_FillValue": np.nan},
+                               "time": {"units": "days since 1970-01-01 00:00:00", "dtype": "float64"},
+                               "time_bnds": {"units": "days since 1970-01-01 00:00:00", "dtype": "float64"}})
     return nc_path
 
 
@@ -201,8 +207,7 @@ def window_total(ds, start, end, var="ppt"):
     have = set(ds.time.values.astype("datetime64[D]"))
     missing = [str(d) for d in wanted if d not in have]
     if missing:
-        sys.exit(f"Cube has no data for {', '.join(missing)}. "
-                 "Run prism_watershed.py for those dates first.")
+        die(f"Cube has no data for {', '.join(missing)}. Run prism_watershed.py for those dates first.")
     daily = ds[var].sel(time=slice(wanted[0], wanted[-1]))
     releases = ([int(v) for v in ds.release.sel(time=slice(wanted[0], wanted[-1])).values]
                 if "release" in ds else [0] * len(wanted))
@@ -398,8 +403,10 @@ def write_rain_snow_nc(ds, part, path, all_snow_c, all_rain_c):
     )
     out["time"].attrs.update(t_attrs)
     enc = {"zlib": True, "complevel": 4, "_FillValue": np.nan}
-    out.to_netcdf(path, encoding={**{k: enc for k in ("rain", "snow", "snow_fraction", "rain_total", "snow_total")},
-                                  **TIME_ENC})
+    with runtime.atomic_path(path) as tmp:
+        out.to_netcdf(tmp, format="NETCDF4",
+                      encoding={**{k: enc for k in ("rain", "snow", "snow_fraction", "rain_total", "snow_total")},
+                                **TIME_ENC})
 
 
 def cube_transform(ds):
@@ -441,9 +448,9 @@ def write_tif(grid, crs_wkt, path, units):
     dx, dy = lon[1] - lon[0], lat[0] - lat[1]
     transform = from_origin(lon[0] - dx / 2, lat[0] + dy / 2, dx, dy)
     data = np.nan_to_num(grid.values.astype("float32"), nan=-9999)
-    with rasterio.open(path, "w", driver="GTiff", height=data.shape[0], width=data.shape[1],
-                       count=1, dtype="float32", crs=crs_wkt, transform=transform,
-                       nodata=-9999, compress="deflate") as dst:
+    with runtime.atomic_path(path) as tmp, rasterio.open(
+            tmp, "w", driver="GTiff", height=data.shape[0], width=data.shape[1], count=1, dtype="float32",
+            crs=crs_wkt, transform=transform, nodata=-9999, compress="deflate") as dst:
         dst.write(data, 1)
         dst.set_band_unit(1, units)
 
@@ -467,7 +474,8 @@ def write_volume_nc(ds, r, path):
     )
     out["time"].attrs.update(t_attrs)
     enc = {"zlib": True, "complevel": 4, "_FillValue": np.nan}
-    out.to_netcdf(path, encoding={"volume": enc, "volume_total": enc, **TIME_ENC})
+    with runtime.atomic_path(path) as tmp:
+        out.to_netcdf(tmp, format="NETCDF4", encoding={"volume": enc, "volume_total": enc, **TIME_ENC})
 
 
 def main():
@@ -495,12 +503,14 @@ def main():
     ap.add_argument("--qc-strict", action="store_true", help="treat QC warnings as failures")
     ap.add_argument("--qc-max-daily-mm", type=float, default=400.0,
                     help="flag daily precipitation in any cell above this (default 400 mm)")
-    a = ap.parse_args()
+    runtime.add_common_args(ap)
+    a = config.parse_args(ap)
     run = manifest.start_run("storm_total.py", a)
+    runtime.attach(a.out, run, a)
 
     nc = Path(a.out) / f"ppt_{a.res}_daily_clip.nc"
     if not nc.exists():
-        sys.exit(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
+        die(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
     with xr.open_dataset(nc) as ds:
         days = ds.time.values.astype("datetime64[D]")
         start = a.start or str(days.min())
@@ -517,7 +527,7 @@ def main():
         bounds = boundary_check(Path(a.out), a.res, a.boundary, ds, start, r["days"])
         part = partition_window(a.out, a.res, ds, r, a.all_snow_c, a.all_rain_c)
         if isinstance(part, str) and (a.rain_tif or a.snow_tif or a.rain_snow_nc):
-            sys.exit(f"Rain/snow outputs requested but the partition was {part}")
+            die(f"Rain/snow outputs requested but the partition was {part}")
         alt_rain = {}
         if not isinstance(part, str):
             for pair in a.ramp_alternatives.split():
@@ -583,11 +593,12 @@ def main():
         print(f"Boundary:    cell centers {vols['centers'] / 1e9:.4f} km³, area-weighted {vols['weighted'] / 1e9:.4f}, "
               f"any cell touched {vols['touched'] / 1e9:.4f} (range {spread} of area-weighted)")
     stations_json = Path(a.out) / "validation" / "stations_summary.json"
-    event_totals = None
-    if stations_json.exists():
-        sj = json.loads(stations_json.read_text())
-        if sj.get("window", {}).get("start") == start and sj["window"].get("end") == end:
-            event_totals = sj.get("event_totals")
+    sj = runtime.window_json(stations_json, start, end)
+    event_totals = sj.get("event_totals") if sj else None
+    if sj is None and stations_json.exists():
+        other = json.loads(stations_json.read_text()).get("window", {})
+        print(f"Gauges:      not in the uncertainty: validate_stations.py was last run for {other.get('start')} to "
+              f"{other.get('end')}; run it for {start} to {end}, then this again")
     components = [uncertainty.gauge_component(event_totals),
                   uncertainty.boundary_component(None if isinstance(bounds, str) else bounds["volumes"], v),
                   uncertainty.revision_component(rc, r["releases"]),
@@ -595,7 +606,8 @@ def main():
     print("\n".join(uncertainty.report(v, components)))
     v_lo, v_hi = uncertainty.volume_range(v, components)
     unc = {"window": {"start": start, "end": end}, "volume_m3": v, "range_m3": [v_lo, v_hi],
-           "range_pct": list(uncertainty.bounding_range(components)), "components": components}
+           "range_pct": list(uncertainty.bounding_range(components)), "components": components,
+           "releases": r["releases"], "rain_snow_ramp_c": [a.all_snow_c, a.all_rain_c]}
     if alt_rain:
         rains = [part["rain_m3"]] + list(alt_rain.values())
         unc["rain"] = {"rain_m3": part["rain_m3"], "range_m3": [min(rains), max(rains)],
@@ -604,7 +616,7 @@ def main():
               f"{a.all_snow_c:g},{a.all_rain_c:g} (used) and {', '.join(alt_rain)} °C; shifts water between rain "
               "and snow, not the total")
     unc_json = Path(a.out) / f"ppt_{a.res}_uncertainty_{start.replace('-', '')}_{end.replace('-', '')}.json"
-    unc_json.write_text(json.dumps(unc, indent=2))
+    runtime.write_json(unc_json, unc)
     if a.tif:
         print(f"Total depth raster: {a.tif}")
     if a.volume_tif:
@@ -649,7 +661,7 @@ def main():
                                                                     a.snow_tif, a.rain_snow_nc, unc_json) if f], a.out))
     print(f"Run recorded in {manifest.append_run(a.out, run).name}")
     if qc.worst_level(checks) == "fail":
-        sys.exit("QC failed (see above).")
+        die("QC failed (see above).", EXIT_QC)
 
 
 def boundary_check(out, res, boundary, ds, start, n_days):
@@ -672,4 +684,4 @@ def boundary_check(out, res, boundary, ds, start, n_days):
 
 
 if __name__ == "__main__":
-    main()
+    runtime.run_main(main)

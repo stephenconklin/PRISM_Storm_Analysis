@@ -41,7 +41,14 @@ Outputs in <out>/validation/:
     validation.gpkg  layers 'gauge_basins' (basins with volumes, ratios, regulation),
                      'gauges' (every gauge considered, with status) and 'dams' (NID dams in
                      the study basin), with default QGIS styles
-    runoff_summary.csv (one row per gauge), runoff_<site>.json, runoff_<site>_flow.csv
+    runoff_summary.csv (one row per gauge), runoff_<site>.json, runoff_<site>_flow.csv; each also as
+    <name>_<start>_<end>.<ext>, so a folder keeps results for several windows: a gauge's saved result
+    for one storm is reused for that storm even after another storm has run (the plain names hold the
+    latest run)
+
+Stopping at the USGS rate limit exits with status 3: rerun the same command to continue. USGS
+revises provisional discharge when it approves it; --recheck-provisional-days N re-fetches gauges
+whose saved flow was all or partly provisional and was fetched N or more days ago.
 
 Usage examples:
     python validate_runoff.py --out data/huc1408 --all-gauges
@@ -52,7 +59,7 @@ import argparse
 import csv
 import datetime as dt
 import json
-import sys
+import time
 from pathlib import Path
 
 import geopandas as gpd
@@ -65,7 +72,10 @@ import requests
 from shapely.geometry import Point
 import xarray as xr
 
+import config
 import manifest
+import runtime
+from runtime import die
 from storm_total import M3_PER_ACRE_FT, area_grid, prism_day_files, snow_fraction
 from validate_stations import load_basin, write_layer
 
@@ -237,15 +247,18 @@ def basin_share_inside(basin, study_poly):
     return float(b.intersection(study).area / b.area) if b.area else 0.0
 
 
-def upsert_layer(gdf, gpkg, layer, key, values):
-    """Replace these gauges' rows in a GeoPackage layer, keeping other gauges."""
-    if Path(gpkg).exists():
-        try:
-            old = gpd.read_file(gpkg, layer=layer)
-            gdf = pd.concat([old[~old[key].isin(values)].to_crs(gdf.crs), gdf], ignore_index=True)
-        except Exception:
-            pass
-    write_layer(gpd.GeoDataFrame(gdf, crs=gdf.crs), gpkg, layer)
+def upsert_layer(gdf, gpkg, layer, key, values, window=None):
+    """Replace these gauges' rows in a GeoPackage layer (and its window-named copy), keeping other gauges."""
+    names = [layer] + ([f"{layer}_{runtime.span(*window)}"] if window else [])
+    for name in names:
+        new = gdf
+        if Path(gpkg).exists():
+            try:
+                old = gpd.read_file(gpkg, layer=name)
+                new = pd.concat([old[~old[key].isin(values)].to_crs(gdf.crs), gdf], ignore_index=True)
+            except Exception:
+                pass
+        write_layer(gpd.GeoDataFrame(new, crs=gdf.crs), gpkg, name, style=layer)
 
 
 # ---------- one gauge ----------
@@ -310,15 +323,18 @@ def run_gauge(site_no, site, grids, study_poly, dams_for, a, vdir, tmean=None):
         "flow": {**vols, "peak_cfs": float(q.max()), "peak_time_utc": peak_t.isoformat(), **gaps,
                  "approval_status": pd.Series([v[3] for v in raw]).value_counts().to_dict(),
                  "qualifiers": pd.Series([", ".join(v[2]) for v in raw if v[2]]).value_counts().to_dict()},
-        "regulation": reg,
+        "regulation": reg, "checked_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "notes": ["Precipitation includes snow; high-elevation snow does not run off within the window.",
                   "Discharge is provisional unless approval_status says otherwise.",
                   "Regulated gauges: reservoir storage and releases, not just precipitation, set the flow."]}
-    (vdir / f"runoff_{site_no}.json").write_text(json.dumps(result, indent=2))
-    basin.to_crs(4269).to_file(vdir / f"runoff_{site_no}_basin.geojson", driver="GeoJSON")
-    pd.DataFrame({"q_cfs": q.round(1), "interpolated": interp, "baseflow_constant_cfs": np.round(base_c, 1),
-                  "baseflow_line_cfs": np.round(base_l, 1)}).rename_axis("time_utc").to_csv(
-        vdir / f"runoff_{site_no}_flow.csv")
+    save_result(vdir, site_no, result, start, end)
+    with runtime.atomic_path(vdir / f"runoff_{site_no}_basin.geojson") as tmp:
+        basin.to_crs(4269).to_file(tmp, driver="GeoJSON")
+    flow_csv = vdir / f"runoff_{site_no}_flow.csv"
+    with runtime.atomic_path(flow_csv) as tmp:
+        pd.DataFrame({"q_cfs": q.round(1), "interpolated": interp, "baseflow_constant_cfs": np.round(base_c, 1),
+                      "baseflow_line_cfs": np.round(base_l, 1)}).rename_axis("time_utc").to_csv(tmp)
+    runtime.keep_window_copy(flow_csv, start, end)
     return result, basin
 
 
@@ -428,22 +444,57 @@ def flow_stale(saved_end, target, now, slack_h=6.0):
     return (min(target, now) - saved_end).total_seconds() / 3600 > slack_h
 
 
-def load_cached(vdir, site_no, key, target=None, now=None):
+def flow_approved(result):
+    """True if every saved discharge value was approved by USGS (none provisional)."""
+    statuses = ((result or {}).get("flow") or {}).get("approval_status") or {}
+    return bool(statuses) and all("approved" in str(s).lower() for s in statuses)
+
+
+def result_paths(vdir, site_no, start=None, end=None):
+    """Where a gauge's saved result for a window may be: runoff_<site>_<start>_<end>.json, then
+    runoff_<site>.json (the latest run, and every run before results were kept per window)."""
+    plain = Path(vdir) / f"runoff_{site_no}.json"
+    return ([runtime.windowed(plain, start, end)] if start and end else []) + [plain]
+
+
+def save_result(vdir, site_no, result, start, end):
+    """Save a gauge's result (or skip) for the window, and as the latest."""
+    for path in result_paths(vdir, site_no, start, end):
+        runtime.write_json(path, result)
+
+
+def load_cached(vdir, site_no, key, target=None, now=None, recheck_days=None):
     """(result, basin, None) or (None, skip reason, gauge) from an earlier run with the same settings, else None.
 
     Results saved with other PRECIP_KEYS are returned too, with a run_key that differs from key, so the
     caller can recompute their precipitation (update_precip); skips caused by precipitation are not reused
     then. Results whose flow window was cut short (run before target) are not reused once more flow exists.
+    With recheck_days, results with provisional flow fetched that many days ago or more are not reused.
     """
-    path = vdir / f"runoff_{site_no}.json"
-    if not path.exists():
+    found = []  # (modified, path, result) for each saved copy made with these settings
+    for candidate in result_paths(vdir, site_no, (key or {}).get("start"), (key or {}).get("end")):
+        try:
+            saved = json.loads(candidate.read_text())
+        except (OSError, ValueError):  # missing or unreadable: try the next, else fetch again
+            continue
+        if same_except_precip(saved.get("run_key"), key):
+            found.append((candidate.stat().st_mtime, candidate, saved))
+    if not found:
         return None
-    cached = json.loads(path.read_text())
-    if not same_except_precip(cached.get("run_key"), key):
-        return None
+    _, path, cached = max(found, key=lambda x: x[0])  # the newest, if both copies match
+    first = result_paths(vdir, site_no, (key or {}).get("start"), (key or {}).get("end"))[0]
+    if path != first:  # saved before results were kept per window: keep this window's copy from now on
+        runtime.write_json(first, cached)
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if recheck_days is not None and cached.get("status", "ok") == "ok" and not flow_approved(cached):
+        checked = cached.get("checked_utc")
+        checked = (dt.datetime.fromisoformat(checked) if checked
+                   else dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc))
+        if (now - checked).total_seconds() >= recheck_days * 86400:
+            return None
     if target is not None:
         saved = (cached.get("flow_window_utc") or {}).get("end") or cached.get("checked_utc")
-        if not saved or flow_stale(dt.datetime.fromisoformat(saved), target, now or dt.datetime.now(dt.timezone.utc)):
+        if not saved or flow_stale(dt.datetime.fromisoformat(saved), target, now):
             return None  # (skips saved before checked_utc was recorded can't be dated: check again)
     if cached.get("status") and cached["status"] != "ok":
         if cached.get("stage") == "precip" and cached.get("run_key") != key:
@@ -453,6 +504,21 @@ def load_cached(vdir, site_no, key, target=None, now=None):
     if not basin_file.exists():
         return None
     return cached, gpd.read_file(basin_file), None
+
+
+def write_summary(path, rows, keep_others=False):
+    """Write runoff_summary rows to path; with keep_others (--gauge runs), rows already there for other
+    gauges are kept. Returns the rows written."""
+    if keep_others and path.exists():
+        with open(path, newline="") as f:
+            done = {r["site"] for r in rows}
+            rows = [r for r in csv.DictReader(f) if r["site"] not in done] + rows
+    with runtime.atomic_open(path, "w", newline="") as f:
+        fields = list(dict.fromkeys(k for r in rows for k in r))
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+    return rows
 
 
 # ---------- main ----------
@@ -484,16 +550,20 @@ def main():
                     help="wait out USGS rate-limit pauses up to this long before stopping (default 15)")
     ap.add_argument("--refresh", action="store_true",
                     help="re-fetch every gauge instead of reusing results saved by an earlier run with the same settings")
+    ap.add_argument("--recheck-provisional-days", type=float,
+                    help="re-fetch gauges whose saved flow is provisional and was fetched at least this many days ago")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"])
-    a = ap.parse_args()
+    runtime.add_common_args(ap)
+    a = config.parse_args(ap)
     run = manifest.start_run("validate_runoff.py", a)
+    runtime.attach(a.out, run, a)
     import observations
     observations.MAX_WAIT_S = a.max_wait_min * 60
 
     out = Path(a.out)
     nc = out / f"ppt_{a.res}_daily_clip.nc"
     if not nc.exists():
-        sys.exit(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
+        die(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
     study = load_basin(out, a.boundary)
     study_poly = study.geometry.iloc[0]
     vdir = out / "validation"
@@ -507,12 +577,12 @@ def main():
         days = [start + dt.timedelta(days=i) for i in range((end - start).days + 1)]
         missing = [d for d in days if d not in set(have)]
         if missing:
-            sys.exit(f"Cube has no data for {', '.join(map(str, missing))}.")
+            die(f"Cube has no data for {', '.join(map(str, missing))}.")
         grids = []
         for d in days:
             grid, _ = prism_day_files(out / "extracted", "ppt", a.res, d)
             if grid is None:
-                sys.exit(f"No extracted PRISM grid for {d} in {out / 'extracted'}; run prism_watershed.py for it.")
+                die(f"No extracted PRISM grid for {d} in {out / 'extracted'}; run prism_watershed.py for it.")
             grids.append((d, grid))
         tmean = {d: prism_day_files(out / "extracted", "tmean", a.res, d)[0] for d in days}
         if None in tmean.values():
@@ -555,11 +625,17 @@ def main():
             else:
                 sites = a.gauge
         except RateLimited as e:
-            sys.exit(str(e))
+            die(f"{e} Rerun the same command to continue.", runtime.EXIT_INCOMPLETE)
 
+        if a.refresh and sites:
+            runtime.confirm_or_stop(f"Re-fetch all {len(sites)} gauges (about {3 * len(sites)} USGS requests; the "
+                                    "limit is 1,000 per hour)?", a.yes)
         rows, basins = [], []
+        started = time.monotonic()
         for i, site_no in enumerate(sites):
-            cached = None if a.refresh else load_cached(vdir, site_no, key, target)
+            n_of = f"[{i + 1}/{len(sites)}]"
+            cached = None if a.refresh else load_cached(vdir, site_no, key, target,
+                                                        recheck_days=a.recheck_provisional_days)
             try:
                 if cached and cached[0] is None:
                     raise GaugeSkipped(cached[1], cached[2])
@@ -569,7 +645,7 @@ def main():
                         result = update_precip(result, basin, grids, a, tmean)
                         result["run_key"] = key
                         result["flow_complete"] = dt.datetime.fromisoformat(result["flow_window_utc"]["end"]) >= target
-                        (vdir / f"runoff_{site_no}.json").write_text(json.dumps(result, indent=2))
+                        save_result(vdir, site_no, result, start, end)
                         cached = "precipitation recomputed (new PRISM releases or rain/snow settings)"
                 else:
                     try:
@@ -581,17 +657,17 @@ def main():
                         raise GaugeSkipped(f"request failed: {e.__class__.__name__} "
                                            f"{getattr(e.response, 'status_code', '')}".strip(), meta.get(site_no))
                     except GaugeSkipped as e:
-                        (vdir / f"runoff_{site_no}.json").write_text(json.dumps(
-                            {"run_key": key, "status": str(e), "gauge": e.site, "stage": e.stage,
-                             "checked_utc": dt.datetime.now(dt.timezone.utc).isoformat()}, indent=2))
+                        save_result(vdir, site_no, {"run_key": key, "status": str(e), "gauge": e.site, "stage": e.stage,
+                                                    "checked_utc": dt.datetime.now(dt.timezone.utc).isoformat()},
+                                    start, end)
                         raise
                     result["run_key"] = key
                     result["flow_complete"] = dt.datetime.fromisoformat(result["flow_window_utc"]["end"]) >= target
-                    (vdir / f"runoff_{site_no}.json").write_text(json.dumps(result, indent=2))
+                    save_result(vdir, site_no, result, start, end)
             except GaugeSkipped as e:
                 rows.append(summary_row(site_no, site=e.site, reason=str(e)))
                 if not (a.all_gauges and str(e) == "gauge is outside the study basin"):
-                    print(f"  {site_no} skipped: {e}")
+                    print(f"  {n_of} {site_no} skipped: {e}")
                 continue
             except RateLimited as e:
                 stopped = (str(e), len(sites) - i)
@@ -599,7 +675,7 @@ def main():
             row = summary_row(site_no, result)
             rows.append(row)
             basins.append(gpd.GeoDataFrame([row], geometry=[basin.to_crs(4269).geometry.iloc[0]], crs=4269))
-            print(f"  {site_no} {row['name'][:42]:<42} {row['area_km2']:>8,.0f} km²  {row['precip_mm']:6.1f} mm  "
+            print(f"  {n_of} {site_no} {row['name'][:42]:<42} {row['area_km2']:>8,.0f} km²  {row['precip_mm']:6.1f} mm  "
                   f"ratio {row['ratio_low']:.2f}–{row['ratio_high']:.2f}"
                   + (f" (rain-only {row['rain_ratio_low']:.2f}–{row['rain_ratio_high']:.2f}, {row['snow_pct']:.0f}% snow)"
                      if row.get("rain_ratio_low") is not None else
@@ -608,24 +684,18 @@ def main():
                   f" ({row['dam_effective_mm']:.1f} mm effective of {row['dam_storage_mm']:.1f} mm capacity,"
                   f" {row['storage_pct_of_precip']:.0f}% of precip)"
                   + (f"  [{cached}]" if isinstance(cached, str) else "  [saved]" if cached else "")
-                  + ("" if row["flow_complete"] else "  [flow window not over yet]"))
+                  + ("" if row["flow_complete"] else "  [flow window not over yet]")
+                  + ("" if cached else runtime.eta(started, i + 1, len(sites))))
 
     if stopped:  # keep the previous outputs; the gauges finished so far are saved and reused next run
-        sys.exit(f"Stopped with {stopped[1]} gauges left: {stopped[0]} Rerun the same command to continue; "
-                 "finished gauges are reused. Summary CSV and layers were left as they were.")
+        die(f"Stopped with {stopped[1]} gauges left: {stopped[0]} Rerun the same command to continue; "
+            "finished gauges are reused. Summary CSV and layers were left as they were.", runtime.EXIT_INCOMPLETE)
     this_run = list(rows)
     if a.all_gauges:  # keep only gauges in the study basin
         rows = [r for r in rows if r["status"] != "gauge is outside the study basin"]
     summary = vdir / "runoff_summary.csv"
-    if not a.all_gauges and summary.exists():  # --gauge: replace these gauges' rows, keep the rest
-        with open(summary, newline="") as f:
-            done = {r["site"] for r in rows}
-            rows = [r for r in csv.DictReader(f) if r["site"] not in done] + rows
-    with open(summary, "w", newline="") as f:
-        fields = list(dict.fromkeys(k for r in rows for k in r))
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(rows)
+    write_summary(runtime.windowed(summary, start, end), rows, keep_others=not a.all_gauges)
+    rows = write_summary(summary, rows, keep_others=not a.all_gauges)
 
     ok = [r for r in rows if r["status"] == "ok"]
     # Layers: --all-gauges replaces them; --gauge replaces only the gauges run now (from this run's rows,
@@ -640,11 +710,11 @@ def main():
                                                                [r["lat"] for r in points]), crs=4269)
           if points else empty)
     if a.all_gauges:
-        write_layer(gb, gpkg, "gauge_basins")
-        write_layer(gp, gpkg, "gauges")
+        write_layer(gb, gpkg, "gauge_basins", window=(start, end))
+        write_layer(gp, gpkg, "gauges", window=(start, end))
     else:
-        upsert_layer(gb, gpkg, "gauge_basins", "site", run_sites)
-        upsert_layer(gp, gpkg, "gauges", "site", run_sites)
+        upsert_layer(gb, gpkg, "gauge_basins", "site", run_sites, window=(start, end))
+        upsert_layer(gp, gpkg, "gauges", "site", run_sites, window=(start, end))
     if dams:
         dg = pd.DataFrame(dams).drop(columns=["_af"], errors="ignore")
         dg["storage_af"] = dg["normal_storage_af"].fillna(dg["nid_storage_af"])
@@ -660,4 +730,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    runtime.run_main(main)

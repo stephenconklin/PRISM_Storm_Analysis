@@ -10,6 +10,18 @@ Hurricane Trudy; rain began ~Oct 21, San Juan at Pagosa Springs crested
 That run covered HUC 1408, ppt and tmean for PRISM days Oct 20–31.
 
 ## Layout
+- `scripts/pipeline.py` — `init` (writes `storm.toml`), `run` (all steps in order as subprocesses; resumes from
+  `<out>/pipeline_state.json` fingerprints; network steps soft, `ppt`/`totals` hard), `status`, `update` (refresh +
+  rerun + what changed). Step arguments are computed when the step starts (earlier steps make inputs)
+- `scripts/config.py` — per-folder settings `<out>/storm.toml` (TOML: tomllib, tomli on 3.10); `config.parse_args(ap)`
+  fills defaults from it (role `download` for prism_watershed, `event` for the rest; adds `--event`); flags win.
+  An event may set its own `after_days`; it applies when `--event` or `--start`/`--end` select that event
+- `scripts/runtime.py` — stdlib only: exit codes (0 ok, 1 QC, 2 input, 3 incomplete, 4 network, 5 error, 130
+  interrupted), `die()`, `run_main()` (records failed/interrupted runs in the manifest), `attach()` (folder `.lock`,
+  log in `<out>/logs/`), `write_atomic`/`atomic_open`/`atomic_path` (`.part` + rename), `confirm()` (only at a
+  terminal), `windowed()`/`window_json()` for per-window validation copies
+- `scripts/check_endpoints.py` — one light probe per external service; `STEP_SERVICES` maps pipeline steps to them
+- `.claude/skills/` — `storm-run`, `storm-update`, `check-endpoints`, `report-check`
 - `scripts/find_huc.py` — look up WBD HUC codes by name (network only)
 - `scripts/prism_watershed.py` — download → unzip → clip → daily CSV + event-total raster + daily NetCDF cube
 - `scripts/storm_total.py` — `build_cube`, ellipsoidal `cell_area_m2`, `prism_day_files` (national grid lookup in
@@ -23,8 +35,9 @@ That run covered HUC 1408, ppt and tmean for PRISM days Oct 20–31.
   basin label reads. Method and judgments in `docs/UNCERTAINTY.md`; keep it in step with the code
 - `scripts/qc.py` — pure QC check functions (pass/warn/fail/skip) run at the end of `prism_watershed.py` and
   `storm_total.py`; any fail → exit status 1 after outputs are written; `--qc-strict` makes warnings fail
-- `scripts/manifest.py` — appends one entry per run to `<out>/run_manifest.json` (`runs` list): command, git
-  commit, versions, basin source, per-day URL/SHA-256/release/info.txt fields, outputs with SHA-256, QC
+- `scripts/manifest.py` — appends one entry per run of any script to `<out>/run_manifest.json` (`runs` list,
+  written atomically): command, status, log, git commit, versions, basin source, per-day URL/SHA-256/release/info.txt
+  fields, outputs with SHA-256, QC, and `input_releases` (cube releases for the entry's window; `status` uses it)
 - `scripts/observations.py` — all network access for validation (RCC-ACIS stations, USGS Water Data API, NLDI,
   National Inventory of Dams, WBD units, NRCS AWDB SNOTEL); `_get` retries 429/503 and raises `RateLimited` on long waits
 - `scripts/validate_stations.py` — gauge vs PRISM comparison; pure functions for ACIS parsing, day alignment,
@@ -32,7 +45,8 @@ That run covered HUC 1408, ppt and tmean for PRISM days Oct 20–31.
 - `scripts/validate_runoff.py` — gauge-basin precipitation volume vs 15-minute streamflow, runoff ratio, for
   `--gauge` sites or `--all-gauges`; gauge-basin precipitation from the national grids in `extracted/` (not the
   clipped cube, so NLDI basins may extend past the study basin); regulation class from NID storage over the whole gauge basin; per-gauge results cached
-  in `validation/runoff_<site>.json` so rate-limited runs resume. Cache rules (`load_cached`): a change in
+  per window in `validation/runoff_<site>_<start>_<end>.json` (`result_paths`/`save_result`; `runoff_<site>.json`
+  is the latest run) so rate-limited runs resume. Cache rules (`load_cached`): a change in
   `PRECIP_KEYS` (res, max_missing_pct, releases, rain/snow, tmean releases) recomputes precipitation offline;
   results or skips whose flow window was cut short by the run time are refetched (`flow_stale`); transient
   request errors are never cached. `--gauge` updates only its own gauges in the layers
@@ -43,8 +57,12 @@ That run covered HUC 1408, ppt and tmean for PRISM days Oct 20–31.
 - `scripts/subbasin_totals.py` — basin and subbasin (HUC10/12) depth and volume from the cube (`zone_totals` in
   `storm_total.py`) to `<out>/totals.gpkg` (`basin_total`, `subbasins`); WBD units via `observations.wbd_units`
 - `scripts/build_qgis_project.py` — builds `<out>/QGIS/<name>.qgz` from a folder's outputs (found by standard
-  names; one resolution, 800m preferred; one event total shown; extra tifs mapped only if `tif_kind` recognizes the
-  name). Errors are caught in `build()` and the traceback freed before `exitQgis()`. Runs under QGIS's Python; relaunches itself there (newest QGIS 3.x app by plist version, so projects open in
+  names; one resolution, 800m preferred). `plan_events` (pure, sqlite3 for GeoPackages) picks the storm windows
+  (storm.toml events, else uncertainty files, else the legacy primary total) and each window's rasters (by the
+  `_<start>_<end>` at the end of the name) and layers (`<layer>_<span>`, else the plain layer if made for that
+  window); one group and theme set per window, shared color scales per kind; extra tifs mapped only if
+  `tif_kind` recognizes the name. Validation and subbasin scripts write window-named layers via
+  `write_layer(..., window=(start, end))`; keep new per-window layers in that scheme. Errors are caught in `build()` and the traceback freed before `exitQgis()`. Runs under QGIS's Python; relaunches itself there (newest QGIS 3.x app by plist version, so projects open in
   QGIS 3 and 4; else newest QGIS; or `--qgis-python`/`QGIS_PYTHON`) with Anaconda's PROJ/GDAL/PDAL env vars cleared. Pure helpers are testable without
   QGIS. In GDAL Python keep the dataset referenced while using its band (a temporary dataset frees the band).
 - `scripts/report.py` — `<out>/report/storm_report_<start>_<end>.html` (self-contained: hand-built SVG charts, CSS
@@ -60,7 +78,7 @@ That run covered HUC 1408, ppt and tmean for PRISM days Oct 20–31.
   runs `prism_watershed.py` end to end; `test_build_qgis_project.py` builds a real project when QGIS is installed
 - `data/` — all downloads and outputs (git-ignored; never commit rasters)
 
-`prism_watershed.py` requires `--start`, `--end`, and one of `--huc`/`--boundary`. `--var tmean` (etc.) can share a
+`prism_watershed.py` requires `--start`, `--end`, and one of `--huc`/`--boundary` (or a `storm.toml` in `--out`). `--cache`/`PRISM_CACHE` shares national zips between folders (hard links). `--var tmean` (etc.) can share a
 `ppt` folder: own cube and `<var>_<res>_daily_basin_summary.csv`, no event total (ppt at 4km also gets the
 `<var>_<res>_` summary name; 800m ppt keeps `daily_basin_summary.csv`). `--boundary` runs save `boundary.geojson`,
 which later steps use like `wbd_huc*.geojson`. Basin means are area-weighted everywhere. `storm_total.py` splits rain/snow
@@ -92,9 +110,15 @@ python3 -m venv .venv && source .venv/bin/activate && pip install -r requirement
 Keep `environment.yml` and `requirements.txt` in sync when adding dependencies.
 To run non-interactively without activating, use `conda run -n prism-storm-analysis python ...`.
 The "numpy.ndarray size changed" RuntimeWarning in tests comes from netCDF4 and is harmless.
+Tests set `PRISM_STORM_RETRY_WAIT=0` so retries of the (deliberately failing) offline requests don't wait.
 
 ## Run
 ```
+python scripts/pipeline.py init [--find NAME | --huc CODE | --boundary FILE] [--start ... --end ...] [--run]
+python scripts/pipeline.py run --out DIR [--dry-run] [--from STEP] [--only STEP ...] [--event NAME]
+python scripts/pipeline.py status --out DIR [--offline]
+python scripts/pipeline.py update --out DIR [--check --notify]
+python scripts/check_endpoints.py [--only prism_releases usgs ...]
 python scripts/find_huc.py animas [--digits 4 8] [--state CO]
 python scripts/prism_watershed.py --huc 14080104 --start 2026-10-20 --end 2026-10-27 [--out DIR]
 python scripts/prism_watershed.py --boundary basin.gpkg --start ... --end ...
@@ -168,5 +192,11 @@ Example HUCs: 1408 San Juan basin; 14080101 Upper San Juan; 14080104 Animas.
 
 ## Conventions
 - Python 3.10+, standard argparse CLIs, no notebooks in `scripts/`.
+- Every script: `runtime.add_common_args(ap)`, `a = config.parse_args(ap)`, `run = manifest.start_run(...)`,
+  `runtime.attach(out, run, a)`, stop with `die(msg, code)` (not `sys.exit(msg)`), end with
+  `runtime.run_main(main)`. Write outputs with the runtime atomic helpers. Ask only via `runtime.confirm`.
+- Validation CSV/JSON outputs are also kept as `<name>_<start>_<end>.<ext>` (`runtime.keep_window_copy`); readers
+  use `runtime.window_json` / the windowed file so a folder can hold several events.
+- `conda run` ignores stdin heredocs: put Python in a file to run it with `conda run`.
 - Keep network code separate from raster processing so processing stays testable offline.
 - Check the PRISM and USGS endpoints before relying on them. Endpoint changes break this project more than anything else.

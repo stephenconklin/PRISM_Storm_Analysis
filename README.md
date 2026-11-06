@@ -10,6 +10,7 @@ Commands:
 
 | Command | What it does |
 |---|---|
+| `scripts/pipeline.py` | Runs the whole workflow for a folder from its settings (`init`, `run`, `status`, `update`); resumes, and picks up PRISM and USGS revisions |
 | `scripts/find_huc.py` | Looks up USGS watershed (HUC) codes by name |
 | `scripts/prism_watershed.py` | Downloads daily PRISM grids, clips them to a watershed, writes daily rasters, a summary CSV, an event-total raster, and a daily NetCDF cube |
 | `scripts/storm_total.py` | Reads the cube and reports depth and water volume for any date range, with optional depth and volume rasters / NetCDF |
@@ -20,6 +21,7 @@ Commands:
 | `scripts/validate_snow.py` | Checks the rain/snow split against snow-water gained at SNOTEL stations |
 | `scripts/build_qgis_project.py` | Builds an organized, styled QGIS project from a folder's outputs (run last) |
 | `scripts/report.py` | Writes a self-contained HTML storm report with charts, plus each chart as SVG (run last) |
+| `scripts/check_endpoints.py` | Checks that every external service the tools use is answering |
 
 ## Setup
 
@@ -53,7 +55,13 @@ pip install -r requirements.txt
 `truststore` (included) is needed to download from PRISM; see Troubleshooting.
 
 ## Quick start
-Replace the `<…>` placeholders with your watershed and dates.
+The pipeline runs everything, in the right order, from one settings file per folder:
+```bash
+python scripts/pipeline.py init                  # find the watershed, enter the storm dates, then run
+python scripts/pipeline.py status --out data/huc<HUC>    # later: what PRISM has revised, what is pending
+python scripts/pipeline.py update --out data/huc<HUC>    # pick up the revisions and see what changed
+```
+See `pipeline.py` below. The same steps by hand (replace the `<…>` placeholders with your watershed and dates):
 ```bash
 # 1. Find your watershed's HUC code by name
 python scripts/find_huc.py "<watershed name>"
@@ -78,6 +86,249 @@ python scripts/validate_snow.py --out data/huc<HUC> --start <YYYY-MM-DD> --end <
 python scripts/build_qgis_project.py --out data/huc<HUC>
 python scripts/report.py --out data/huc<HUC>
 ```
+
+## `pipeline.py`: the whole workflow in one command
+
+```bash
+python scripts/pipeline.py init                 # asks for the watershed (name search) and the storm dates
+python scripts/pipeline.py run --out data/huc<HUC>
+python scripts/pipeline.py status --out data/huc<HUC>
+python scripts/pipeline.py update --out data/huc<HUC>
+```
+
+`init` writes the folder's settings, `<out>/storm.toml`, and offers to start the run. Everything can
+also be given as options, for scripts and notebooks:
+```bash
+python scripts/pipeline.py init --find animas --state CO --start 2026-10-21 --end 2026-10-27 --run
+python scripts/pipeline.py init --huc 1408 --start 2026-10-21 --end 2026-10-27 --event trudy --out data/huc1408
+```
+With `--find` it searches WBD names as `find_huc.py` does and lists the matches to choose from. The
+download window is the storm padded by `--pad` days (default 1) on each side.
+
+### Settings: `storm.toml`
+
+```toml
+name = "San Juan, late October 2026"
+huc = "1408"                 # or boundary = "basin.gpkg" (relative to this file)
+res = "800m"
+prism_cache = "~/prism_cache"   # optional: shared national zip cache (see Notes)
+
+[download]                   # PRISM days to download
+start = 2026-10-20
+end = 2026-11-02
+vars = ["ppt", "tmean"]
+
+[[events]]                   # analysis windows; scripts default to the first
+name = "trudy"
+start = 2026-10-21
+end = 2026-10-27
+
+[[events]]
+name = "second"
+start = 2026-10-30
+end = 2026-11-01
+
+[rain_snow]
+all_snow_c = 0.0
+all_rain_c = 3.0
+
+[validation]
+buffer_km = 10.0
+after_days = 7
+gauges = []                  # empty = every USGS gauge in the basin
+
+[subbasins]
+digits = 10
+
+[report]
+gauges = []                  # gauges for the storm timeline; empty = picked automatically
+```
+
+Every script reads it for its defaults, and options on the command line override it, so once a folder
+has settings most commands need only `--out` (and `--event <name>` for an event other than the first):
+```bash
+python scripts/storm_total.py --out data/huc1408 --event second
+python scripts/prism_watershed.py --out data/huc1408 --var tmean --refresh
+```
+Each script prints the settings it took from the file. Keeping the rain/snow ramp and window in one
+place means `storm_total.py`, `validate_runoff.py`, `validate_snow.py` and the report always agree.
+
+### Several storms in one basin
+
+Keep one folder per basin and add each storm as an event; the folder's daily cube holds every day, and
+each event gets its own totals, uncertainty, validation results (files and map layers named
+`<name>_<start>_<end>`), report, and group and map themes in the QGIS project.
+
+1. In `storm.toml`, extend `[download] end` to a day past the new storm, and add an event:
+   ```toml
+   [[events]]
+   name = "nov1"
+   start = 2026-11-01
+   end = 2026-11-03
+   ```
+   An event can also span several storms (for example both, with the dry days between): its runoff ratio
+   then doesn't have to split overlapping recessions.
+2. If the storms are close together, end the earlier storm's flow window before the next storm's runoff:
+   give that event its own `after_days` (it overrides `[validation] after_days`):
+   ```toml
+   [[events]]
+   name = "trudy"
+   start = 2026-10-20
+   end = 2026-10-27
+   after_days = 3
+   ```
+3. `pipeline.py run --out DIR --event nov1` downloads only the new days and runs that storm; the other
+   storms' results are left as they are (rerun one with `--event trudy`).
+4. `pipeline.py update --out DIR` later brings every storm up to date.
+
+An event's own settings follow its window: a script given `--start`/`--end` that match an event (as the
+pipeline does) uses that event's `after_days`.
+
+### `run`
+
+Runs the steps in order, once per event where it applies:
+
+| Step | Script | Notes |
+|---|---|---|
+| `ppt` | `prism_watershed.py` | Download window; a failure stops the run |
+| `tmean` | `prism_watershed.py --var tmean` | When `tmean` is in `[download] vars` |
+| `stations` | `validate_stations.py` | Before `totals`, so the uncertainty includes the gauge comparison |
+| `totals` | `storm_total.py` | Writes `ppt_<res>_total_`, `_volume_`, `_rain_`, `_snow_<start>_<end>.tif`; a failure stops the run |
+| `subbasins` | `subbasin_totals.py` | |
+| `normals` | `storm_context.py --pct-tif ppt_<res>_pct_normal_<start>_<end>.tif` | |
+| `runoff` | `validate_runoff.py` | Rate-limited runs resume where they stopped |
+| `snow` | `validate_snow.py` | |
+| `report` | `report.py` | |
+| `qgis` | `build_qgis_project.py` | When QGIS is installed |
+
+The run ends with a summary (illustrative values):
+```
+Step       Event          Result                                 Time  Log
+ppt        —              ok                                     41 s  logs/20261105-120004/01-ppt.log
+tmean      —              done earlier
+stations   trudy          ok                                      9 s  logs/20261105-120004/03-stations-trudy.log
+totals     trudy          ok                                     12 s  logs/20261105-120004/04-totals-trudy.log
+...
+runoff     trudy          incomplete                            6.2 min  logs/20261105-120004/07-runoff-trudy.log
+```
+
+- **Resume:** `pipeline_state.json` records each step's result and a fingerprint of its inputs (its
+  options, `storm.toml`, the PRISM releases in the folder, and for `totals` the gauge comparison). A
+  rerun skips steps that finished with the same inputs, so after a failure, an interruption or the USGS
+  rate limit, run the same command again. The report and QGIS project are rebuilt whenever an earlier
+  step ran.
+- **Failures:** a failed download (`ppt`) or total stops the run, since later steps need them
+  (`--keep-going` continues anyway). A failed network step (a service down, a rate limit) is recorded and
+  the run goes on; the summary lists it and the run exits with status 3.
+- **Choosing steps:** `--from runoff` reruns from that step on; `--only report qgis`; `--skip snow`;
+  `--event trudy`; `--force` reruns everything; `--no-qgis`.
+- **`--dry-run`:** prints each step's command and whether it would run, checks that the services the
+  planned steps use are answering (`check_endpoints.py`; `--offline` skips this), and compares the space
+  the remaining downloads need with the free disk space.
+- **`--open`:** opens the reports and the QGIS project when the run ends.
+
+### `status` and `update`
+
+`status` shows, without downloading anything, what the folder holds and what to do next (illustrative values):
+```
+San Juan, late October 2026: HUC 1408, 800m; settings data/huc1408/storm.toml
+  ppt    14/14 days (r2: 6, r3: 8); newer at PRISM for 6: 10-27 r2->r3, 10-28 r2->r3, ...
+  tmean  14/14 days (r2: 6, r3: 8); newer at PRISM for 6: ...
+  PRISM revises days for about 6 months; final releases (r8) expected by about 2027-05-04.
+  event trudy (2026-10-21 to 2026-10-27): stations ✓  totals ✓  subbasins ✓  normals ✓  runoff ✓  snow ✓  report ✓
+    gauges: 0 with the flow window not over when fetched, 22 with provisional USGS flow
+  QGIS project: QGIS/huc1408.qgz
+Next:
+  - PRISM has revised 6 ppt day(s): pipeline.py update --out data/huc1408
+```
+It asks PRISM's release service which release each day is at (`--offline` skips that), finds outputs made
+from older releases (each manifest entry records the releases it used), and gauges whose flow window
+hadn't ended when they were fetched.
+
+`update` shows the same status, asks before going on, then:
+1. refreshes `ppt` and `tmean` (`--refresh`: only days PRISM has revised are downloaded again),
+2. reruns every event's steps (runoff re-fetches gauges whose flow window was cut short, and gauges whose
+   flow was provisional when fetched 30 or more days ago, to pick up USGS approvals),
+3. keeps the previous report in `report/history/` and rebuilds the QGIS project,
+4. prints what changed per event: volume and range, releases, PRISM vs gauges, runoff ratios, snow check.
+
+`update --check` only prints the status; `--notify` adds a desktop notification (macOS) when there is
+something to do. PRISM publishes a revision at about D+1, D+5 and then monthly, so a weekly check is
+plenty. A launchd job (macOS) for that, in `~/Library/LaunchAgents/com.prism-storm.update.plist`:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.prism-storm.update</string>
+  <key>ProgramArguments</key><array>
+    <string>/opt/anaconda3/bin/conda</string><string>run</string><string>-n</string><string>prism-storm-analysis</string>
+    <string>python</string><string>/path/to/PRISM_Storm_Analysis/scripts/pipeline.py</string>
+    <string>update</string><string>--out</string><string>/path/to/data/huc1408</string>
+    <string>--check</string><string>--notify</string>
+  </array>
+  <key>StartCalendarInterval</key><dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer></dict>
+</dict></plist>
+```
+Load it with `launchctl load ~/Library/LaunchAgents/com.prism-storm.update.plist`. It runs on this
+machine (the data folder and PRISM's per-IP download limit are here) and only checks; run `update`
+yourself when it says there is something to do.
+
+### Logs, exit codes and interrupted runs
+
+- **Logs:** every script copies its output, with a time stamp per line, to `<out>/logs/` (pipeline steps
+  to `logs/<time>/<nn>-<step>.log`), together with debug detail the terminal doesn't show: each HTTP
+  request with its status, size and time, retries, and rate-limit waits. `--verbose` shows that detail
+  in the terminal too; `--quiet` shows only warnings and errors (the log still has everything). The API
+  key is sent in a header and never logged. Each `run_manifest.json` entry names its log.
+- **Exit codes** (every script):
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | OK |
+  | 1 | QC failed (outputs were written) |
+  | 2 | Bad options or missing inputs |
+  | 3 | Incomplete: rate-limited or partly done; rerun to continue |
+  | 4 | Network failure (run `check_endpoints.py`) |
+  | 5 | Other error |
+  | 130 | Interrupted (Ctrl-C) or cancelled |
+- **Every run is recorded**, including ones that fail, are interrupted or are cancelled: the manifest
+  entry's `status` is one of `ok`, `qc_fail`, `input_error`, `incomplete`, `network_error`, `error`,
+  `interrupted`, with the error message.
+- **Ctrl-C** prints what was kept and the command that continues. Downloads, clipped days, CSVs, JSON,
+  the cube, rasters and the manifest are written to a `.part` file and renamed when complete, and zips
+  are unzipped into a temporary folder, so an interrupted run never leaves a half-written file under its
+  real name. Rerunning the same command picks up where it stopped.
+- **One run per folder at a time:** a run holds `<out>/.lock` (pipeline steps share the pipeline's). A
+  second run in the same folder stops with a message naming the first; a lock left by a run that is
+  gone is taken over automatically.
+- **Network retries:** a dropped connection or timeout is retried (with backoff for the validation
+  services; once for a PRISM download, since each request may count toward the 2-per-24-hours limit;
+  never after PRISM's own reply such as its limit message). USGS rate-limit waits show a countdown.
+- **Questions:** at a terminal, `--refresh` asks before re-downloading revised PRISM files (they count
+  toward the download limit), and `validate_runoff.py --refresh` asks before re-fetching every gauge.
+  `--yes` answers yes; without a terminal (pipelines, scheduled jobs) nothing is asked.
+
+### `check_endpoints.py`: are the services up?
+
+```bash
+python scripts/check_endpoints.py
+python scripts/check_endpoints.py --only prism_releases usgs
+```
+```
+  ok    prism_releases    1.7 s  release 2 for 2026-10-26
+  ok    prism_grids       0.2 s  grid count 2
+  ok    prism_normals     0.9 s  3.2 MB zip
+  ok    wbd              13.7 s  HUC4 query answered
+  ok    usgs              0.3 s  SAN JUAN RIVER AT PAGOSA SPRINGS, CO
+  ok    nldi              0.8 s  gauge feature returned
+  ok    nid               0.3 s  5 dams in the probe box
+  ok    acis              1.9 s  10 stations in the probe box
+  ok    awdb              1.4 s  118 Colorado SNOTEL stations
+```
+One light request per service (PRISM release and grid-count services, a HEAD request for the normals,
+count queries, one USGS request); nothing counts toward a download limit. Exits 4 if any fails. Changes
+to these services break this project more than anything else, so run it when a step fails with a
+network error. `pipeline.py run --dry-run` runs it for the services the planned steps use.
 
 ## Choosing a watershed
 Any watershed in the contiguous US works.
@@ -130,7 +381,7 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--start` / `--end` | required | PRISM days, inclusive; end is capped at yesterday |
+| `--start` / `--end` | required (or from `storm.toml`) | PRISM days, inclusive; end is capped at yesterday |
 | `--huc` / `--boundary` | one required | Watershed to clip to (see Choosing a watershed) |
 | `--out` | `data/huc<code>` or `data/<boundary name>` | Output folder, relative to where you run the command. Use one folder per basin |
 | `--var` | `ppt` | `tmin`, `tmax`, `tmean`, `tdmean`, `vpdmin`, or `vpdmax`. Other variables can share a precipitation folder: they get their own cube and `<var>_<res>_daily_basin_summary.csv` (basin mean, min, and max in °C or hPa) and no event total. `tmean` enables the rain/snow split |
@@ -138,6 +389,8 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 | `--region` | `us` | PRISM region |
 | `--format` | COG GeoTIFF | `nc`, `bil`, or `asc` |
 | `--pause` | `2.0` | Seconds between download requests |
+| `--cache` | `PRISM_CACHE`, else none | Shared folder of national zips for every basin (see Notes) |
+| `-y` / `--yes`, `-v` / `--verbose`, `-q` / `--quiet` | off | Don't ask before `--refresh` re-downloads; show debug detail; show only warnings (every script takes these) |
 | `--refresh` | off | Re-download cached days that PRISM has a newer release of, up to `--target-release` (see Updating to newer PRISM releases) |
 | `--target-release` | `8` | Release to refresh up to (8 is final) |
 | `--refresh-age` | `7` | Only when PRISM's release service can't be reached: re-download zips last downloaded at least this many days ago |
@@ -157,7 +410,11 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 | `daily_basin_summary.csv` | Per day: PRISM release number, area-weighted basin mean and max (mm), and basin mean (in). Covers every day in the folder; a run replaces its own days. Named `<var>_<res>_daily_basin_summary.csv` for other variables or 4 km |
 | `boundary.geojson` | With `--boundary`: the basin polygon, kept so later steps and the QGIS project find it |
 | `normals_zips/`, `normals/`, `ppt_<res>_normals_<start>_<end>.json` | From `storm_context.py`: cached PRISM normals and the percent-of-normal results |
-| `run_manifest.json` | One entry per run of `prism_watershed.py` or `storm_total.py`: command, versions, inputs, outputs with checksums, and QC results |
+| `run_manifest.json` | One entry per run of any script: command, status, log, versions, inputs (and the PRISM releases a windowed output was made from), outputs with checksums, and QC results |
+| `storm.toml` | The folder's settings (`pipeline.py init`); every script reads its defaults from it |
+| `logs/` | Each run's output with time stamps and HTTP detail; `logs/<time>/` for pipeline runs |
+| `pipeline_state.json` | What each pipeline step last did and with which inputs, for resuming |
+| `.lock` | Present while a run is writing to the folder |
 | `<var>_<res>_release_history.csv` | One row per day and PRISM release seen in this folder: basin mean and max (mm) and volume (m³) for `ppt`; mean, min, and max for other variables; and when recorded |
 | `<var>_<res>_total_<start>_<end>.tif` | Sum of the run's days per pixel (mm for `ppt`) |
 | `<var>_<res>_daily_clip.nc` | NetCDF cube: every clipped day in the folder on a time axis (`<var>`, mm) plus `cell_area` (m²) and `release` (PRISM release per day; 0 unknown). Rebuilt on each run, so new days are added automatically |
@@ -234,7 +491,8 @@ python scripts/prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27
 - First real refresh (San Juan, 1 Nov 2026): Oct 26–27 went from release 1 to 2, Oct 26's basin volume
   fell 18.9%, and the Oct 20–27 window volume fell 0.7% (4.719 to 4.685 km³).
 - `tmean` has its own releases: refresh it too (`--var tmean --refresh`) if you use the rain/snow split.
-- Then rerun the later steps in this order, for the same window: `validate_stations.py`, then
+- `pipeline.py update` does all of this (both variables, every event, the report and QGIS project) and
+  prints what changed. By hand, rerun the later steps in this order, for the same window: `validate_stations.py`, then
   `storm_total.py` (its uncertainty reads the station comparison), then `subbasin_totals.py`,
   `validate_runoff.py`, and `validate_snow.py`; last, `build_qgis_project.py` (its basin label reads
   the uncertainty). `validate_runoff.py` notices the new releases and recomputes each saved gauge's
@@ -459,7 +717,8 @@ python scripts/validate_runoff.py --out data/huc<HUC> --gauge <site> [<site> ...
   run uses roughly two per gauge plus a few. When USGS asks the tool to pause, it waits (printing how
   long) for up to `--max-wait-min` (default 15). For a longer pause, the run stops, writes what it has,
   and says when to retry. Rerunning the same command reuses
-  gauges already finished with the same settings (`--refresh` re-fetches everything, for example after
+  gauges already finished for the same window with the same settings (each window keeps its own results,
+  so running another storm doesn't re-fetch them) (`--refresh` re-fetches everything, for example after
   USGS revises provisional data). If only the PRISM releases or the rain/snow settings changed, saved
   gauges keep their flow and only their precipitation and ratios are recomputed. With a free key from
   [api.waterdata.usgs.gov/signup](https://api.waterdata.usgs.gov/signup/), set `USGS_API_KEY` (for example in
@@ -532,12 +791,19 @@ rain fell.
 | `stations.csv`, `station_days.csv` | Same data as the station layers |
 | `stations_summary.json` | All statistics, counts, settings, and exclusion reasons |
 | `runoff_summary.csv` | One row per gauge in the study basin: status, regulation, volumes, and ratios |
-| `runoff_<site>.json` | Areas, daily basin precipitation, flow volumes, peak, gaps, approval, runoff ratios, and regulation (or the skip reason) |
+| `runoff_<site>_<start>_<end>.json` | Areas, daily basin precipitation, flow volumes, peak, gaps, approval, runoff ratios, and regulation (or the skip reason), per window; `runoff_<site>.json` holds the latest run |
 | `runoff_<site>_flow.csv` | 15-minute flow, interpolated flag, and both baseflow lines |
 | `runoff_<site>_basin.geojson` | The gauge's NLDI basin, saved so later runs can reuse it |
 | `snotel.csv`, `snotel_summary.json` | Per SNOTEL station: precipitation, SWE gain, and the three snow shares (or the skip reason); the averages |
 
-`--all-gauges` replaces the gauge layers; `--gauge` adds or replaces just those gauges' rows.
+`--all-gauges` replaces the gauge layers; `--gauge` adds or replaces just those gauges' rows. The CSV and
+JSON files above (except the gauge basin, which doesn't depend on the window) are also kept per window as
+`<name>_<start>_<end>.<ext>`, so one folder can hold the results for several events; `storm_total.py` and
+`report.py` read the window's own copy. The GeoPackage layers hold the latest run under their plain names
+and every window's run as `<layer>_<start>_<end>` (the QGIS project maps each storm from these).
+
+`validate_runoff.py --recheck-provisional-days N` re-fetches gauges whose saved flow was provisional
+(USGS approves discharge over months) and was fetched N or more days ago; `pipeline.py update` uses 30.
 
 ### Reading the validation results
 
@@ -780,7 +1046,8 @@ has a data table under each chart.
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--start` / `--end` | the latest `storm_total.py` window, else the whole cube | PRISM days |
+| `--start` / `--end` | the first event in `storm.toml`, else the latest `storm_total.py` window, else the whole cube | PRISM days |
+| `--keep-previous` | off | Move an existing report for the window to `report/history/` first (`pipeline.py update` does) |
 | `--gauges` | up to 3 gauges not regulated by dams, with the most event runoff | USGS sites for the storm timeline |
 | `--title` | the basin name | Page title |
 | `--res` | `800m` | or `4km` |
@@ -808,26 +1075,37 @@ Finds the outputs in `--out` by their standard names and writes a styled, organi
 
 | Group | Layers (on by default in bold) |
 |---|---|
-| Validation | **USGS gauges** (by regulation, runoff ratio labels), **rain gauges: PRISM − gauge storm total**, rain gauges daily (Temporal), dams, gauge drainage basins, and SNOTEL snow share (from `validate_snow.py`) |
-| Storm totals | **Precipitation depth (mm)** for each run window; precipitation by subbasin (from `subbasin_totals.py`); and any `storm_total.py --tif`/`--volume-tif`/`--rain-tif`/`--snow-tif` rasters saved in the folder (named by what they hold: `volume`/`m3`, `rain`, or `snow`) |
+| Storm: *event* — *dates* (one per storm window) | **Totals:** **basin label** (volume, depth and uncertainty range for the window), **precipitation depth (mm)**, water volume per cell, rain depth, snow-water, percent of normal, precipitation by subbasin. **Validation:** **USGS gauges** (by regulation, runoff ratio labels), **rain gauges: PRISM − gauge storm total**, rain gauges daily (Temporal), gauge drainage basins, SNOTEL snow share. The first window's group is on; the others are off |
+| Other windows | Totals for windows that aren't storms, such as the whole download window or an earlier one-off `storm_total.py --tif` (group off) |
 | Daily precipitation | One raster per PRISM day, each tied to its 24-hour period for the Temporal Controller (group off) |
-| Boundaries | **Study basin** outline, labeled with the storm's total volume and depth when `subbasin_totals.py` has run |
+| Boundaries and dams | **Study basin** outline; dams (NID) |
 | Basemap | **OpenStreetMap** |
+
+**Several storms in one basin.** The storm windows are the events in `storm.toml`, else every window
+`storm_total.py` analyzed (one uncertainty file each), else, for folders made before either existed, the
+event total for the subbasin window (or the longest). Each window's layers come from the window-named
+GeoPackage layers the validation and subbasin scripts write (`stations_<start>_<end>` and so on), so
+running a second storm never replaces the first storm's map layers; a plain layer from an older run is
+used for the window it was made for. Rasters are matched to a window by the dates at the end of their
+names, so older names (`rain_mm_<start>_<end>.tif`) work too. A storm listed in `storm.toml` that hasn't
+been run yet is left out until it has outputs.
 
 - **Layers and symbols** are explained in the [Map guide](#map-guide-layers-symbols-and-how-they-relate-to-prism).
 - **Basin label:** volume, depth, and window, plus the uncertainty range when `storm_total.py` has run for
   the same window as `subbasin_totals.py`.
-- **Colors:** daily rasters share one scale and storm totals another, with round-number classes spread
-  on a log scale from the data's minimum to its maximum; areas below the first class are transparent. Station difference classes are also
+- **Colors:** daily rasters share one scale, and each kind of total (depth, rain, snow, volume, subbasin
+  depth) shares one scale across every storm window, so a color means the same depth in each storm; classes
+  are round numbers spread on a log scale from the data's minimum to its maximum; areas below the first
+  class are transparent. Station difference classes are also
   set from the data, so small storms aren't all one color.
-- **One event total shown:** the one for the subbasin totals' window (else the longest); other event
-  totals are added switched off. Only one resolution is mapped (800 m if present), only precipitation
-  (not `tmean`), and only tifs whose names say what they hold (`depth`, `volume`/`m3`, `rain`, or `snow`).
-- **Map themes:** Storm total; Validation (rain gauges and river gauges over the storm total); Rivers and
-  dams (gauges, their drainage basins, and dams); Volume by subbasin; Rain and snow (rain and snow-water
-  rasters with the SNOTEL comparison); Percent of normal (from `storm_context.py --pct-tif`); and Daily
-  animation (Temporal Controller). Pick one from the
-  Map Themes button in the Layers panel.
+- Only one resolution is mapped (800 m if present), only precipitation (not `tmean`), and only tifs whose
+  names say what they hold (`depth`/`total`, `volume`/`m3`, `rain`, `snow`, or `pct`/`normal`).
+- **Map themes**, one set per storm window (named `<event>: <theme>` when there are several; without the
+  prefix when there is one): Storm total; Validation (rain gauges and river gauges over the storm total);
+  Rivers and dams (gauges, their drainage basins, and dams); Volume by subbasin; Rain and snow (rain and
+  snow-water rasters with the SNOTEL comparison); Percent of normal (from `storm_context.py --pct-tif`);
+  and Daily animation (Temporal Controller). Applying a theme switches to that storm's group. Pick one from
+  the Map Themes button in the Layers panel.
 - **Temporal Controller:** preset to the storm window with a 1-day step. Turn on the Daily
   precipitation group (or apply the Daily animation theme) and press play.
 - **Only precipitation is mapped:** `tmean` (and other variables) in the same folder are left out.
@@ -950,7 +1228,7 @@ gauges, terrain, and climate patterns. Everything else on the map is there to ch
 ### Total volume: study basin label and subbasins
 - **The study basin label** gives the storm's headline numbers on separate lines, for example *"San Juan:
   4.68 km³ = 3.80 million acre-ft / mean 73 mm, max 228 mm, PRISM days 2026-10-20 to 2026-10-27 / range
-  4.63–4.92 km³"*, plus the share of the basin without PRISM data when there is any (14.3% for the Upper
+  4.65–4.92 km³"*, plus the share of the basin without PRISM data when there is any (14.3% for the Upper
   Skagit, in Canada). The range appears when `storm_total.py` has written the uncertainty for the same
   window and resolution.
 - **Subbasins are colored by depth, not volume.** Volume grows with area, so coloring by volume would
@@ -972,7 +1250,8 @@ gauges, terrain, and climate patterns. Everything else on the map is there to ch
 - **Identify** (the i tool) shows every field. The fields are listed under
   [Field reference](#field-reference).
 - **Map themes** (in a built project, the Map Themes button in the Layers panel): Storm total,
-  Validation, Rivers and dams, Volume by subbasin, Rain and snow, Percent of normal, and Daily animation.
+  Validation, Rivers and dams, Volume by subbasin, Rain and snow, Percent of normal, and Daily animation;
+  one set per storm window, prefixed with the event name when the folder has several.
 - **Units:** precipitation in mm (inches in printed summaries and CSV columns ending `_in`); river flow
   in cfs; volumes in m³ (acre-ft in printed summaries); and dam storage in acre-ft and mm over the basin.
 
@@ -991,14 +1270,23 @@ gauges, terrain, and climate patterns. Everything else on the map is there to ch
 - **PRISM day:** 12:00 UTC to 12:00 UTC, labeled with the end date. For example, in Mountain Daylight
   Time the Oct 23 grid covers 6 AM Oct 22 to 6 AM Oct 23. Pad storm windows by a day on each side.
 - **Download limit:** PRISM allows each file to be downloaded only twice per 24 hours per IP. The
-  script caches every zip in `raw_zips/` and never re-requests one it has. The grids are national, so
-  to run a second basin over the same dates without re-downloading, copy `raw_zips/*.zip` into the
-  new `--out` folder's `raw_zips/` first.
+  script caches every zip in `raw_zips/` and never re-requests one it has.
+- **Shared zip cache:** the grids are national, so several basins over the same dates can share them.
+  Set `PRISM_CACHE=~/prism_cache` (or `--cache`, or `prism_cache` in `storm.toml`): zips are kept there
+  and hard-linked into each folder's `raw_zips/` (copied if on another disk), so each file is downloaded
+  once. A folder's own zips are added to the cache; a newer release one basin refreshed is picked up by
+  the others without a download, their older zip archived in `raw_zips/releases/`.
 - **Revisions:** each daily grid is released 8 times over about 6 months (the day after, ~4 days
   later, and then about monthly). The CSV's `release` column and the cube's `release` variable show which
   one you have. Use `--refresh` to update (see Updating to newer PRISM releases).
 
 ## Troubleshooting
+- **`... is in use by another run`:** another run is writing to the same folder (it holds `<out>/.lock`).
+  Wait for it; if that run is gone (the machine restarted), delete the `.lock` file. Locks left by a
+  process that no longer exists on this machine are taken over automatically.
+- **A step fails with a network error (exit 4):** run `python scripts/check_endpoints.py` to see which
+  service isn't answering, then rerun; finished work is kept. The run's log in `<out>/logs/` has each
+  request.
 - **`CERTIFICATE_VERIFY_FAILED` from services.nacse.org:** the server's chain ends at emSign Root
   CA - G1, which Python's certifi bundle lacks. Install `truststore` (in `requirements.txt`) so the
   script uses the operating system's trust store. Don't disable verification.
@@ -1016,7 +1304,9 @@ rainfall timing, and maps in the report) are described in [docs/ROADMAP.md](docs
 python -m pytest tests -q
 ```
 Offline only: synthetic rasters stand in for PRISM downloads, and any request goes to a closed local
-port. `test_build_qgis_project.py` also builds a real project when QGIS is installed (skipped otherwise).
+port (`PRISM_STORM_RETRY_WAIT=0` keeps the retries of those failed requests fast). `test_pipeline.py`
+runs the pipeline end to end, interrupts a run with Ctrl-C and resumes it, and recovers from files a
+crash could leave. `test_build_qgis_project.py` also builds a real project when QGIS is installed (skipped otherwise).
 `.github/workflows/tests.yml` runs the suite on GitHub once the repository is pushed there.
 
 Data: PRISM Group, Oregon State University, https://prism.oregonstate.edu

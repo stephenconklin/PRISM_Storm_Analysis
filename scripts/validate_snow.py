@@ -21,8 +21,8 @@ Days: AWDB daily values are Pacific Standard Time calendar days with end-of-day 
 days start..end are AWDB days start-1..end-1 (4 hours apart; see observations.py).
 
 Needs prism_watershed.py runs for ppt and tmean over the window in --out (national grids in
-<out>/extracted). Outputs in <out>/validation/: snotel.csv, snotel_summary.json, and layer
-'snotel' in validation.gpkg.
+<out>/extracted). Outputs in <out>/validation/: snotel.csv, snotel_summary.json (each also as
+<name>_<start>_<end>.<ext>), and layer 'snotel' in validation.gpkg.
 
 Usage examples:
     python validate_snow.py --out data/huc1408
@@ -31,15 +31,16 @@ Usage examples:
 import argparse
 import csv
 import datetime as dt
-import json
-import sys
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 from shapely.geometry import Point
 
+import config
 import manifest
+import runtime
+from runtime import die
 from storm_total import prism_day_files, snow_fraction
 from validate_stations import INCH_MM, cube_days, load_basin, sample_grid, write_layer
 
@@ -119,8 +120,10 @@ def main():
     ap.add_argument("--min-precip-mm", type=float, default=10.0,
                     help="leave stations with less precipitation out of the summary (default 10 mm)")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"])
-    a = ap.parse_args()
+    runtime.add_common_args(ap)
+    a = config.parse_args(ap)
     run = manifest.start_run("validate_snow.py", a)
+    runtime.attach(a.out, run, a)
 
     out = Path(a.out)
     c0, c1 = cube_days(out, "ppt", a.res)
@@ -129,7 +132,7 @@ def main():
     days = [start + dt.timedelta(days=i) for i in range((end - start).days + 1)]
     ppt_grids = [prism_day_files(out / "extracted", "ppt", a.res, d)[0] for d in days]
     if None in ppt_grids:
-        sys.exit(f"No extracted PRISM ppt grid for every day in {out / 'extracted'}; run prism_watershed.py.")
+        die(f"No extracted PRISM ppt grid for every day in {out / 'extracted'}; run prism_watershed.py.")
     t_grids = [prism_day_files(out / "extracted", "tmean", a.res, d)[0] for d in days]
     if None in t_grids:
         t_grids = None
@@ -140,7 +143,7 @@ def main():
     study = basin.geometry.iloc[0]
     stations = [s for s in snotel_stations(tuple(zone.bounds)) if zone.contains(Point(s["lon"], s["lat"]))]
     if not stations:
-        sys.exit("No active SNOTEL stations in the basin or buffer.")
+        die("No active SNOTEL stations in the basin or buffer.")
     series = snotel_daily([s["triplet"] for s in stations], start - dt.timedelta(days=2), end - dt.timedelta(days=1))
 
     lonlat = [(s["lon"], s["lat"]) for s in stations]
@@ -175,16 +178,18 @@ def main():
 
     vdir = out / "validation"
     vdir.mkdir(exist_ok=True)
-    with open(vdir / "snotel.csv", "w", newline="") as f:
+    with runtime.atomic_open(vdir / "snotel.csv", "w", newline="") as f:
         fields = list(dict.fromkeys(k for r in rows for k in r))
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)
     write_layer(gpd.GeoDataFrame(rows, geometry=[Point(r["lon"], r["lat"]) for r in rows], crs=4269),
-                vdir / "validation.gpkg", "snotel")
+                vdir / "validation.gpkg", "snotel", window=(start, end))
     summary = {"window": {"start": str(start), "end": end.isoformat()},
                "ramp_c": [a.all_snow_c, a.all_rain_c], **summarize(rows, a.min_precip_mm)}
-    (vdir / "snotel_summary.json").write_text(json.dumps(summary, indent=2))
+    runtime.write_json(vdir / "snotel_summary.json", summary)
+    for name in ("snotel.csv", "snotel_summary.json"):  # kept per window too
+        runtime.keep_window_copy(vdir / name, start, end)
 
     def fmt(v):
         return "   -" if v is None else f"{v:4.0f}"
@@ -210,4 +215,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    runtime.run_main(main)

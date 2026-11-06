@@ -17,7 +17,8 @@ In-sample flag: PRISM lists the stations it used each day in *.stn.csv. A gauge
 within --match-km of a listed station is marked in_sample; comparisons against those
 gauges are optimistic because PRISM was fitted to them.
 
-Outputs in <out>/validation/:
+Outputs in <out>/validation/ (each CSV and JSON also as <name>_<start>_<end>.<ext>, so a folder keeps
+results for several windows; the GeoPackage layers hold the latest run):
     validation.gpkg   layers 'stations' (event totals) and 'station_days' (per day,
                       with UTC start/end fields for the QGIS Temporal Controller),
                       each with a default QGIS style
@@ -30,9 +31,7 @@ Usage examples:
 import argparse
 import csv
 import datetime as dt
-import json
 import sqlite3
-import sys
 from collections import Counter
 from pathlib import Path
 
@@ -41,7 +40,10 @@ import numpy as np
 import rasterio
 from shapely.geometry import Point
 
+import config
 import manifest
+import runtime
+from runtime import die
 from storm_total import prism_day_files
 
 INCH_MM = 25.4
@@ -225,11 +227,16 @@ def write_default_style(gpkg, layer, qml_path):
     con.close()
 
 
-def write_layer(gdf, gpkg, layer):
-    gdf.to_file(gpkg, layer=layer, driver="GPKG")
-    qml = STYLE_DIR / f"{layer}.qml"
-    if qml.exists():
-        write_default_style(gpkg, layer, qml)
+def write_layer(gdf, gpkg, layer, window=None, style=None):
+    """Write a GeoPackage layer with its default QGIS style (styles/<layer>.qml). With window=(start, end),
+    also write it as <layer>_<YYYYMMDD>_<YYYYMMDD> (same style), so a folder keeps every storm's layers:
+    the plain name holds the latest run, the window-named one stays for that window. style names the .qml
+    when layer is itself a window-named copy."""
+    qml = STYLE_DIR / f"{style or layer}.qml"
+    for name in [layer] + ([f"{layer}_{runtime.span(*window)}"] if window else []):
+        gdf.to_file(gpkg, layer=name, driver="GPKG")
+        if qml.exists():
+            write_default_style(gpkg, name, qml)
 
 
 # ---------- main ----------
@@ -239,7 +246,7 @@ def load_basin(out, boundary):
         return gpd.read_file(boundary).to_crs(4269).dissolve()
     wbd = sorted(Path(out).glob("wbd_huc*.geojson")) or sorted(Path(out).glob("boundary.geojson"))
     if len(wbd) != 1:
-        sys.exit("Pass --boundary: expected exactly one wbd_huc*.geojson (or boundary.geojson) in --out.")
+        die("Pass --boundary: expected exactly one wbd_huc*.geojson (or boundary.geojson) in --out.")
     return gpd.read_file(wbd[0]).to_crs(4269).dissolve()
 
 
@@ -248,7 +255,7 @@ def cube_days(out, var, res):
     import xarray as xr
     nc = Path(out) / f"{var}_{res}_daily_clip.nc"
     if not nc.exists():
-        sys.exit(f"No cube at {nc}. Run prism_watershed.py with --out {out} first.")
+        die(f"No cube at {nc}. Run prism_watershed.py with --out {out} first.")
     with xr.open_dataset(nc) as ds:
         t = ds.time.values.astype("datetime64[D]").astype(object)
     return min(t), max(t)
@@ -267,8 +274,10 @@ def main():
                     help="hours between station and PRISM day ends allowed in the statistics (default 6)")
     ap.add_argument("--match-km", type=float, default=0.5, help="distance to a PRISM input station for in_sample (default 0.5)")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"])
-    a = ap.parse_args()
+    runtime.add_common_args(ap)
+    a = config.parse_args(ap)
     run = manifest.start_run("validate_stations.py", a)
+    runtime.attach(a.out, run, a)
 
     out = Path(a.out)
     c0, c1 = cube_days(out, "ppt", a.res)
@@ -280,7 +289,7 @@ def main():
     for d in days:
         g, s = prism_day_files(out / "extracted", "ppt", a.res, d)
         if g is None:
-            sys.exit(f"No extracted PRISM grid for {d} in {out / 'extracted'}; run prism_watershed.py for it.")
+            die(f"No extracted PRISM grid for {d} in {out / 'extracted'}; run prism_watershed.py for it.")
         grids[d] = (g, s)
 
     basin = load_basin(out, a.boundary)
@@ -293,7 +302,7 @@ def main():
     poly, zone_poly = basin.geometry.iloc[0], zone.iloc[0]
     acis = [st for st in acis if st["meta"].get("ll") and zone_poly.contains(Point(st["meta"]["ll"]))]
     if not acis:
-        sys.exit("ACIS returned no stations within the basin and buffer.")
+        die("ACIS returned no stations within the basin and buffer.")
     lonlat = [tuple(st["meta"]["ll"]) for st in acis]
     print(f"{len(acis)} ACIS stations within the basin + {a.buffer_km:g} km")
 
@@ -373,17 +382,19 @@ def main():
     vdir.mkdir(exist_ok=True)
     gpkg = vdir / "validation.gpkg"
     for name, rows in (("stations", st_rows), ("station_days", day_rows)):
-        with open(vdir / f"{name}.csv", "w", newline="") as f:
+        with runtime.atomic_open(vdir / f"{name}.csv", "w", newline="") as f:
             wcsv = csv.DictWriter(f, fieldnames=rows[0].keys())
             wcsv.writeheader()
             wcsv.writerows(rows)
+        runtime.keep_window_copy(vdir / f"{name}.csv", start, end)
         gdf = gpd.GeoDataFrame(rows, geometry=gpd.points_from_xy([r["lon"] for r in rows], [r["lat"] for r in rows]),
                                crs=4269)
         if name == "station_days":
             for c in ("period_start", "period_end"):
                 gdf[c] = gpd.pd.to_datetime(gdf[c], utc=True)
-        write_layer(gdf, gpkg, name)
-    (vdir / "stations_summary.json").write_text(json.dumps(summary, indent=2))
+        write_layer(gdf, gpkg, name, window=(start, end))
+    runtime.write_json(vdir / "stations_summary.json", summary)
+    runtime.keep_window_copy(vdir / "stations_summary.json", start, end)
 
     def line(label, s):
         if not s.get("n"):
@@ -411,4 +422,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    runtime.run_main(main)

@@ -155,3 +155,127 @@ def test_build_real_project(tmp_path):
         qgs = z.read(next(n for n in z.namelist() if n.endswith(".qgs"))).decode()
     assert "SNOTEL: PRISM" in qgs and "Study basin" in qgs and "terrain.tif" not in qgs
     assert "Precipitation depth (mm), Oct 21–22, 2026" in qgs and "Precipitation depth (mm), Oct 22, 2026" in qgs
+
+
+# ---------- several storms in one folder ----------
+
+def two_storm_folder(tmp_path):
+    """A folder with two events in storm.toml, their totals, window-named validation and totals layers, an untagged
+    layer from an older run, and a total for a window that is no event."""
+    import json
+    import subprocess
+    import geopandas as gpd
+    from shapely.geometry import Point, box
+    from test_offline import OFFLINE, SCRIPT, make_zip
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import config
+    from validate_stations import write_layer
+    out = tmp_path / "Two_Storms"
+    (out / "raw_zips").mkdir(parents=True)
+    for ymd, v in (("20261021", 10.0), ("20261022", 30.0), ("20261023", 0.0), ("20261024", 20.0)):
+        make_zip(out / "raw_zips", ymd, v)
+    boundary = tmp_path / "basin.geojson"
+    poly = box(-108.4, 37.5, -108.0, 37.7)
+    gpd.GeoDataFrame(geometry=[poly], crs=4269).to_file(boundary)
+    subprocess.run([sys.executable, str(SCRIPT), "--start", "2026-10-21", "--end", "2026-10-24", "--boundary", str(boundary),
+                    "--out", str(out), "--pause", "0"], check=True, capture_output=True, env=OFFLINE)
+    s = {"name": "Two storms", "boundary": str(boundary), "res": "800m",
+         "download": {"start": dt.date(2026, 10, 21), "end": dt.date(2026, 10, 24)},
+         "events": [{"name": "first", "start": dt.date(2026, 10, 21), "end": dt.date(2026, 10, 22)},
+                    {"name": "second", "start": dt.date(2026, 10, 24), "end": dt.date(2026, 10, 24)},
+                    {"name": "planned", "start": dt.date(2026, 10, 23), "end": dt.date(2026, 10, 23)}]}  # not run
+    (out / "storm.toml").write_text(config.render(s))
+    for start, end in (("2026-10-21", "2026-10-22"), ("2026-10-24", "2026-10-24")):
+        sp = f"{start.replace('-', '')}_{end.replace('-', '')}"
+        subprocess.run([sys.executable, str(SCRIPT.parent / "storm_total.py"), "--out", str(out), "--start", start, "--end",
+                        end, "--tif", str(out / f"ppt_800m_total_{sp}.tif"), "--volume-tif",
+                        str(out / f"ppt_800m_volume_{sp}.tif")], check=True, capture_output=True, env=OFFLINE)
+        mean = 40.0 if sp.startswith("20261021") else 20.0
+        bt = {"name": "Test basin", "huc": None, "prism_start": start, "prism_end": end, "area_km2": 784.1,
+              "coverage_pct": 100.0, "mean_mm": mean, "max_mm": mean, "volume_m3": mean * 784.1e3,
+              "volume_km3": mean * 784.1e-6, "volume_acre_ft": round(mean * 784.1e3 / 1233.48), "res": "800m"}
+        write_layer(gpd.GeoDataFrame([bt], geometry=[poly], crs=4269), out / "totals.gpkg", "basin_total",
+                    window=(start, end))
+        (out / "validation").mkdir(exist_ok=True)
+        st = {"station": "A", "in_stats": True, "in_sample": False, "diff_mm": -2.0 if mean > 30 else 3.0,
+              "obs_mm": mean, "prism_mm": mean - 2}
+        write_layer(gpd.GeoDataFrame([st], geometry=[Point(-108.2, 37.6)], crs=4269), out / "validation" / "validation.gpkg",
+                    "stations", window=(start, end))
+    (out / "validation" / "stations_summary.json").write_text(json.dumps({"window": {"start": "2026-10-24",
+                                                                                      "end": "2026-10-24"}}))
+    # an older run's untagged snotel layer, made for the first window
+    gpd.GeoDataFrame([{"triplet": "1:CO:SNTL", "name": "S", "status": "ok"}], geometry=[Point(-108.1, 37.6)],
+                     crs=4269).to_file(out / "validation" / "validation.gpkg", layer="snotel")
+    (out / "validation" / "snotel_summary.json").write_text(json.dumps({"window": {"start": "2026-10-21",
+                                                                                    "end": "2026-10-22"}}))
+    return out
+
+
+def test_plan_events_groups_each_storm(tmp_path):
+    from build_qgis_project import gpkg_layers, plan_events
+    out = two_storm_folder(tmp_path)
+    assert {"stations", "stations_20261021_20261022", "stations_20261024_20261024", "snotel"} <= gpkg_layers(
+        out / "validation" / "validation.gpkg")
+    events, other = plan_events(discover(out))
+    assert [e["name"] for e in events] == ["first", "second"]  # 'planned' has no outputs yet
+    first, second = events
+    assert first["label"] == "first — Oct 21–22, 2026" and first["span"] == "20261021_20261022"
+    assert {k: p.name for k, p in first["rasters"].items()} == {"depth": "ppt_800m_total_20261021_20261022.tif",
+                                                                 "volume": "ppt_800m_volume_20261021_20261022.tif"}
+    assert first["layers"]["stations"][1] == "stations_20261021_20261022"
+    assert first["layers"]["basin_total"][1] == "basin_total_20261021_20261022"
+    assert first["layers"]["snotel"][1] == "snotel"          # untagged, made for this window
+    assert "snotel" not in second["layers"]
+    assert second["layers"]["stations"][1] == "stations_20261024_20261024"
+    assert [p.name for k, p in other] == ["ppt_800m_total_20261021_20261024.tif"]  # the download window's total
+
+
+def test_plan_events_without_settings_uses_uncertainty_files(tmp_path):
+    import json
+    from build_qgis_project import plan_events
+    out = tmp_path / "f"
+    (out / "clipped").mkdir(parents=True)
+    (out / "clipped" / "ppt_800m_20261021_clip.tif").write_bytes(b"x")
+    for sp in ("20261021_20261022", "20261024_20261024"):
+        (out / f"ppt_800m_total_{sp}.tif").write_bytes(b"x")
+        (out / f"ppt_800m_uncertainty_{sp}.json").write_text(json.dumps({"volume_m3": 1, "range_m3": [1, 1]}))
+    (out / "rain_mm_20261021_20261022.tif").write_bytes(b"x")  # older naming, matched by its window
+    events, other = plan_events(discover(out))
+    assert [e["label"] for e in events] == ["PRISM days Oct 21–22, 2026", "PRISM days Oct 24, 2026"]
+    assert events[0]["rasters"]["rain"].name == "rain_mm_20261021_20261022.tif" and other == []
+
+
+def test_write_layer_keeps_a_copy_per_window(tmp_path):
+    import geopandas as gpd
+    from shapely.geometry import Point
+    from build_qgis_project import gpkg_layers, gpkg_window
+    from validate_stations import write_layer
+    gpkg = tmp_path / "v.gpkg"
+    for start in ("2026-10-21", "2026-10-24"):
+        write_layer(gpd.GeoDataFrame([{"site": "1", "prism_start": start, "prism_end": start}],
+                                     geometry=[Point(0, 0)], crs=4269), gpkg, "gauges", window=(start, start))
+    assert gpkg_layers(gpkg) == {"gauges", "gauges_20261021_20261021", "gauges_20261024_20261024"}
+    assert gpkg_window(gpkg, "gauges") == (dt.date(2026, 10, 24), dt.date(2026, 10, 24))  # the latest run
+    import sqlite3
+    styled = {r[0] for r in sqlite3.connect(gpkg).execute("SELECT f_table_name FROM layer_styles")}
+    assert styled == gpkg_layers(gpkg)  # every copy carries the style
+
+
+def test_build_real_project_with_two_storms(tmp_path):
+    import subprocess
+    import zipfile
+    from build_qgis_project import find_qgis_python
+    if not find_qgis_python()[0]:
+        pytest.skip("QGIS not installed")
+    out = two_storm_folder(tmp_path)
+    res = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "scripts" / "build_qgis_project.py"),
+                          "--out", str(out)], capture_output=True, text=True, timeout=300)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "Storm windows: first — Oct 21–22, 2026; second — Oct 24, 2026" in res.stdout
+    with zipfile.ZipFile(out / "QGIS" / "Two_Storms.qgz") as z:
+        qgs = z.read(next(n for n in z.namelist() if n.endswith(".qgs"))).decode()
+    for text in ("Storm: first — Oct 21–22, 2026", "Storm: second — Oct 24, 2026", "Other windows",
+                 "Precipitation depth (mm), Oct 21–22, 2026", "Water volume per cell (m³), Oct 24, 2026",
+                 "Basin total: 0.03 km³", "Basin total: 0.02 km³", "first: Storm total", "second: Validation",
+                 "layername=stations_20261024_20261024", "layername=snotel", "Boundaries and dams"):
+        assert text in qgs, text
