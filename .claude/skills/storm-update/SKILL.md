@@ -5,7 +5,11 @@ description: Bring an existing PRISM storm analysis folder up to date with PRISM
 
 # Update a storm folder
 
-1. **Status first (no downloads):**
+1. **Status first (no downloads):** a folder made before 7 Nov 2026 (outputs at its top level) must be
+   migrated first; every command says so. `pipeline.py migrate --out <DIR> --dry-run` lists the moves
+   (offline, renames only); show the user, then run it without `--dry-run`.
+
+   
    `conda run -n prism-storm-analysis python scripts/pipeline.py status --out <DIR>`
    It lists days PRISM has revised (from its release service, which doesn't count toward the download
    limit), outputs made from older releases, gauges whose flow window was cut short or is provisional,
@@ -14,7 +18,7 @@ description: Bring an existing PRISM storm analysis folder up to date with PRISM
    toward PRISM's limit of 2 per file per 24 h per IP. Say how many files.
 3. **Update:** `conda run -n prism-storm-analysis python scripts/pipeline.py update --out <DIR> --yes`
    (run in the background for large basins). It refreshes ppt and tmean, reruns every event, keeps the
-   previous report in `report/history/`, and prints per-event changes.
+   previous report in `events/<event>/report/history/`, and prints per-event changes.
 4. **Report the changes** it printed (volume and range, releases, gauge bias, runoff ratios, snow check),
    with the releases now in use and the date final releases are expected (`status` prints it).
 5. Exit 3 means some steps are incomplete (often the USGS rate limit): rerun the same `update` later.

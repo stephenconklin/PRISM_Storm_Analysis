@@ -14,63 +14,80 @@ Hurricane Trudy; rain began ~Oct 21, San Juan at Pagosa Springs crested
 That run covered HUC 1408, ppt and tmean for PRISM days Oct 20–31.
 
 ## Layout
+- `scripts/layout.py` — stdlib only; **every path goes through it** (`Layout(out)`, `Store`). A folder:
+  `storm.toml`, `basin/` (boundary, `gauges/<site>_basin.geojson`, `dams.gpkg`), `daily/` (`clipped/`, cubes,
+  daily summaries, release histories, the download window's total), `events/<name>/` (one per storm window:
+  `event.json`, `totals/`, `subbasins/`, `validation/` with `runoff/`, `report/`), `qgis/`, `run/` (state,
+  manifest, logs, `.lock`). A window that is no storm.toml event gets `events/<start>_<end>/`. File and layer
+  names inside event folders keep `_<start>_<end>`; there are no "latest" copies. `prepare_event` makes a
+  window's folder before writing (moves files when an event is renamed or redated). National data lives in the
+  shared store (`prism_store` in storm.toml, `PRISM_STORE`, else `<out>/../prism_store`; `prism_cache`/
+  `PRISM_CACHE`/`--cache` are aliases): `zips/<region>/<res>/<var>/` (+ `releases/`), `extracted/.../<stem>_r<n>/`
+  (one folder per release), `normals/`. Scripts stop on an old-layout folder (`layout.legacy`) with the migrate
+  command. Compare folders with `os.path.samefile`, not paths: the disk is case-insensitive (`QGIS`/`qgis`)
+- `scripts/migrate.py` — `pipeline.py migrate [--dry-run]`: old layout → current, offline, renames only; store
+  dedup by zip members (newer release current, older archived); GeoPackages split per window with styles; finished
+  steps keep their fingerprints (`carry_over_state`); anything ambiguous goes to `run/pre_migration/`
 - `scripts/pipeline.py` — `init` (writes `storm.toml`), `run` (all steps in order as subprocesses; resumes from
-  `<out>/pipeline_state.json` fingerprints; network steps soft, `ppt`/`totals` hard), `status`, `update` (refresh +
-  rerun + what changed). Step arguments are computed when the step starts (earlier steps make inputs)
+  `run/pipeline_state.json` fingerprints; network steps soft, `ppt`/`totals` hard), `status`, `update` (refresh +
+  rerun + what changed), `migrate`. Step arguments are computed when the step starts (earlier steps make inputs);
+  a fingerprint covers the step's arguments and storm.toml, so editing storm.toml makes every step rerun
 - `scripts/config.py` — per-folder settings `<out>/storm.toml` (TOML: tomllib, tomli on 3.10); `config.parse_args(ap)`
   fills defaults from it (role `download` for prism_watershed, `event` for the rest; adds `--event`); flags win.
   An event may set its own `after_days`; it applies when `--event` or `--start`/`--end` select that event
 - `scripts/runtime.py` — stdlib only: exit codes (0 ok, 1 QC, 2 input, 3 incomplete, 4 network, 5 error, 130
-  interrupted), `die()`, `run_main()` (records failed/interrupted runs in the manifest), `attach()` (folder `.lock`,
-  log in `<out>/logs/`), `write_atomic`/`atomic_open`/`atomic_path` (`.part` + rename), `confirm()` (only at a
-  terminal), `windowed()`/`window_json()` for per-window validation copies
+  interrupted), `die()`, `run_main()` (records failed/interrupted runs in the manifest), `attach()` (`run/.lock`,
+  log in `run/logs/`, stops on an old-layout folder), `write_atomic`/`atomic_open`/`atomic_path` (`.part` +
+  rename), `confirm()` (only at a terminal), `windowed()`/`window_json()` for per-window file names
 - `scripts/check_endpoints.py` — one light probe per external service; `STEP_SERVICES` maps pipeline steps to them
 - `.claude/skills/` — `storm-run`, `storm-update`, `check-endpoints`, `report-check`
 - `scripts/find_huc.py` — look up WBD HUC codes by name (network only)
-- `scripts/prism_watershed.py` — download → unzip → clip → daily CSV + event-total raster + daily NetCDF cube
-- `scripts/storm_total.py` — `build_cube`, ellipsoidal `cell_area_m2`, `prism_day_files` (national grid lookup in
-  `extracted/`), and a CLI that totals depth/volume for any date range from the cube, with releases, revision
+- `scripts/prism_watershed.py` — download (to the store) → unzip (store, per release) → clip → daily CSV +
+  download-window total + daily NetCDF cube
+- `scripts/storm_total.py` — `build_cube`, ellipsoidal `cell_area_m2`, `prism_day_files` (national grid in the store
+  at the release the folder's clipped day carries, so another basin's refresh doesn't change it; unzips an archived
+  release on demand), and a CLI that totals depth/volume for any date range from the cube, with releases, revision
   change (from the release history) and boundary sensitivity (centers / area-weighted / touched, from the national
-  grids). Volumes use per-row GRS80 cell areas on the native grid; don't reproject or resample. NetCDF outputs are CF-1.10
+  grids). It turns off PROJ's network grid downloads (`pyproj.network`): offline, a NAD83↔WGS 84 transform
+  otherwise returns infinite coordinates. Volumes use per-row GRS80 cell areas on the native grid; don't reproject or resample. NetCDF outputs are CF-1.10
   (`cf_time`, `cf_globals`, `VAR_CF`): time = 00:00 UTC on the day label (the midpoint) with `time_bnds` 12:00–12:00 UTC;
   keep it there, since date selection relies on it.
 - `scripts/uncertainty.py` — pure components (gauges, boundary, revisions, products) and the bounding range
-  (sum of lows/highs) for `storm_total.py`; writes `<out>/ppt_<res>_uncertainty_<start>_<end>.json`, which the QGIS
+  (sum of lows/highs) for `storm_total.py`; writes `events/<e>/totals/ppt_<res>_uncertainty_<start>_<end>.json`, which the QGIS
   basin label reads. Method and judgments in `docs/UNCERTAINTY.md`; keep it in step with the code
 - `scripts/qc.py` — pure QC check functions (pass/warn/fail/skip) run at the end of `prism_watershed.py` and
   `storm_total.py`; any fail → exit status 1 after outputs are written; `--qc-strict` makes warnings fail
-- `scripts/manifest.py` — appends one entry per run of any script to `<out>/run_manifest.json` (`runs` list,
+- `scripts/manifest.py` — appends one entry per run of any script to `<out>/run/run_manifest.json` (`runs` list,
   written atomically): command, status, log, git commit, versions, basin source, per-day URL/SHA-256/release/info.txt
   fields, outputs with SHA-256, QC, and `input_releases` (cube releases for the entry's window; `status` uses it)
 - `scripts/observations.py` — all network access for validation (RCC-ACIS stations, USGS Water Data API, NLDI,
   National Inventory of Dams, WBD units, NRCS AWDB SNOTEL); `_get` retries 429/503 and raises `RateLimited` on long waits
 - `scripts/validate_stations.py` — gauge vs PRISM comparison; pure functions for ACIS parsing, day alignment,
-  event totals and stats; writes `validation/validation.gpkg` with styles from `styles/*.qml`
+  event totals and stats; writes the event's `validation/validation.gpkg` with styles from `styles/*.qml`
 - `scripts/validate_runoff.py` — gauge-basin precipitation volume vs 15-minute streamflow, runoff ratio, for
-  `--gauge` sites or `--all-gauges`; gauge-basin precipitation from the national grids in `extracted/` (not the
+  `--gauge` sites or `--all-gauges`; gauge-basin precipitation from the national grids in the store (not the
   clipped cube, so NLDI basins may extend past the study basin); regulation class from NID storage over the whole gauge basin; per-gauge results cached
-  per window in `validation/runoff_<site>_<start>_<end>.json` (`result_paths`/`save_result`; `runoff_<site>.json`
-  is the latest run) so rate-limited runs resume. Cache rules (`load_cached`): a change in
+  per window in `events/<e>/validation/runoff/runoff_<site>_<start>_<end>.json` (`result_paths`/`save_result`;
+  gauge basins in `basin/gauges/`, dams in `basin/dams.gpkg`) so rate-limited runs resume. Cache rules (`load_cached`): a change in
   `PRECIP_KEYS` (res, max_missing_pct, releases, rain/snow, tmean releases) recomputes precipitation offline;
   results or skips whose flow window was cut short by the run time are refetched (`flow_stale`); transient
   request errors are never cached. `--gauge` updates only its own gauges in the layers
 - `scripts/validate_snow.py` — rain/snow split vs SNOTEL SWE gain (observed, station-data split, PRISM split) per
-  station; `validation/snotel.csv`, `snotel_summary.json`, layer `snotel`; pure functions `snotel_window`, `prism_split`
+  station; `validation/snotel_<span>.csv`, `snotel_summary_<span>.json`, layer `snotel_<span>`; pure functions `snotel_window`, `prism_split`
 - `scripts/storm_context.py` — storm vs PRISM 1991–2020 normals (prorated monthly, or `--daily-normals`); normals
-  cached in `<out>/normals_zips/`; `ppt_<res>_normals_<start>_<end>.json` feeds the report tile; `--pct-tif` map
+  cached in the store's `normals/`; `totals/ppt_<res>_normals_<start>_<end>.json` feeds the report tile; `--pct-tif` map
 - `scripts/subbasin_totals.py` — basin and subbasin (HUC10/12) depth and volume from the cube (`zone_totals` in
-  `storm_total.py`) to `<out>/totals.gpkg` (`basin_total`, `subbasins`); WBD units via `observations.wbd_units`
-- `scripts/build_qgis_project.py` — builds `<out>/QGIS/<name>.qgz` from a folder's outputs (found by standard
-  names; one resolution, 800m preferred). `plan_events` (pure, sqlite3 for GeoPackages) picks the storm windows
-  (storm.toml events, else uncertainty files, else the legacy primary total) and each window's rasters (by the
-  `_<start>_<end>` at the end of the name) and layers (`<layer>_<span>`, else the plain layer if made for that
-  window); one group and theme set per window, shared color scales per kind; extra tifs mapped only if
+  `storm_total.py`) to the event's `subbasins/totals.gpkg` (`basin_total_<span>`, `subbasins_<span>`); WBD units via `observations.wbd_units`
+- `scripts/build_qgis_project.py` — builds `<out>/qgis/<name>.qgz` from a folder's outputs (`discover` via
+  `layout`; one resolution, 800m preferred). `plan_events` (pure, sqlite3 for GeoPackages) picks the storm windows
+  (storm.toml events, else uncertainty files, else the longest total) and each window's rasters (by the
+  `_<start>_<end>` at the end of the name) and layers (`<layer>_<span>` in that event's GeoPackages); one group and theme set per window, shared color scales per kind; extra tifs mapped only if
   `tif_kind` recognizes the name. Validation and subbasin scripts write window-named layers via
   `write_layer(..., window=(start, end))`; keep new per-window layers in that scheme. Errors are caught in `build()` and the traceback freed before `exitQgis()`. Runs under QGIS's Python; relaunches itself there (newest QGIS 3.x app by plist version, so projects open in
   QGIS 3 and 4; else newest QGIS; or `--qgis-python`/`QGIS_PYTHON`) with Anaconda's PROJ/GDAL/PDAL env vars cleared. Pure helpers are testable without
   QGIS. In GDAL Python keep the dataset referenced while using its band (a temporary dataset frees the band).
-- `scripts/report.py` — `<out>/report/storm_report_<start>_<end>.html` (self-contained: hand-built SVG charts, CSS
-  light/dark tokens, no external resources) and `report/figures/*.svg`. Colors are the dataviz skill's validated
+- `scripts/report.py` — `events/<e>/report/storm_report_<start>_<end>.html` (self-contained: hand-built SVG charts, CSS
+  light/dark tokens, no external resources), `report/figures/*.svg`, `--web` copies in `report/web/`. Colors are the dataviz skill's validated
   slots 1–3; check charts by screenshot (headless Chrome) after layout changes. Sections skip with a note when
   their inputs are missing or for another window
 - PyQGIS returns a NULL object (not None) for empty fields: filter with `is_number()`. Build inside an inner
@@ -81,32 +98,34 @@ That run covered HUC 1408, ppt and tmean for PRISM days Oct 20–31.
 - `tests/` — offline only (synthetic rasters; requests go to a closed local port via `OFFLINE` env). `test_offline.py`
   runs `prism_watershed.py` end to end; `test_pipeline.py` runs the pipeline, interrupts it with Ctrl-C and resumes;
   `test_build_qgis_project.py` builds a real project when QGIS is installed (skipped otherwise, e.g. in CI:
-  `.github/workflows/tests.yml` runs the suite from `environment.yml` on every push/PR)
+  `.github/workflows/tests.yml` runs the suite from `environment.yml` on every push/PR); `test_migrate.py`
+  migrates a synthetic old-layout folder. Tests seed zips with `zips(out)` (the default store next to `out`)
 - `data/` — all downloads and outputs (git-ignored; never commit rasters)
 
-`prism_watershed.py` requires `--start`, `--end`, and one of `--huc`/`--boundary` (or a `storm.toml` in `--out`). `--cache`/`PRISM_CACHE` shares national zips between folders (hard links). `--var tmean` (etc.) can share a
+`prism_watershed.py` requires `--start`, `--end`, and one of `--huc`/`--boundary` (or a `storm.toml` in `--out`). `--store` picks the PRISM store. `--var tmean` (etc.) can share a
 `ppt` folder: own cube and `<var>_<res>_daily_basin_summary.csv`, no event total (ppt at 4km also gets the
-`<var>_<res>_` summary name; 800m ppt keeps `daily_basin_summary.csv`). `--boundary` runs save `boundary.geojson`,
+`<var>_<res>_` summary name; 800m ppt keeps `daily_basin_summary.csv`). `--boundary` runs save `basin/boundary.geojson`,
 which later steps use like `wbd_huc*.geojson`. Basin means are area-weighted everywhere. `storm_total.py` splits rain/snow
 from the `tmean` cube (`snow_fraction`, `rain_snow`); `validate_runoff.py` adds rain-only ratios from national
-`tmean` grids in `extracted/`. Discovery globs that mean precipitation must say `ppt_` (e.g. QGIS `discover`).
-Outputs (default `--out data/huc<code>` or `data/<boundary stem>`): `raw_zips/`, `extracted/`, `clipped/<var>_<res>_YYYYMMDD_clip.tif`,
+`tmean` grids in the store. Discovery globs that mean precipitation must say `ppt_` (e.g. QGIS `discover`).
+Outputs (default `--out data/huc<code>` or `data/<boundary stem>`), all in `daily/`: `clipped/<var>_<res>_YYYYMMDD_clip.tif`,
 `daily_basin_summary.csv` (every day in the folder; a run replaces its own days), `<var>_<res>_total_<start>_<end>.tif`, `<var>_<res>_daily_clip.nc` (rebuilt each run
 from every tif in `clipped/`, so one `--out` folder = one basin), `<var>_<res>_release_history.csv`. `--end` is capped at yesterday.
 
 Releases: the release is read from the zip's info.txt; clipped tifs carry it as tag `PRISM_DATASET_RELEASE_NUMBER`
 and the cube as `release` (0 unknown). `--refresh` re-downloads days whose release PRISM's releaseDate service reports as newer
 (`available_releases`; if unreachable, zips at least `--refresh-age` days old, file mtime = last checked) and moves a superseded zip to
-`raw_zips/releases/<stem>_r<n>.zip`. `extract_grid` re-extracts when `extracted/` holds another release. A newer
-release replaces the day everywhere; older values live only in the history CSV and archived zips. Other event-total
-tifs covering a revised day are reported as out of date (`stale_totals`).
+the store's `releases/<stem>_r<n>.zip`. `extract_grid` unzips each release into its own `<stem>_r<n>/` and prunes
+older unzipped releases (re-made on demand from `releases/`). A newer release replaces the day in this folder;
+older values live in the history CSV and archived zips. Other total tifs covering a revised day are reported as
+out of date (`stale_totals`).
 `validate_runoff.py` run keys include releases; a release-only change recomputes precipitation without network.
 
-The offline test runs the script as a subprocess with zips pre-seeded in `raw_zips/` and a local
-`--boundary`, so the cache check skips every network call. Zips are cached under an exact name from
-`zip_name()`: `prism_<var>_<region>_<rescode>_<YYYYMMDD>[_<format>].zip` (rescode `30s` 800 m, `25m` 4 km;
-`RES_CODES` in `storm_total.py`), which equals PRISM's own name for the default COG. Never match cache or
-extracted files without the resolution code. If you change cache naming or lookup, keep the test working.
+The offline test runs the script as a subprocess with zips pre-seeded in the store and a local
+`--boundary`, so the cache check skips every network call. Zips are stored under an exact name from
+`layout.zip_name()`: `prism_<var>_<region>_<rescode>_<YYYYMMDD>[_<format>].zip` (rescode `30s` 800 m, `25m` 4 km;
+`RES_CODES` in `layout.py`), which equals PRISM's own name for the default COG. Never match store or
+extracted files without the resolution code. If you change store naming or lookup, keep the test working.
 
 ## Setup
 ```
@@ -124,6 +143,7 @@ python scripts/pipeline.py init [--find NAME | --huc CODE | --boundary FILE] [--
 python scripts/pipeline.py run --out DIR [--dry-run] [--from STEP] [--only STEP ...] [--event NAME]
 python scripts/pipeline.py status --out DIR [--offline]
 python scripts/pipeline.py update --out DIR [--check --notify]
+python scripts/pipeline.py migrate --out DIR [--dry-run]           # a folder made before 7 Nov 2026
 python scripts/check_endpoints.py [--only prism_releases usgs ...]
 python scripts/find_huc.py animas [--digits 4 8] [--state CO]
 python scripts/prism_watershed.py --huc 14080104 --start 2026-10-20 --end 2026-10-27 [--out DIR]
@@ -157,7 +177,7 @@ The script calls `truststore.inject_into_ssl()` to use the OS trust store; never
   - Retired syntax: `services.nacse.org/prism/data/public/4km/...` — do not use.
 - 800m time series has been free since 27 Mar 2025. Daily data from 1981-01-01.
 - **Hard limit: the same file can be downloaded only twice per 24 h per IP.** Always cache zips
-  in `data/.../raw_zips` and never re-request one that exists. Pause ~2 s between requests.
+  in the PRISM store (`prism_store/zips/`) and never re-request one that exists. Pause ~2 s between requests.
 - Stability is no longer in filenames or labeled early/provisional/stable. The zip's `*.info.txt` has
   `PRISM_DATASET_RELEASE_NUMBER` (1–8): daily grids are released at D+1, D+5, then ~monthly for 6 months.
   Recent days are remodeled for ~6 months, so re-pull later for final numbers with `--refresh`.

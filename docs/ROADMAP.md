@@ -8,7 +8,7 @@ Per `CLAUDE.md`, check every external endpoint before building on it.
 
 Effort: **S** (an afternoon), **M** (a few days), **L** (a week or more).
 
-## Where the tool stands (5 Nov 2026)
+## Where the tool stands (7 Nov 2026)
 
 | Area | Today |
 |---|---|
@@ -19,7 +19,8 @@ Effort: **S** (an afternoon), **M** (a few days), **L** (a week or more).
 | Uncertainty | `uncertainty.py`: volume with a bounding range (gauges, boundary, revisions); other products not yet assessed |
 | Validation | `validate_stations.py` (1.1), `validate_runoff.py` (1.2, with rain-only ratios), `validate_snow.py` (SNOTEL check of the rain/snow split); 1.3 not started |
 | Provenance | `run_manifest.json` (one entry per run); releases in the CSV, clipped tifs and cube; release history CSV |
-| Workflow | `pipeline.py` (`init`, `run`, `status`, `update`) from per-folder settings (`storm.toml`); resume, logs, exit codes, folder lock, atomic writes, shared zip cache; `check_endpoints.py` (section 9) |
+| Workflow | `pipeline.py` (`init`, `run`, `status`, `update`, `migrate`) from per-folder settings (`storm.toml`); resume, logs, exit codes, folder lock, atomic writes; `check_endpoints.py` (section 9) |
+| Folders | `layout.py`: basin/, daily/, events/<event>/, qgis/, run/; national data in one PRISM store for every basin, kept per release (section 10) |
 | Engineering | Git (tag `v0.1.0`); offline pytest, including a real QGIS build when QGIS is installed; GitHub Actions workflow (runs once pushed); no packaging |
 
 ## Multi-basin test (31 Oct 2026)
@@ -59,8 +60,7 @@ gauges whose basins lie mostly outside the study basin are skipped; `--gauge` ru
 7. ~~**Workflow and pipeline** (9)~~ — built 5 Nov 2026.
 8. **Engineering** (8). Git, a first tag and a CI workflow are in place (CI runs once the repo has a GitHub
    remote); packaging and logging as the tool grows.
-9. **Output folder layout** (10): one folder per storm, a shared national PRISM store, and an offline
-   `pipeline.py migrate`. Do it before more basins are run, since each new folder is one more to migrate.
+9. ~~**Output folder layout** (10)~~ — built 7 Nov 2026; the four folders in `PRISM_data/` migrated.
 
 ---
 
@@ -565,7 +565,7 @@ everything downstream by hand, with nothing saying which outputs were out of dat
 | Lock | `<out>/.lock`; a second run in the folder stops with a message; stale locks are taken over; pipeline steps share the pipeline's |
 | Retries | Validation services: dropped connections, timeouts, 502/504 with backoff; PRISM downloads: one retry, never after PRISM's own reply (its limit message) |
 | Prompts | At a terminal only: before `--refresh` re-downloads (download limit), before `validate_runoff.py --refresh`; `--yes`; progress `[i/n]` with time left; a countdown during rate-limit waits |
-| Shared zip cache | `--cache`, `PRISM_CACHE` or `prism_cache`: zips hard-linked into each folder; a newer release from one basin's refresh reaches the others without a download |
+| Shared zip cache | `--cache`, `PRISM_CACHE` or `prism_cache`: zips hard-linked into each folder; a newer release from one basin's refresh reaches the others without a download (replaced 7 Nov 2026 by the PRISM store, section 10) |
 | Window-named validation outputs | Station, SNOTEL and runoff summaries and flow CSVs also as `<name>_<start>_<end>.<ext>`, so a folder holds several events; readers prefer them |
 | Fixes | The report used a hard-coded 0–3 °C ramp; it now uses the window's (uncertainty JSON, else `storm.toml`). `storm_total.py` now says when the gauge comparison is for another window instead of dropping it silently |
 | `check_endpoints.py` | One light request per service (nine); nothing counts toward a download limit |
@@ -585,9 +585,31 @@ matching `--start`/`--end`); validation and subbasin GeoPackage layers are also 
   (`runoff_<site>_<start>_<end>.json`).
 - `status` doesn't yet flag the SNOTEL lag in ACIS for windows ending within a few days of the run.
 - Batch: several basins from one list (each folder already has its own settings; a loop over folders
-  with the shared cache is the remaining piece).
+  with the shared store is the remaining piece).
 
-## 10. Output folder layout — L
+## 10. Output folder layout — L (built 7 Nov 2026)
+
+> **Status: built 7 Nov 2026** as `scripts/layout.py` (every path), `scripts/migrate.py` and
+> `pipeline.py migrate`, with tests in `tests/test_migrate.py` and the store tests in `tests/test_pipeline.py`
+> and `tests/test_validation.py`. The four folders in `PRISM_data/` were migrated (San Juan, Elkhorn, Upper
+> Skagit, Upper St. Johns) with network access blocked. Checked: every file's content is still in the
+> folder or the store except `run_manifest.json` and `pipeline_state.json` (which migrate updates); San
+> Juan's `status` is unchanged apart from the `qgis/` path; its regenerated reports differ only in the
+> footer line and its figures are byte-identical; its rebuilt QGIS project has the same 58 layers and
+> themes, all valid; every GeoPackage layer split per window has the original's row count; the totals and
+> SNOTEL split recomputed from the store match the saved results. The store holds each national day once
+> (2.5 GB for the four basins).
+>
+> Differences from the plan: steps 1 and 2 (route every path, then switch) were done as one change, and the
+> store (step 4) with them, since the tests cover all three together; migration has no journal, because
+> every step checks what is already done, so a rerun continues where an interrupted one stopped. A
+> folder's GeoPackages are split per window (`validation.gpkg` and `totals.gpkg` in each event folder,
+> dams in `basin/dams.gpkg`). Found while migrating: QGIS/qgis are one folder on macOS (compare folders with
+> `os.path.samefile`); the builder's `.qgz.bak` would overwrite an older backup (now kept in
+> `run/pre_migration/qgis/`); the three test folders' older backups (from 31 Oct) were overwritten before
+> that fix. San Juan's per-gauge results for the Trudy and Nov 1 windows had already been overwritten by
+> the later Oct 20–Nov 3 run (the old "latest" files); their summaries and flow files are intact, and the
+> next `validate_runoff.py` run for those windows fetches the gauges again, as it would have before.
 
 **Goal:** A basin folder that a person can read at a glance: one folder per storm, national PRISM data
 kept once for all basins, and pipeline bookkeeping out of the way. Existing folders move to the new

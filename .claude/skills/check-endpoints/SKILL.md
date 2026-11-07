@@ -8,7 +8,7 @@ description: Check that the external services PRISM Storm Analysis depends on (P
 1. `conda run -n prism-storm-analysis python scripts/check_endpoints.py` (or `--only <name> ...`).
    One light request per service; nothing counts toward a download limit. It makes one USGS request of
    the 1,000/hour allowed, so don't loop it.
-2. All `ok`: the problem is elsewhere; read the failing step's log in `<out>/logs/`.
+2. All `ok`: the problem is elsewhere; read the failing step's log in `<out>/run/logs/`.
 3. A `FAIL`:
    - Connection errors or timeouts on one host: likely an outage; check again later before changing code.
    - An HTTP error, or `unexpected reply`: the service may have changed. Fetch the endpoint once by hand
