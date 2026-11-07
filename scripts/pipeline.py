@@ -485,14 +485,14 @@ def folder_status(c, offline=False):
             with open(summary, newline="") as f:
                 rows = [r for r in csv.DictReader(f) if r.get("status") == "ok"]
             e["flow_pending"] = sum(r.get("flow_complete") == "False" for r in rows)
-            for r in rows:
+            for r in rows:  # flow not known to be approved: provisional, or no saved result to tell
                 try:
                     saved = next(p for p in result_paths(c.lay.runoff_dir(ev[1], ev[2]), r["site"], ev[1], ev[2])
                                  if p.exists())
-                    if not flow_approved(json.loads(saved.read_text())):
-                        e["provisional"] += 1
+                    approved = flow_approved(json.loads(saved.read_text()))
                 except (OSError, ValueError, StopIteration):
-                    pass
+                    approved = False
+                e["provisional"] += not approved
         if any(v == "missing" or v.startswith("failed") for v in e["outputs"].values()):
             st["actions"].append(f"event {ev[0]}: some outputs missing or failed last time: "
                                  f"pipeline.py run --out {c.out}")
