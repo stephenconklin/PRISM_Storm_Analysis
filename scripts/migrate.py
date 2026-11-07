@@ -537,7 +537,11 @@ def rebuild_qgis(out, qgis_python=None):
     from build_qgis_project import find_qgis_python
     if not find_qgis_python(qgis_python)[0]:
         return "QGIS not found: rebuild the project later with build_qgis_project.py"
-    names = [p.stem for p in Layout(out, settings={}).qgis_dir.glob("*.qgz")]
+    lay = Layout(out, settings={})
+    names = [p.stem for p in lay.qgis_dir.glob("*.qgz")]
+    for bak in lay.qgis_dir.glob("*.qgz.bak"):  # the rebuild writes the current project there: keep the older one
+        target = lay.run_dir / "pre_migration" / "qgis" / bak.name
+        move(bak, target if not target.exists() else target.with_name(target.name + ".2"))
     cmd = [sys.executable, str(Path(__file__).resolve().parent / "build_qgis_project.py"), "--out", str(out)]
     for name in names or [None]:
         res = subprocess.run(cmd + (["--name", name] if name else []) + (["--qgis-python", qgis_python] if qgis_python else []),

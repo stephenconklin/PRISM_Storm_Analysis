@@ -100,6 +100,7 @@ def legacy_folder(root, name="Basin", release=2):
         (r / f).write_text(f)
     (out / "QGIS").mkdir()
     (out / "QGIS" / f"{name}.qgz").write_bytes(b"qgz")
+    (out / "QGIS" / f"{name}.qgz.bak").write_bytes(b"older")
     (out / "logs" / "20261105-163619").mkdir(parents=True)
     (out / "logs" / "20261105-163619-pipeline.log").write_text("log")
     (out / "run_manifest.json").write_text(json.dumps({"runs": [{"script": "storm_total.py"}]}))
@@ -199,6 +200,20 @@ def test_migrate_moves_everything_and_keeps_finished_steps(tmp_path):
     status = subprocess.run([sys.executable, str(PIPELINE), "status", "--out", str(out), "--offline"],
                             capture_output=True, text=True, env=OFFLINE)
     assert status.returncode == 0, status.stdout + status.stderr
+
+
+def test_rebuilding_the_project_keeps_the_older_backup(tmp_path, monkeypatch):
+    import build_qgis_project
+    import migrate as m
+    out = legacy_folder(tmp_path)
+    assert migrate(out).returncode == 0
+    calls = []
+    monkeypatch.setattr(build_qgis_project, "find_qgis_python", lambda explicit=None: ("qgis-python", ""))
+    monkeypatch.setattr(m.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or
+                        type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    assert m.rebuild_qgis(out).startswith("QGIS project rebuilt") and calls
+    assert (out / "run" / "pre_migration" / "qgis" / "Basin.qgz.bak").read_bytes() == b"older"
+    assert not (out / "qgis" / "Basin.qgz.bak").exists()  # the builder makes a new one from Basin.qgz
 
 
 def test_migrate_shares_the_store_between_basins(tmp_path):
