@@ -54,12 +54,19 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pyproj
 import rasterio
 from rasterio import features
 from rasterio.transform import from_origin
 from rasterio.windows import from_bounds
 import shapely
 import xarray as xr
+
+# No PROJ grid downloads. conda-forge's PROJ turns network access on, and a NAD83 <-> WGS 84 transformation
+# whose grid isn't cached then returns infinite coordinates when the download fails (offline, a proxy, an
+# expired cache entry) instead of falling back. Without the network PROJ uses a transformation it has: the
+# datums differ by about a meter, far below PRISM's 800 m cells. Every script that reprojects imports this.
+pyproj.network.set_network_enabled(False)
 
 import config
 import manifest
