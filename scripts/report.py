@@ -259,6 +259,15 @@ def pick_gauges(rows, wanted=None, n=3):
     return sorted(free, key=lambda r: -(num(r["runoff_const_m3"]) or 0))[:n]
 
 
+def missing_gauges(rows, wanted, picked):
+    """(site, reason) for each asked-for gauge left off the timeline: the skip reason from the runoff
+    summary, or that it has no result for the window."""
+    shown = {g["site"] for g in picked}
+    status = {r["site"]: r["status"] for r in rows}
+    return [(w, status[w] if status.get(w, "ok") != "ok" else "no runoff result for this window")
+            for w in wanted or [] if w not in shown]
+
+
 # ---------- charts ----------
 
 def timeline_chart(basin, gauges, flows):
@@ -581,8 +590,8 @@ def main():
     ap.add_argument("--out", required=True, help="folder the PRISM Storm Analysis tools wrote to")
     ap.add_argument("--start", help="first PRISM day (default: the latest storm_total.py window, else the cube)")
     ap.add_argument("--end", help="last PRISM day")
-    ap.add_argument("--gauges", nargs="+", help="USGS sites for the storm timeline (default: up to 3 of the largest "
-                    "compared gauges not regulated by dams)")
+    ap.add_argument("--gauges", nargs="+", help="USGS sites for the storm timeline, any number (default when none given: "
+                    "the 3 compared gauges not regulated by dams with the most event runoff)")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"])
     ap.add_argument("--title", help="report title (default: name in storm.toml, else the basin name from the folder)")
     ap.add_argument("--keep-previous", action="store_true",
@@ -660,9 +669,11 @@ def main():
 
     sections, figures = [], {}
     # 1. Timeline.
-    runoff = [r for r in read_csv(window_file(vdir / "runoff_summary.csv", start, end))
-              if r.get("prism_start") == start and r.get("prism_end") == end]
+    summary = read_csv(window_file(vdir / "runoff_summary.csv", start, end))
+    runoff = [r for r in summary if r.get("prism_start") == start and r.get("prism_end") == end]
     gauges = pick_gauges(runoff, a.gauges)
+    for site, why in missing_gauges(summary, a.gauges, gauges):
+        print(f"Note: gauge {site} left off the timeline: {why}")
     flows = []
     for g in gauges:
         rows = read_csv(window_file(rdir / f"runoff_{g['site']}_flow.csv", start, end))

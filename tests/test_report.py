@@ -9,7 +9,7 @@ from shapely.geometry import box
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
-from report import pick_gauges, standalone, ticks, top_rounded_bar  # noqa: E402
+from report import missing_gauges, pick_gauges, standalone, ticks, top_rounded_bar  # noqa: E402
 from test_offline import OFFLINE, SCRIPT, make_zip, zips  # noqa: E402
 
 
@@ -26,6 +26,10 @@ def test_pick_gauges_prefers_runoff_and_skips_regulated():
             {"site": "gap", "status": "discharge gap", "regulation": "", "runoff_const_m3": "", "area_km2": "100"}]
     assert [g["site"] for g in pick_gauges(rows, n=2)] == ["main", "dry"]
     assert [g["site"] for g in pick_gauges(rows, ["dam"])] == ["dam"]
+    picked = pick_gauges(rows, ["dam", "gap", "none"])
+    assert missing_gauges(rows, ["dam", "gap", "none"], picked) == [
+        ("gap", "discharge gap"), ("none", "no runoff result for this window")]
+    assert missing_gauges(rows, None, pick_gauges(rows)) == []
 
 
 def test_standalone_svg_has_colors():

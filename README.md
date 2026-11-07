@@ -1074,7 +1074,7 @@ has a data table under each chart.
 |---|---|---|
 | `--start` / `--end` | the first event in `storm.toml`, else the latest `storm_total.py` window, else the whole cube | PRISM days |
 | `--keep-previous` | off | Move an existing report for the window to its `report/history/` first (`pipeline.py update` does) |
-| `--gauges` | up to 3 gauges not regulated by dams, with the most event runoff | USGS sites for the storm timeline |
+| `--gauges` | when none given: the 3 gauges not regulated by dams with the most event runoff | USGS sites for the storm timeline, any number; a named gauge without a runoff result for the window is left off with a printed note |
 | `--title` | the basin name | Page title |
 | `--res` | `800m` | or `4km` |
 
