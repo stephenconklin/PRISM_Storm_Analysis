@@ -13,7 +13,7 @@ from shapely.geometry import box
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import manifest  # noqa: E402
 import qc  # noqa: E402
-from test_offline import SCRIPT, make_zip  # noqa: E402
+from test_offline import SCRIPT, make_zip, zips  # noqa: E402
 
 D1, D2 = dt.date(2026, 10, 21), dt.date(2026, 10, 22)
 
@@ -89,7 +89,7 @@ def test_manifest_appends_runs(tmp_path):
         entry = manifest.start_run("storm_total.py", args)
         entry["qc"] = []
         manifest.append_run(tmp_path, entry)
-    runs = json.loads((tmp_path / "run_manifest.json").read_text())["runs"]
+    runs = json.loads((tmp_path / "run" / "run_manifest.json").read_text())["runs"]
     assert len(runs) == 2
     assert {"script", "command", "args", "started", "finished", "git_commit", "versions"} <= set(runs[0])
     assert {"python", "rasterio", "gdal", "proj", "xarray", "netCDF4"} <= set(runs[0]["versions"])
@@ -100,8 +100,7 @@ def test_manifest_appends_runs(tmp_path):
 def test_pipeline_manifest_and_corrupt_zip(tmp_path):
     """A run records each day in the manifest; a corrupt cached zip fails QC (exit 1) and is set aside."""
     out = tmp_path / "run"
-    raw = out / "raw_zips"
-    raw.mkdir(parents=True)
+    raw = zips(out)
     make_zip(raw, "20261021", 10.0)
     make_zip(raw, "20261022", 30.0)
     boundary = tmp_path / "basin.geojson"
@@ -110,12 +109,12 @@ def test_pipeline_manifest_and_corrupt_zip(tmp_path):
            "--boundary", str(boundary), "--out", str(out), "--pause", "0"]
     res = subprocess.run(cmd, check=True, capture_output=True, text=True)
     assert "QC: WARN" in res.stdout and "release_mix" in res.stdout  # release 2 days
-    run = json.loads((out / "run_manifest.json").read_text())["runs"][-1]
+    run = json.loads((out / "run" / "run_manifest.json").read_text())["runs"][-1]
     assert {"basin", "window", "days", "qc", "outputs"} <= set(run)
     assert run["basin"]["sha256"] == manifest.sha256(boundary)
     day = run["days"][0]
     assert day["release"] == "2" and len(day["sha256"]) == 64 and day["info"]["PRISM_DATASET_VERSION"] == "D2"
-    assert any(o["path"] == "ppt_800m_daily_clip.nc" for o in run["outputs"])
+    assert any(o["path"] == "daily/ppt_800m_daily_clip.nc" for o in run["outputs"])
 
     strict = subprocess.run(cmd + ["--qc-strict"], capture_output=True, text=True)
     assert strict.returncode == 1 and "QC: FAIL" in strict.stdout
@@ -124,7 +123,7 @@ def test_pipeline_manifest_and_corrupt_zip(tmp_path):
     bad = subprocess.run(cmd[:5] + ["2026-10-22"] + cmd[6:], capture_output=True, text=True)
     assert bad.returncode == 1 and "download_integrity" in bad.stdout and "not a valid zip" in bad.stdout
     assert (raw / "prism_ppt_us_30s_20261022.zip.bad").exists()
-    assert len(json.loads((out / "run_manifest.json").read_text())["runs"]) == 3
+    assert len(json.loads((out / "run" / "run_manifest.json").read_text())["runs"]) == 3
 
 
 def test_manifest_skips_hash_for_huge_files(tmp_path, monkeypatch):

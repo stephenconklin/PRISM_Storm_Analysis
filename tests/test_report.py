@@ -10,7 +10,7 @@ from shapely.geometry import box
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 from report import pick_gauges, standalone, ticks, top_rounded_bar  # noqa: E402
-from test_offline import OFFLINE, SCRIPT, make_zip  # noqa: E402
+from test_offline import OFFLINE, SCRIPT, make_zip, zips  # noqa: E402
 
 
 def test_ticks_and_bars():
@@ -38,9 +38,8 @@ def run_folder(tmp_path_factory):
     """A synthetic folder with a cube and a storm_total.py run, but no validation (so some sections are missing)."""
     tmp_path = tmp_path_factory.mktemp("report")
     out = tmp_path / "run"
-    (out / "raw_zips").mkdir(parents=True)
     for ymd, v in (("20261021", 10.0), ("20261022", 30.0)):
-        make_zip(out / "raw_zips", ymd, v)
+        make_zip(zips(out), ymd, v)
     boundary = tmp_path / "basin.geojson"
     gpd.GeoDataFrame(geometry=[box(-108.4, 37.5, -108.0, 37.7)], crs=4269).to_file(boundary)
     subprocess.run([sys.executable, str(SCRIPT), "--start", "2026-10-21", "--end", "2026-10-22", "--boundary",
@@ -57,24 +56,29 @@ def report(out, *args):
     return res
 
 
+def rep(out):
+    """The report folder of the test window (no storm.toml, so the folder is named for the window)."""
+    return out / "events" / "20261021_20261022" / "report"
+
+
 SECTION_IDS = ("timeline", "gauges", "runoff", "uncertainty", "snow")
 
 
 def test_report_end_to_end(run_folder):
     out = run_folder
     report(out)
-    page = (out / "report" / "storm_report_20261021_20261022.html").read_text()
+    page = (rep(out) / "storm_report_20261021_20261022.html").read_text()
     assert "Storm timeline" in page
     assert "30 mm" in page                                     # the peak day is labeled
     assert "Not shown: run validate_stations.py" in page        # missing validation is explained, not an error
     assert "Volume and its uncertainty" in page and "Total range" in page
-    assert (out / "report" / "figures" / "timeline_20261021_20261022.svg").exists()
+    assert (rep(out) / "figures" / "timeline_20261021_20261022.svg").exists()
     assert 'src="http' not in page and "<link" not in page and "@import" not in page  # no external resources
 
 
 def test_report_sections_have_ids_and_title_has_dates(run_folder):
     report(run_folder)
-    page = (run_folder / "report" / "storm_report_20261021_20261022.html").read_text()
+    page = (rep(run_folder) / "storm_report_20261021_20261022.html").read_text()
     for id_ in SECTION_IDS:
         assert f'<h2 id="{id_}">' in page, id_
     # a "Not shown" section keeps its anchor
@@ -85,7 +89,7 @@ def test_report_sections_have_ids_and_title_has_dates(run_folder):
 
 def test_web_report_has_no_local_paths_or_operator_notes(run_folder, tmp_path):
     out = run_folder
-    local = (out / "report" / "storm_report_20261021_20261022.html")
+    local = (rep(out) / "storm_report_20261021_20261022.html")
     report(out)
     before = local.read_text()
     res = report(out, "--web", "--web-out", str(tmp_path / "site"))
@@ -102,9 +106,9 @@ def test_web_report_has_no_local_paths_or_operator_notes(run_folder, tmp_path):
     assert 'class="back"' not in page
     assert local.read_text() == before                           # the local report is left alone
     assert "Web report:" in res.stdout
-    # without --web-out the page sits next to the local one
+    # without --web-out the page goes to the window's report/web/
     report(out, "--web")
-    assert (out / "report" / "storm_report_20261021_20261022_web.html").exists()
+    assert (rep(out) / "web" / "storm_report_20261021_20261022.html").exists()
 
 
 def test_web_report_back_link(run_folder, tmp_path):

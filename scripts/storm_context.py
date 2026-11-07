@@ -10,9 +10,10 @@ For a window of PRISM days it reports, over the basin (area-weighted, the cells 
 
 Normals are not on PRISM's data web service; they come from PRISM's file server
 (https://data.prism.oregonstate.edu/normals/<region>/<res>/<var>/<monthly|daily>/, checked 1 Nov 2026),
-cached in <out>/normals_zips/ (a monthly 800 m normal is ~58 MB, a daily one ~67 MB; 4 km files are far
-smaller). Writes <out>/ppt_<res>_normals_<start>_<end>.json, read by report.py, and with --pct-tif a
-GeoTIFF of percent of normal per cell.
+cached in the PRISM store's normals/<region>/<res>/ppt/ (a monthly 800 m normal is ~58 MB, a daily one
+~67 MB; 4 km files are far smaller). Writes ppt_<res>_normals_<start>_<end>.json in the window's
+<out>/events/<event>/totals/ (layout.py), read by report.py, and with --pct-tif a GeoTIFF of percent
+of normal per cell.
 
 Usage examples:
     python storm_context.py --out data/huc1408 --start 2026-10-20 --end 2026-10-27
@@ -35,6 +36,7 @@ import xarray as xr
 import config
 import manifest
 import runtime
+from layout import Layout
 from runtime import die
 from storm_total import RES_CODES, cube_transform, window_total, write_tif
 
@@ -86,7 +88,7 @@ def normal_on_cube(zpath, ds):
     """A normal grid (mm) read on the cube's cells. Exits if PRISM's grid doesn't line up with the cube."""
     with zipfile.ZipFile(zpath) as z:
         tif = next(n for n in z.namelist() if n.endswith(".tif"))
-        dest = zpath.parent.parent / "normals" / zpath.stem
+        dest = zpath.parent / zpath.stem
         if not (dest / tif).exists():
             (dest / tif).parent.mkdir(parents=True, exist_ok=True)
             with runtime.atomic_path(dest / tif) as tmp, z.open(tif) as src, open(tmp, "wb") as dst:
@@ -128,11 +130,12 @@ def main():
     runtime.attach(a.out, run, a)
 
     out = Path(a.out)
-    nc = out / f"ppt_{a.res}_daily_clip.nc"
+    lay = Layout(out)
+    nc = lay.cube("ppt", a.res)
     if not nc.exists():
         die(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
-    zdir = out / "normals_zips"
-    zdir.mkdir(exist_ok=True)
+    zdir = lay.store.normals_dir("ppt", a.res, a.region)
+    zdir.mkdir(parents=True, exist_ok=True)
     session = requests.Session()
     session.headers["User-Agent"] = "prism-storm-analysis"
 
@@ -167,6 +170,7 @@ def main():
             month_rows.append({"month": calendar.month_name[month], "normal_mm": round(m_mm, 1),
                                "storm_pct_of_month": None if m_pct is None else round(m_pct, 1)})
         if a.pct_tif:
+            Path(a.pct_tif).parent.mkdir(parents=True, exist_ok=True)
             with np.errstate(divide="ignore", invalid="ignore"):
                 pct_grid = np.where(window_normal > 0, storm / window_normal * 100, np.nan)
             write_tif(r["total_mm"].copy(data=pct_grid), ds.crs.attrs["crs_wkt"], a.pct_tif, "percent")
@@ -175,8 +179,9 @@ def main():
     result = {"window": {"start": str(start), "end": str(end)}, "normals": "PRISM 1991-2020", "method": method,
               "storm_mm": round(s_mm, 1), "window_normal_mm": round(n_mm, 1),
               "percent_of_normal": None if pct is None else round(pct, 1), "months": month_rows}
-    span = f"{start:%Y%m%d}_{end:%Y%m%d}"
-    jpath = out / f"ppt_{a.res}_normals_{span}.json"
+    lay.prepare_event(start, end)
+    jpath = lay.normals_json(a.res, start, end)
+    jpath.parent.mkdir(parents=True, exist_ok=True)
     runtime.write_json(jpath, result)
     print(f"PRISM days {start} to {end}: basin {s_mm:.1f} mm vs a normal of {n_mm:.1f} mm for these days "
           f"({method}): {pct:.0f}% of normal")

@@ -1,7 +1,7 @@
 """
 Run manifest: how a folder's outputs were made.
 
-<out>/run_manifest.json holds {"runs": [...]}, one entry appended per run of any script
+<out>/run/run_manifest.json holds {"runs": [...]}, one entry appended per run of any script
 that writes to the folder, so a folder refreshed over months keeps its whole history.
 Each entry records the command and arguments, start and end time, status (ok, qc_fail,
 input_error, incomplete, network_error, error, interrupted; see runtime.py), the log file,
@@ -20,6 +20,8 @@ import platform
 import subprocess
 import sys
 from pathlib import Path
+
+import layout
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -113,7 +115,7 @@ def window_releases(out, start, end, res=None):
     except ImportError:
         return {}
     found = {}
-    for nc in sorted(Path(out).glob("*_daily_clip.nc")):
+    for nc in sorted(layout.Layout(out, settings={}).daily_dir.glob("*_daily_clip.nc")):
         var, nc_res = nc.name.split("_")[:2]
         if var not in ("ppt", "tmean") or (res and nc_res != res):
             continue
@@ -126,9 +128,13 @@ def window_releases(out, start, end, res=None):
     return found
 
 
+def manifest_path(out):
+    return layout.Layout(out, settings={}).manifest_file
+
+
 def read_runs(out):
-    """The runs list of <out>/run_manifest.json ([] if there is none or it can't be read)."""
-    path = Path(out) / "run_manifest.json"
+    """The runs list of <out>/run/run_manifest.json ([] if there is none or it can't be read)."""
+    path = manifest_path(out)
     try:
         return json.loads(path.read_text()).get("runs", []) if path.exists() else []
     except ValueError:
@@ -136,7 +142,7 @@ def read_runs(out):
 
 
 def append_run(out, entry):
-    """Finish the entry and append it to <out>/run_manifest.json. Returns the manifest path."""
+    """Finish the entry and append it to <out>/run/run_manifest.json. Returns the manifest path."""
     entry["finished"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     if "status" not in entry:
         entry["status"] = "qc_fail" if any(c.get("level") == "fail" for c in entry.get("qc") or []) else "ok"
@@ -145,7 +151,8 @@ def append_run(out, entry):
         entry["input_releases"] = window_releases(out, window["start"], window["end"],
                                                   (entry.get("args") or {}).get("res"))
     entry.pop("_appended", None)
-    path = Path(out) / "run_manifest.json"
+    path = manifest_path(out)
+    path.parent.mkdir(parents=True, exist_ok=True)
     runs = read_runs(out)
     if not runs and path.exists() and path.stat().st_size:
         try:

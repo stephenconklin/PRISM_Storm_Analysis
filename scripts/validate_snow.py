@@ -20,9 +20,9 @@ independent test is the snow share.
 Days: AWDB daily values are Pacific Standard Time calendar days with end-of-day SWE, so PRISM
 days start..end are AWDB days start-1..end-1 (4 hours apart; see observations.py).
 
-Needs prism_watershed.py runs for ppt and tmean over the window in --out (national grids in
-<out>/extracted). Outputs in <out>/validation/: snotel.csv, snotel_summary.json (each also as
-<name>_<start>_<end>.<ext>), and layer 'snotel' in validation.gpkg.
+Needs prism_watershed.py runs for ppt and tmean over the window in --out (national grids in the PRISM
+store). Outputs in the window's <out>/events/<event>/validation/ (layout.py): snotel_<start>_<end>.csv,
+snotel_summary_<start>_<end>.json, and layer 'snotel_<start>_<end>' in validation.gpkg.
 
 Usage examples:
     python validate_snow.py --out data/huc1408
@@ -40,6 +40,7 @@ from shapely.geometry import Point
 import config
 import manifest
 import runtime
+from layout import Layout
 from runtime import die
 from storm_total import prism_day_files, snow_fraction, utm_crs
 from validate_stations import INCH_MM, cube_days, load_basin, sample_grid, write_layer
@@ -113,7 +114,7 @@ def main():
     ap.add_argument("--out", required=True, help="folder prism_watershed.py wrote to")
     ap.add_argument("--start", help="first PRISM day (default: first day in the cube)")
     ap.add_argument("--end", help="last PRISM day (default: last day in the cube)")
-    ap.add_argument("--boundary", help="basin polygon (default: the wbd_huc*.geojson in --out)")
+    ap.add_argument("--boundary", help="basin polygon (default: the basin in --out/basin)")
     ap.add_argument("--buffer-km", type=float, default=10.0, help="also use stations this far outside the basin (default 10)")
     ap.add_argument("--all-snow-c", type=float, default=0.0, help="all snow at or below this daily mean (default 0 °C)")
     ap.add_argument("--all-rain-c", type=float, default=3.0, help="all rain at or above this daily mean (default 3 °C)")
@@ -130,10 +131,11 @@ def main():
     start = dt.date.fromisoformat(a.start) if a.start else c0
     end = dt.date.fromisoformat(a.end) if a.end else c1
     days = [start + dt.timedelta(days=i) for i in range((end - start).days + 1)]
-    ppt_grids = [prism_day_files(out / "extracted", "ppt", a.res, d)[0] for d in days]
+    lay = Layout(out)
+    ppt_grids = [prism_day_files(lay, "ppt", a.res, d)[0] for d in days]
     if None in ppt_grids:
-        die(f"No extracted PRISM ppt grid for every day in {out / 'extracted'}; run prism_watershed.py.")
-    t_grids = [prism_day_files(out / "extracted", "tmean", a.res, d)[0] for d in days]
+        die(f"No national PRISM ppt grid for every day in the PRISM store ({lay.store.root}); run prism_watershed.py.")
+    t_grids = [prism_day_files(lay, "tmean", a.res, d)[0] for d in days]
     if None in t_grids:
         t_grids = None
         print("No PRISM tmean grids for every day; PRISM split skipped (run prism_watershed.py --var tmean).")
@@ -176,20 +178,21 @@ def main():
                      "prism_snow_pct": share(p_snow, p_ppt),
                      "station_mean_tavg_c": None if w["mean_tavg_c"] is None else round(w["mean_tavg_c"], 1)})
 
-    vdir = out / "validation"
-    vdir.mkdir(exist_ok=True)
-    with runtime.atomic_open(vdir / "snotel.csv", "w", newline="") as f:
+    lay.prepare_event(start, end)
+    vdir = lay.validation_dir(start, end)
+    vdir.mkdir(parents=True, exist_ok=True)
+    csv_path, json_path, gpkg = (lay.validation_file("snotel.csv", start, end),
+                                 lay.validation_file("snotel_summary.json", start, end), lay.validation_gpkg(start, end))
+    with runtime.atomic_open(csv_path, "w", newline="") as f:
         fields = list(dict.fromkeys(k for r in rows for k in r))
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)
     write_layer(gpd.GeoDataFrame(rows, geometry=[Point(r["lon"], r["lat"]) for r in rows], crs=4269),
-                vdir / "validation.gpkg", "snotel", window=(start, end))
+                gpkg, "snotel", window=(start, end))
     summary = {"window": {"start": str(start), "end": end.isoformat()},
                "ramp_c": [a.all_snow_c, a.all_rain_c], **summarize(rows, a.min_precip_mm)}
-    runtime.write_json(vdir / "snotel_summary.json", summary)
-    for name in ("snotel.csv", "snotel_summary.json"):  # kept per window too
-        runtime.keep_window_copy(vdir / name, start, end)
+    runtime.write_json(json_path, summary)
 
     def fmt(v):
         return "   -" if v is None else f"{v:4.0f}"
@@ -210,7 +213,7 @@ def main():
               f"{summary['prism_snow_pct']}%; PRISM snow / observed SWE gain = {summary['prism_over_observed_snow']}")
     print(f"Outputs in {vdir.resolve()}")
     run.update(window={"start": str(start), "end": str(end)},
-               outputs=manifest.files_entry([vdir / "snotel.csv", vdir / "snotel_summary.json", vdir / "validation.gpkg"], out))
+               outputs=manifest.files_entry([csv_path, json_path, gpkg], out))
     manifest.append_run(out, run)
 
 

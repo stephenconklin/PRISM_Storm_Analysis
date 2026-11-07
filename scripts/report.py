@@ -12,10 +12,10 @@ Charts (each skipped, with a note, when its inputs are missing or were made for 
     Snow check         snow share at SNOTEL stations, observed vs PRISM split (validate_snow.py)
 
 The window defaults to the first event in <out>/storm.toml, else the latest storm_total.py run
-recorded in run_manifest.json, else every day in the cube. The rain/snow split uses the ramp
+recorded in run/run_manifest.json, else every day in the cube. The rain/snow split uses the ramp
 storm_total.py used for the window (from its uncertainty file), else storm.toml's, else 0-3 °C.
---keep-previous moves an existing report for the window to report/history/ first. Outputs: <out>/report/storm_report_<start>_<end>.html and
-<out>/report/figures/<chart>_<start>_<end>.svg. The page has no external dependencies, follows the
+--keep-previous moves an existing report for the window to report/history/ first. Outputs, in the window's
+<out>/events/<event>/report/ (layout.py): storm_report_<start>_<end>.html and figures/<chart>_<start>_<end>.svg. The page has no external dependencies, follows the
 viewer's light/dark setting, and has a data table under each chart.
 
 Section anchors (a stable interface: other pages link to them): each section's <h2> has the id of its
@@ -24,8 +24,8 @@ matching report/figures/<name>_<start>_<end>.svg.
 
 --web writes a copy for publishing instead: no local paths or notes for whoever runs the tools, links to
 the repository and docs/UNCERTAINTY.md, and an optional back link (--back-url, --back-label). It goes to
-<--web-out>/storm_report_<start>_<end>.html, else <out>/report/storm_report_<start>_<end>_web.html, so the
-local report is kept.
+<--web-out>/storm_report_<start>_<end>.html, else the window's report/web/storm_report_<start>_<end>.html,
+so the local report is kept.
 
 Usage examples:
     python report.py --out data/huc1408
@@ -47,6 +47,7 @@ import xarray as xr
 import config
 import manifest
 import runtime
+from layout import Layout
 from runtime import die
 from storm_total import M3_PER_ACRE_FT, partition_window, window_total
 
@@ -163,17 +164,15 @@ def table(headers, rows):
 
 def default_window(out, cube_days):
     """(start, end) of the latest storm_total.py run in the manifest, else the cube's full range."""
-    path = Path(out) / "run_manifest.json"
-    if path.exists():
-        for run in reversed(json.loads(path.read_text()).get("runs", [])):
-            if run.get("script") == "storm_total.py" and run.get("window"):
-                return run["window"]["start"], run["window"]["end"]
+    for run in reversed(manifest.read_runs(out)):
+        if run.get("script") == "storm_total.py" and run.get("window"):
+            return run["window"]["start"], run["window"]["end"]
     return str(min(cube_days)), str(max(cube_days))
 
 
 def daily_basin(out, res, start, end, all_snow_c=0.0, all_rain_c=3.0):
     """Per PRISM day: basin precipitation and (with a tmean cube) rain and snow, in area-weighted mm."""
-    with xr.open_dataset(Path(out) / f"ppt_{res}_daily_clip.nc") as ds:
+    with xr.open_dataset(Layout(out, settings={}).cube("ppt", res)) as ds:
         r = window_total(ds, start, end)
         inside = r["total_mm"].notnull()
         area = ds.cell_area.where(inside)
@@ -203,9 +202,8 @@ def rain_snow_ramp(out, unc=None):
 
 
 def window_file(path, start, end):
-    """The window-named copy of a validation file if there is one, else the file itself."""
-    w = runtime.windowed(path, start, end)
-    return w if w.exists() else path
+    """A validation file's window-named form (<stem>_<start>_<end><suffix>)."""
+    return runtime.windowed(path, start, end)
 
 
 def keep_previous(html_path):
@@ -219,14 +217,12 @@ def keep_previous(html_path):
 
 def latest_qc(out):
     """{script: worst QC level} from the newest manifest entry of each script."""
-    path = Path(out) / "run_manifest.json"
     seen = {}
-    if path.exists():
-        order = {"skip": 0, "pass": 1, "warn": 2, "fail": 3}
-        for run in reversed(json.loads(path.read_text()).get("runs", [])):
-            s = run.get("script")
-            if s in ("prism_watershed.py", "storm_total.py") and s not in seen and run.get("qc"):
-                seen[s] = max((c["level"] for c in run["qc"]), key=order.get)
+    order = {"skip": 0, "pass": 1, "warn": 2, "fail": 3}
+    for run in reversed(manifest.read_runs(out)):
+        s = run.get("script")
+        if s in ("prism_watershed.py", "storm_total.py") and s not in seen and run.get("qc"):
+            seen[s] = max((c["level"] for c in run["qc"]), key=order.get)
     return seen
 
 
@@ -593,7 +589,7 @@ def main():
                     help="move an existing report for this window to report/history/ instead of replacing it")
     ap.add_argument("--web", action="store_true",
                     help="write a copy for publishing: no local paths or operator notes, links to the repository")
-    ap.add_argument("--web-out", help="folder for the --web page (default: report/, named ..._web.html)")
+    ap.add_argument("--web-out", help="folder for the --web page (default: the window's report/web/)")
     ap.add_argument("--back-url", help="with --web: a link above the title, e.g. back to the project page")
     ap.add_argument("--back-label", default="Back", help="text of the --back-url link")
     runtime.add_common_args(ap)
@@ -602,30 +598,33 @@ def main():
     runtime.attach(a.out, run, a)
 
     out = Path(a.out)
-    nc = out / f"ppt_{a.res}_daily_clip.nc"
+    lay = Layout(out)
+    nc = lay.cube("ppt", a.res)
     if not nc.exists():
         die(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
     with xr.open_dataset(nc) as ds:
         cube_days = ds.time.values.astype("datetime64[D]")
     d0, d1 = default_window(out, cube_days)
     start, end = a.start or d0, a.end or d1
-    span = f"{start.replace('-', '')}_{end.replace('-', '')}"
-    unc_path = out / f"ppt_{a.res}_uncertainty_{span}.json"
+    span = runtime.span(start, end)
+    lay.prepare_event(start, end)
+    unc_path = lay.uncertainty_json(a.res, start, end)
     unc = json.loads(unc_path.read_text()) if unc_path.exists() else None
     ramp = rain_snow_ramp(out, unc)
     basin = daily_basin(out, a.res, start, end, *ramp)
-    vdir = out / "validation"
+    vdir = lay.validation_dir(start, end)
+    rdir = lay.runoff_dir(start, end)
 
     try:
         title = a.title or (config.load(out) or {}).get("name")
     except config.SettingsError:
         title = a.title
     if not title:
-        totals = out / "totals.gpkg"
+        totals = lay.totals_gpkg(start, end)
         title = out.name.replace("_", " ")
         if totals.exists():
             import geopandas as gpd
-            bt = gpd.read_file(totals, layer="basin_total")
+            bt = gpd.read_file(totals, layer=f"basin_total_{span}")
             if len(bt) and bt.get("name") is not None:
                 title = str(bt["name"].iloc[0]) + (f" (HUC {bt['huc'].iloc[0]})" if bt.get("huc") is not None
                                                    and bt["huc"].iloc[0] else "")
@@ -642,7 +641,7 @@ def main():
              ("Basin mean", f"{basin['mean_mm']:.1f} mm", f"max {basin['max_mm']:.0f} mm in one cell"),
              ("PRISM releases", ", ".join(f"r{r}" for r in rel if r) or "unknown",
               "final" if rel and min(rel) >= 8 else "not final: revised for ~6 months")]
-    norm_path = out / f"ppt_{a.res}_normals_{span}.json"
+    norm_path = lay.normals_json(a.res, start, end)
     if norm_path.exists():
         nj = json.loads(norm_path.read_text())
         if nj.get("percent_of_normal") is not None:
@@ -666,7 +665,7 @@ def main():
     gauges = pick_gauges(runoff, a.gauges)
     flows = []
     for g in gauges:
-        rows = read_csv(window_file(vdir / f"runoff_{g['site']}_flow.csv", start, end))
+        rows = read_csv(window_file(rdir / f"runoff_{g['site']}_flow.csv", start, end))
         flows.append([(dt.datetime.fromisoformat(r["time_utc"]), float(r["q_cfs"]), float(r["baseflow_line_cfs"]))
                       for r in rows])
     figures["timeline"] = timeline_chart(basin, gauges, flows)
@@ -751,8 +750,8 @@ def main():
     else:
         sections.append(missing("snow", "Snow check at SNOTEL stations", NOT_RUN if web else "run validate_snow.py for this window."))
 
-    rdir = out / "report"
-    fdir = rdir / "figures"
+    rep = lay.report_dir(start, end)
+    fdir = rep / "figures"
     fdir.mkdir(parents=True, exist_ok=True)
     fig_paths = []
     for name, s in figures.items():
@@ -763,7 +762,7 @@ def main():
     sources = "PRISM data: PRISM Group, Oregon State University. Gauges: RCC-ACIS, USGS, NRCS."
     footer = (f'Made {esc(made)} by <a href="{REPO_URL}">PRISM Storm Analysis</a>. {sources}' if web else
               f'Made {esc(made)} by PRISM Storm Analysis report.py from {esc(out.resolve())}. {sources} '
-              f'Figures as SVG in report/figures/.')
+              f'Figures as SVG in {esc(fdir.relative_to(out))}/.')
     back = (f'<p class="back"><a href="{esc(a.back_url)}">&larr; {esc(a.back_label)}</a></p>'
             if web and a.back_url else "")
     page = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -775,8 +774,7 @@ def main():
             f'<p class="note" style="margin-top:40px">{footer}</p></main><div id="tip"></div><script>{TIP_JS}</script>'
             f'</body></html>')
     if web:
-        html_path = (Path(a.web_out) / f"storm_report_{span}.html" if a.web_out
-                     else rdir / f"storm_report_{span}_web.html")
+        html_path = (Path(a.web_out) if a.web_out else rep / "web") / f"storm_report_{span}.html"
         html_path.parent.mkdir(parents=True, exist_ok=True)
         local = {str(out.resolve()), str(out.absolute())}
         leaks = [m for m in re.findall(r"/(?:Volumes|Users|home|private|tmp)/[^\s<\"')]*", page)] + \
@@ -784,7 +782,7 @@ def main():
         if leaks:
             die(f"The --web page would show local paths: {', '.join(sorted(set(leaks))[:3])}", runtime.EXIT_ERROR)
     else:
-        html_path = rdir / f"storm_report_{span}.html"
+        html_path = lay.report_html(start, end)
     if a.keep_previous and html_path.exists():
         kept = keep_previous(html_path)
         print(f"Previous report kept as {kept.relative_to(out)}")

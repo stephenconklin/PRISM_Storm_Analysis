@@ -6,6 +6,7 @@ Run the PRISM Storm Analysis workflow for one output folder, from its settings (
     pipeline.py run    run every step in order (resumes: steps already done with the same inputs are skipped)
     pipeline.py status what is current, what PRISM has revised, what is still pending, and what to run next
     pipeline.py update pick up PRISM revisions and later flow data, rerun the analysis, and show what changed
+    pipeline.py migrate move a folder made before 7 Nov 2026 to the current layout (offline; renames only)
 
 Steps, in order (each runs the script as its own process, as you would by hand):
 
@@ -22,9 +23,10 @@ Steps, in order (each runs the script as its own process, as you would by hand):
 
 stations runs before totals so that the volume's uncertainty includes the gauge comparison. A failed
 network step is recorded and the run goes on; the summary says what to rerun. Every step's output is
-also in <out>/logs/<time>/, and pipeline_state.json records what ran with which inputs.
+also in <out>/run/logs/<time>/, and run/pipeline_state.json records what ran with which inputs.
 
-Rasters from totals and normals use standard names the QGIS builder recognizes:
+Each event's outputs go to <out>/events/<event>/ (folder layout: layout.py). Rasters from totals and
+normals use standard names the QGIS builder recognizes, in the event's totals/:
     ppt_<res>_total_<start>_<end>.tif, ppt_<res>_volume_..., ppt_<res>_rain_..., ppt_<res>_snow_...,
     ppt_<res>_pct_normal_<start>_<end>.tif
 
@@ -40,6 +42,7 @@ Usage examples:
     python pipeline.py status --out data/huc1408
     python pipeline.py update --out data/huc1408
     python pipeline.py update --out data/huc1408 --check --notify   # for a scheduled job
+    python pipeline.py migrate --out data/huc1408 --dry-run
 """
 import argparse
 import datetime as dt
@@ -55,12 +58,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import config
+import layout
 import manifest
 import runtime
+from layout import Layout
 from runtime import EXIT_INCOMPLETE, EXIT_INTERRUPTED, EXIT_OK, die
 
 SCRIPTS = Path(__file__).resolve().parent
-STATE = "pipeline_state.json"
 FINAL_AFTER_DAYS = 183  # PRISM revises a day for about 6 months (release 8 is final)
 
 
@@ -97,9 +101,9 @@ def window(extra=None):
 
 
 def totals_extra(c, ev):
-    name = lambda kind: str(c.out / f"ppt_{c.res}_{kind}_{span(ev)}.tif")  # noqa: E731
+    name = lambda kind: str(c.lay.window_tif(kind, c.res, ev[1], ev[2]))  # noqa: E731
     x = ["--tif", name("total"), "--volume-tif", name("volume")]
-    if (c.out / f"tmean_{c.res}_daily_clip.nc").exists():
+    if c.lay.cube("tmean", c.res).exists():
         x += ["--rain-tif", name("rain"), "--snow-tif", name("snow")]
     return x
 
@@ -125,7 +129,7 @@ STEPS = [
     Step("totals", "storm_total.py", True, True, False, window(totals_extra)),
     Step("subbasins", "subbasin_totals.py", True, False, True, window()),
     Step("normals", "storm_context.py", True, False, True,
-         window(lambda c, ev: ["--pct-tif", str(c.out / f"ppt_{c.res}_pct_normal_{span(ev)}.tif")])),
+         window(lambda c, ev: ["--pct-tif", str(c.lay.window_tif("pct_normal", c.res, ev[1], ev[2]))])),
     Step("runoff", "validate_runoff.py", True, False, True,
          window(lambda c, ev: ["--recheck-provisional-days", "30"] if c.refresh else [])),
     Step("snow", "validate_snow.py", True, False, True, window()),
@@ -140,6 +144,8 @@ ALWAYS_AFTER_CHANGES = {"report", "qgis"}  # rerun whenever an earlier step ran 
 class Ctx:
     def __init__(self, out, a=None, refresh=False):
         self.out = Path(out)
+        if layout.legacy(self.out):
+            die(layout.migrate_hint(self.out))
         try:
             self.s = config.load(self.out)
         except config.SettingsError as e:
@@ -153,6 +159,7 @@ class Ctx:
         self.region = self.s.get("region", "us")
         self.vars = (self.s.get("download") or {}).get("vars", ["ppt", "tmean"])
         self.events = config.events(self.s)
+        self.lay = Layout(self.out, self.s)
         self.refresh = refresh
         self.no_qgis = getattr(a, "no_qgis", False)
         self.qgis_python = getattr(a, "qgis_python", None)
@@ -185,16 +192,20 @@ def fingerprint(c, step, args):
     h.update(file_sha(config.path_for(c.out)).encode())
     if step.name not in ("ppt", "tmean"):
         for var in ("ppt", "tmean"):
-            h.update(file_sha(c.out / f"{var}_{c.res}_release_history.csv").encode())
+            h.update(file_sha(c.lay.release_history(var, c.res)).encode())
     if step.name == "totals":  # the gauge comparison goes into the volume's uncertainty
         start, end = args[args.index("--start") + 1], args[args.index("--end") + 1]
-        h.update(file_sha(runtime.windowed(c.out / "validation" / "stations_summary.json", start, end)).encode())
+        h.update(file_sha(c.lay.validation_file("stations_summary.json", start, end)).encode())
     return h.hexdigest()[:16]
+
+
+def state_path(out):
+    return Layout(out, settings={}).state_file
 
 
 def load_state(out):
     try:
-        return json.loads((Path(out) / STATE).read_text())
+        return json.loads(state_path(out).read_text())
     except (OSError, ValueError):
         return {"steps": {}}
 
@@ -246,8 +257,8 @@ def execute(c, items, a):
     """Run the plan. Returns [(key, step, ev, status, code, seconds, log)]."""
     state = load_state(c.out)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir = c.out / "logs" / stamp
-    env = {**os.environ, runtime.LOCK_ENV: str((c.out / ".lock").resolve()),
+    log_dir = c.lay.logs_dir / stamp
+    env = {**os.environ, runtime.LOCK_ENV: str(c.lay.lock_file.resolve()),
            runtime.PIPELINE_ENV: shlex.join(["python"] + sys.argv)}
     results, ran_any, stopped, k = [], False, None, 0
     todo = [i for i in items if i[4] == "run" or (i[4] == "done" and i[0].name in ALWAYS_AFTER_CHANGES)]
@@ -297,7 +308,7 @@ def execute(c, items, a):
                                "finished": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
                                "seconds": round(seconds, 1), "log": str(log.relative_to(c.out)),
                                "command": shlex.join(cmd)}
-        runtime.write_json(c.out / STATE, state)
+        runtime.write_json(c.lay.state_file, state)
         results.append((key, step, ev, status, code, seconds, str(log.relative_to(c.out))))
         if code == EXIT_INTERRUPTED:
             print_summary(results)
@@ -363,11 +374,10 @@ def download_estimate(c):
     d = c.s["download"]
     start, end = dt.date.fromisoformat(config.iso(d["start"])), dt.date.fromisoformat(config.iso(d["end"]))
     end = min(end, dt.date.today() - dt.timedelta(days=1))
-    from prism_watershed import zip_name
-    raw, missing, sizes = c.out / "raw_zips", 0, []
+    missing, sizes = 0, []
     for var in c.vars:
         for i in range((end - start).days + 1):
-            z = raw / zip_name(var, c.res, c.region, start + dt.timedelta(days=i))
+            z = c.lay.store.zip_path(var, c.res, c.region, start + dt.timedelta(days=i))
             if z.exists():
                 sizes.append(z.stat().st_size)
             else:
@@ -377,8 +387,8 @@ def download_estimate(c):
 
 
 def open_outputs(c):
-    paths = [c.out / "report" / f"storm_report_{span(ev)}.html" for ev in c.events]
-    paths += sorted((c.out / "QGIS").glob("*.qgz"))
+    paths = [c.lay.report_html(ev[1], ev[2]) for ev in c.events]
+    paths += sorted(c.lay.qgis_dir.glob("*.qgz"))
     opener = "open" if sys.platform == "darwin" else "xdg-open"
     for p in paths:
         if p.exists() and shutil.which(opener):
@@ -389,7 +399,7 @@ def open_outputs(c):
 
 def cube_releases(c, var):
     """{date: release} for the days in the folder's cube for var."""
-    nc = c.out / f"{var}_{c.res}_daily_clip.nc"
+    nc = c.lay.cube(var, c.res)
     if not nc.exists():
         return {}
     import xarray as xr
@@ -468,8 +478,7 @@ def folder_status(c, offline=False):
             made_from = ((run or {}).get("input_releases") or {}).get(f"ppt_{c.res}")
             if run and made_from is not None and made_from != now_rel:
                 e["stale"].append(name)
-        vdir = c.out / "validation"
-        summary = runtime.windowed(vdir / "runoff_summary.csv", ev[1], ev[2])
+        summary = c.lay.validation_file("runoff_summary.csv", ev[1], ev[2])
         if summary.exists():
             import csv
             from validate_runoff import flow_approved, result_paths
@@ -478,7 +487,8 @@ def folder_status(c, offline=False):
             e["flow_pending"] = sum(r.get("flow_complete") == "False" for r in rows)
             for r in rows:
                 try:
-                    saved = next(p for p in result_paths(vdir, r["site"], ev[1], ev[2]) if p.exists())
+                    saved = next(p for p in result_paths(c.lay.runoff_dir(ev[1], ev[2]), r["site"], ev[1], ev[2])
+                                 if p.exists())
                     if not flow_approved(json.loads(saved.read_text())):
                         e["provisional"] += 1
                 except (OSError, ValueError, StopIteration):
@@ -496,7 +506,7 @@ def folder_status(c, offline=False):
             st["actions"].append(f"event {ev[0]}: {e['flow_pending']} gauge(s) recorded before the flow window "
                                  f"ended ({after}); after that: pipeline.py update --out {c.out}")
         st["events"].append(e)
-    qgz = sorted((c.out / "QGIS").glob("*.qgz"))
+    qgz = sorted(c.lay.qgis_dir.glob("*.qgz"))
     st["qgis"] = str(qgz[0].relative_to(c.out)) if qgz else None
     return st
 
@@ -535,22 +545,22 @@ def print_status(c, st):
 # ---------- update: what changed ----------
 
 def metrics(c, ev):
-    vdir, sp = c.out / "validation", span(ev)
     m = {}
-    unc = c.out / f"ppt_{c.res}_uncertainty_{sp}.json"
+    vfile = lambda name: c.lay.validation_file(name, ev[1], ev[2])  # noqa: E731
+    unc = c.lay.uncertainty_json(c.res, ev[1], ev[2])
     if unc.exists():
         u = json.loads(unc.read_text())
         m.update(volume=u["volume_m3"], range=u.get("range_m3"), releases=u.get("releases"))
-    sj = runtime.window_json(vdir / "stations_summary.json", ev[1], ev[2])
+    sj = runtime.window_json(vfile("stations_summary.json"), ev[1], ev[2])
     if sj:
         m["gauge_pbias"] = ((sj.get("event_totals") or {}).get("all") or {}).get("pbias_pct")
-    summary = runtime.windowed(vdir / "runoff_summary.csv", ev[1], ev[2])
+    summary = vfile("runoff_summary.csv")
     if summary.exists():
         import csv
         with open(summary, newline="") as f:
             m["runoff"] = {r["site"]: (r.get("ratio_low"), r.get("ratio_high"), r.get("name", ""))
                            for r in csv.DictReader(f) if r.get("status") == "ok"}
-    sn = runtime.window_json(vdir / "snotel_summary.json", ev[1], ev[2])
+    sn = runtime.window_json(vfile("snotel_summary.json"), ev[1], ev[2])
     if sn:
         m["snow_ratio"] = sn.get("prism_over_observed_snow")
     return m
@@ -599,7 +609,12 @@ def cmd_run(a, refresh=False, force_event_steps=False):
         ok = preflight(c, items, a.offline)
         return EXIT_OK if ok else runtime.EXIT_NETWORK
     run = manifest.start_run("pipeline.py", a)
-    runtime.attach(c.out, run, a, log_path=c.out / "logs" / f"{dt.datetime.now():%Y%m%d-%H%M%S}-pipeline.log")
+    runtime.attach(c.out, run, a, log_path=c.lay.logs_dir / f"{dt.datetime.now():%Y%m%d-%H%M%S}-pipeline.log")
+    # Settle each event's folder first (an event renamed or redated in storm.toml), so the output paths the
+    # steps are given point into the folder they will keep.
+    for ev in c.events:
+        c.lay.prepare_event(ev[1], ev[2])
+    items = plan(c, a, load_state(c.out), force_event_steps)
     todo = sum(i[4] == "run" for i in items)
     print(f"{c.s.get('name') or c.out.name}: {todo} step(s) to run, "
           f"{sum(i[4] == 'done' for i in items)} done earlier with the same inputs"
@@ -711,7 +726,7 @@ def cmd_init(a):
     d0, d1 = start - dt.timedelta(days=a.pad), min(end + dt.timedelta(days=a.pad), yesterday)
     out = Path(a.out or (f"data/huc{huc}" if huc else f"data/{Path(boundary).stem}"))
     s = {"name": a.name or basin_name or out.name, "huc": huc, "boundary": boundary, "res": a.res,
-         "prism_cache": a.cache, "download": {"start": d0, "end": d1, "vars": a.vars},
+         "prism_store": str(Path(a.store).expanduser().resolve()) if a.store else None, "download": {"start": d0, "end": d1, "vars": a.vars},
          "events": [{"name": event, "start": start, "end": end}],
          "rain_snow": {"all_snow_c": 0.0, "all_rain_c": 3.0},
          "validation": {"buffer_km": 10.0, "after_days": 7, "gauges": []}}
@@ -771,7 +786,8 @@ def main():
     p.add_argument("--pad", type=int, default=1, help="days to download either side of the storm (default 1)")
     p.add_argument("--res", default="800m", choices=["800m", "4km"])
     p.add_argument("--vars", nargs="+", default=["ppt", "tmean"], help="PRISM variables to download (default ppt tmean)")
-    p.add_argument("--cache", help="shared folder of national PRISM zips for all basins")
+    p.add_argument("--store", "--cache", dest="store",
+                   help="the PRISM store shared by every basin (default: prism_store/ next to the folder)")
     p.add_argument("--force", action="store_true", help="replace an existing storm.toml")
     p.add_argument("--run", action="store_true", help="run the pipeline right after writing the settings")
     p.add_argument("--no-qgis", action="store_true", help="(with --run) don't build the QGIS project")

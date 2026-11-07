@@ -222,18 +222,53 @@ def test_zip_cache_name_and_lookup(tmp_path):
 
 
 def test_prism_day_files_matches_resolution_and_format(tmp_path):
+    from layout import Layout
     from validate_stations import prism_day_files
-    for folder, fname in (("prism_ppt_us_25m_20261022", "prism_ppt_us_25m_20261022.tif"),
-                          ("prism_ppt_us_30s_20261022_nc", "prism_ppt_us_30s_20261022.nc"),
-                          ("prism_ppt_us_30s_20261022", "prism_ppt_us_30s_20261022.tif")):
-        (tmp_path / folder).mkdir()
-        (tmp_path / folder / fname).write_bytes(b"x")
-    (tmp_path / "prism_ppt_us_30s_20261022" / "prism_ppt_us_30s_20261022.stn.csv").write_text("x")
-    grid, stn = prism_day_files(tmp_path, "ppt", "800m", D)
+    lay = Layout(tmp_path / "run", settings={})
+    for res, folder, fname in (("4km", "prism_ppt_us_25m_20261022_r2", "prism_ppt_us_25m_20261022.tif"),
+                               ("800m", "prism_ppt_us_30s_20261022_nc_r2", "prism_ppt_us_30s_20261022.nc"),
+                               ("800m", "prism_ppt_us_30s_20261022_r2", "prism_ppt_us_30s_20261022.tif")):
+        d = lay.store.extracted_dir("ppt", res) / folder
+        d.mkdir(parents=True)
+        (d / fname).write_bytes(b"x")
+    cog = lay.store.extracted_dir("ppt", "800m") / "prism_ppt_us_30s_20261022_r2"
+    (cog / "prism_ppt_us_30s_20261022.stn.csv").write_text("x")
+    grid, stn = prism_day_files(lay, "ppt", "800m", D)
     assert grid.name == "prism_ppt_us_30s_20261022.tif" and stn is not None
-    assert prism_day_files(tmp_path, "ppt", "4km", D)[0].name == "prism_ppt_us_25m_20261022.tif"
-    (tmp_path / "prism_ppt_us_30s_20261022" / "prism_ppt_us_30s_20261022.tif").unlink()
-    assert prism_day_files(tmp_path, "ppt", "800m", D)[0].suffix == ".nc"
+    assert prism_day_files(lay, "ppt", "4km", D)[0].name == "prism_ppt_us_25m_20261022.tif"
+    (cog / "prism_ppt_us_30s_20261022.tif").unlink()
+    assert prism_day_files(lay, "ppt", "800m", D)[0].suffix == ".nc"
+
+
+def test_prism_day_files_reads_the_folders_release(tmp_path):
+    """The store keeps every release: a basin reads the release its clipped day was made from (unzipped again
+    from the archived zip when needed), so another basin's refresh doesn't change it."""
+    from layout import Layout
+    from test_offline import GRID, make_zip, zips
+    from validate_stations import prism_day_files
+    out = tmp_path / "run"
+    lay = Layout(out, settings={})
+    z = zips(out)
+    make_zip(z, "20261022", 10.0, release=1)
+    current = z / "prism_ppt_us_30s_20261022.zip"
+    archived = lay.store.archived_zip(current, 1)
+    archived.parent.mkdir()
+    current.rename(archived)
+    make_zip(z, "20261022", 20.0, release=2)
+
+    def value(grid):
+        with rasterio.open(grid) as src:
+            return float(src.read(1)[0, 0])
+    newest = prism_day_files(lay, "ppt", "800m", D)[0]  # no clipped day: the newest release, unzipped now
+    assert newest.parent.name.endswith("_r2") and value(newest) == 20.0
+    clip = lay.clip_tif("ppt", "800m", D)
+    clip.parent.mkdir(parents=True)
+    with rasterio.open(clip, "w", driver="GTiff", height=1, width=1, count=1, dtype="float32", crs="EPSG:4269",
+                       transform=GRID) as dst:
+        dst.write(np.array([[10.0]], dtype="float32"), 1)
+        dst.update_tags(PRISM_DATASET_RELEASE_NUMBER="1")
+    pinned = prism_day_files(lay, "ppt", "800m", D)[0]
+    assert pinned.parent.name.endswith("_r1") and value(pinned) == 10.0
 
 
 def test_missing_tzo_from_longitude():
@@ -289,11 +324,11 @@ def test_runoff_cache_reused_across_releases(tmp_path):
     days = [D]
     old_key, new_key = window_key(days, a, [1]), window_key(days, a, [2])
     basin = gpd.GeoDataFrame(geometry=[box(-108.0, 37.8, -107.8, 38.0)], crs=4269)
-    basin.to_file(tmp_path / "runoff_09342500_basin.geojson", driver="GeoJSON")
+    basin.to_file(tmp_path / "09342500_basin.geojson", driver="GeoJSON")
     flow = {"runoff_constant_m3": 1e5, "runoff_line_m3": 5e4, "total_flow_m3": 2e5}
     saved = {"gauge": {"site": "09342500"}, "flow": flow, "run_key": {k: v for k, v in old_key.items()
                                                                        if k != "releases"}}  # pre-release cache
-    (tmp_path / "runoff_09342500.json").write_text(json.dumps(saved))
+    (tmp_path / "runoff_09342500_20261022_20261022.json").write_text(json.dumps(saved))
 
     result, cached_basin, _ = load_cached(tmp_path, "09342500", new_key)
     assert result["run_key"] != new_key
@@ -366,8 +401,8 @@ def test_flow_cache_reuse_rules(tmp_path):
 
     key = window_key([dt.date(2026, 10, 20), dt.date(2026, 10, 27)], a, [2] * 8)
     basin = gpd.GeoDataFrame(geometry=[box(-108.0, 37.8, -107.8, 38.0)], crs=4269)
-    basin.to_file(tmp_path / "runoff_1_basin.geojson", driver="GeoJSON")
-    (tmp_path / "runoff_1.json").write_text(json.dumps(
+    basin.to_file(tmp_path / "1_basin.geojson", driver="GeoJSON")
+    (tmp_path / "runoff_1_20261020_20261027.json").write_text(json.dumps(
         {"run_key": key, "status": "ok", "flow_window_utc": {"end": cut.isoformat()}}))
     late = dt.datetime(2026, 11, 5, tzinfo=utc)
     assert load_cached(tmp_path, "1", key, target, now=dt.datetime(2026, 10, 31, 18, tzinfo=utc)) is not None
@@ -376,11 +411,11 @@ def test_flow_cache_reuse_rules(tmp_path):
     other = window_key([dt.date(2026, 10, 20), dt.date(2026, 10, 27)],
                        SimpleNamespace(**{**vars(a), "max_missing_pct": 5.0}), [2] * 8)
     for stage, reused in (("precip", False), ("flow", True)):
-        (tmp_path / "runoff_2.json").write_text(json.dumps(
+        (tmp_path / "runoff_2_20261020_20261027.json").write_text(json.dumps(
             {"run_key": key, "status": "x", "stage": stage, "checked_utc": late.isoformat()}))
         got = load_cached(tmp_path, "2", other, target, now=late)
         assert (got is not None) == reused
-    (tmp_path / "runoff_3.json").write_text(json.dumps({"run_key": key, "status": "old skip"}))  # undated
+    (tmp_path / "runoff_3_20261020_20261027.json").write_text(json.dumps({"run_key": key, "status": "old skip"}))  # undated
     assert load_cached(tmp_path, "3", key, target, now=late) is None
     assert window_key([D], SimpleNamespace(**{**vars(a), "res": "4km"}))["res"] == "4km"
 
@@ -427,11 +462,10 @@ def test_gauge_runs_update_only_their_gauges(tmp_path, monkeypatch):
     import subprocess
     import validate_runoff
     import observations
-    from test_offline import OFFLINE, SCRIPT, make_zip
+    from test_offline import OFFLINE, SCRIPT, make_zip, zips
     out = tmp_path / "run"
-    (out / "raw_zips").mkdir(parents=True)
     for ymd in ("20261021", "20261022"):
-        make_zip(out / "raw_zips", ymd, 10.0)
+        make_zip(zips(out), ymd, 10.0)
     boundary = tmp_path / "basin.geojson"
     gpd.GeoDataFrame(geometry=[box(-108.4, 37.5, -108.0, 37.7)], crs=4269).to_file(boundary)
     subprocess.run([sys.executable, str(SCRIPT), "--start", "2026-10-21", "--end", "2026-10-22", "--boundary",
@@ -463,13 +497,17 @@ def test_gauge_runs_update_only_their_gauges(tmp_path, monkeypatch):
     run("A")
     run("B")
     run("B")
-    gpkg = out / "validation" / "validation.gpkg"
-    assert sorted(gpd.read_file(gpkg, layer="gauge_basins")["site"]) == ["A", "B"]
-    gauges = gpd.read_file(gpkg, layer="gauges")
+    gpkg = out / "events" / "20261021_20261022" / "validation" / "validation.gpkg"
+    assert sorted(gpd.read_file(gpkg, layer="gauge_basins_20261021_20261022")["site"]) == ["A", "B"]
+    gauges = gpd.read_file(gpkg, layer="gauges_20261021_20261022")
     assert sorted(gauges["site"]) == ["A", "B"] and gauges["ratio_low"].dtype.kind == "f"  # numbers, not text
     import json
-    runs = [r for r in json.loads((out / "run_manifest.json").read_text())["runs"] if r["script"] == "validate_runoff.py"]
-    assert len(runs) == 3 and any(o["path"] == "validation/runoff_summary.csv" for o in runs[-1]["outputs"])
+    runs = [r for r in json.loads((out / "run" / "run_manifest.json").read_text())["runs"]
+            if r["script"] == "validate_runoff.py"]
+    assert len(runs) == 3 and any(o["path"] == "events/20261021_20261022/validation/runoff_summary_20261021_20261022.csv"
+                                  for o in runs[-1]["outputs"])
+    assert (out / "basin" / "gauges" / "A_basin.geojson").exists()
+    assert (out / "events" / "20261021_20261022" / "validation" / "runoff" / "runoff_B_20261021_20261022.json").exists()
 
 
 def test_awdb_keeps_primary_sensor():

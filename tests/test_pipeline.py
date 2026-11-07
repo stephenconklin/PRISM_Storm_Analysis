@@ -1,5 +1,5 @@
 """Offline tests for the pipeline, settings, run-time support (lock, atomic writes, exit codes, logs), resume after
-an interruption, the shared zip cache and HTTP retries."""
+an interruption, the shared PRISM store and HTTP retries."""
 import csv
 import datetime as dt
 import json
@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config  # noqa: E402
 import manifest  # noqa: E402
 import runtime  # noqa: E402
-from test_offline import OFFLINE, SCRIPT, FakeResponse, FakeSession, make_zip  # noqa: E402
+from test_offline import OFFLINE, SCRIPT, FakeResponse, FakeSession, make_zip, zips  # noqa: E402
 
 FAST = {**OFFLINE, "PRISM_STORM_RETRY_WAIT": "0"}
 PIPELINE = SCRIPTS / "pipeline.py"
@@ -66,12 +66,12 @@ def test_folder_lock(tmp_path, monkeypatch):
     with pytest.raises(runtime.Stop) as e:
         runtime.FolderLock(tmp_path).acquire()  # same live process holds it
     assert e.value.code == runtime.EXIT_USAGE
-    monkeypatch.setenv(runtime.LOCK_ENV, str(tmp_path / ".lock"))
+    monkeypatch.setenv(runtime.LOCK_ENV, str(tmp_path / "run" / ".lock"))
     runtime.FolderLock(tmp_path).acquire()  # a pipeline step shares its pipeline's lock
     monkeypatch.delenv(runtime.LOCK_ENV)
     lock.release()
-    assert not (tmp_path / ".lock").exists()
-    (tmp_path / ".lock").write_text(json.dumps({"pid": 999999, "host": os.uname().nodename}))  # a run that is gone
+    assert not (tmp_path / "run" / ".lock").exists()
+    (tmp_path / "run" / ".lock").write_text(json.dumps({"pid": 999999, "host": os.uname().nodename}))  # a run that is gone
     runtime.FolderLock(tmp_path).acquire().release()
 
 
@@ -91,14 +91,15 @@ def test_run_main_records_failed_runs(tmp_path, monkeypatch, error, code, status
         runtime.run_main(main)
     assert e.value.code == code
     run = manifest.read_runs(tmp_path)[-1]
-    assert run["status"] == status and not (tmp_path / ".lock").exists()
+    assert run["status"] == status and not (tmp_path / "run" / ".lock").exists()
     assert "working" in (tmp_path / run["log"]).read_text()
 
 
 def test_manifest_corrupt_file_is_kept(tmp_path):
-    (tmp_path / "run_manifest.json").write_text('{"runs": [')
+    (tmp_path / "run").mkdir()
+    (tmp_path / "run" / "run_manifest.json").write_text('{"runs": [')
     manifest.append_run(tmp_path, {"script": "x.py"})
-    assert len(manifest.read_runs(tmp_path)) == 1 and list(tmp_path.glob("run_manifest.corrupt-*.json"))
+    assert len(manifest.read_runs(tmp_path)) == 1 and list((tmp_path / "run").glob("run_manifest.corrupt-*.json"))
 
 
 # ---------- settings ----------
@@ -180,8 +181,8 @@ def test_pipeline_offline(tmp_path):
     a rerun skips finished steps, and status reports what is left."""
     days = ["20261020", "20261021", "20261022", "20261023"]
     out = tmp_path / "run"
-    seed(out / "raw_zips", days)
-    seed(out / "raw_zips", days, var="tmean", value=1.5)
+    seed(zips(out), days)
+    seed(zips(out, "tmean"), days, var="tmean", value=1.5)
     b = basin(tmp_path)
     init = subprocess.run([sys.executable, str(PIPELINE), "init", "--boundary", str(b), "--out", str(out),
                            "--start", "2026-10-21", "--end", "2026-10-22", "--event", "storm1", "--no-qgis"],
@@ -193,14 +194,19 @@ def test_pipeline_offline(tmp_path):
     cmd = [sys.executable, str(PIPELINE), "run", "--out", str(out), "--no-qgis"]
     res = subprocess.run(cmd, capture_output=True, text=True, env=FAST)
     assert res.returncode == runtime.EXIT_INCOMPLETE, res.stdout + res.stderr
-    state = json.loads((out / "pipeline_state.json").read_text())["steps"]
+    state = json.loads((out / "run" / "pipeline_state.json").read_text())["steps"]
     assert state["ppt"]["status"] == state["totals:storm1"]["status"] == state["report:storm1"]["status"] == "ok"
     assert state["runoff:storm1"]["status"] == "network_error"
+    ev = out / "events" / "storm1"
+    assert json.loads((ev / "event.json").read_text())["start"] == "2026-10-21"
     for kind in ("total", "volume", "rain", "snow"):
-        assert (out / f"ppt_800m_{kind}_20261021_20261022.tif").exists()
-    assert json.loads((out / "ppt_800m_uncertainty_20261021_20261022.json").read_text())["rain_snow_ramp_c"] == [0.0, 3.0]
-    assert (out / "report" / "storm_report_20261021_20261022.html").exists()
-    assert not (out / ".lock").exists() and not list(out.rglob("*.part"))
+        assert (ev / "totals" / f"ppt_800m_{kind}_20261021_20261022.tif").exists()
+    unc = ev / "totals" / "ppt_800m_uncertainty_20261021_20261022.json"
+    assert json.loads(unc.read_text())["rain_snow_ramp_c"] == [0.0, 3.0]
+    assert (ev / "report" / "storm_report_20261021_20261022.html").exists()
+    assert not (out / "run" / ".lock").exists() and not list(out.rglob("*.part"))
+    top = {p.name for p in out.iterdir()}
+    assert top <= {"storm.toml", "basin", "daily", "events", "qgis", "run"}, top
     assert (out / state["totals:storm1"]["log"]).read_text().count("Volume:") == 1
 
     again = subprocess.run(cmd, capture_output=True, text=True, env=FAST)
@@ -223,14 +229,14 @@ def test_pipeline_dry_run_lists_commands(tmp_path):
                           "--no-qgis", "--event", "two"], capture_output=True, text=True, env=FAST)
     assert res.returncode == 0, res.stderr
     assert "storm_total.py --out" in res.stdout and "--start 2026-10-23" in res.stdout and "one" not in res.stdout
-    assert "Disk:" in res.stdout and not (out / "pipeline_state.json").exists()
+    assert "Disk:" in res.stdout and not (out / "run" / "pipeline_state.json").exists()
 
 
 def test_status_sees_newer_releases_and_stale_outputs(tmp_path, monkeypatch):
     import pipeline
     import prism_watershed
     out = tmp_path / "run"
-    seed(out / "raw_zips", ["20261020", "20261021", "20261022", "20261023"])
+    seed(zips(out), ["20261020", "20261021", "20261022", "20261023"])
     b = basin(tmp_path)
     assert watershed(out, b, "2026-10-20", "2026-10-23").returncode == 0
     settings(tmp_path, b, download={"start": dt.date(2026, 10, 20), "end": dt.date(2026, 10, 23), "vars": ["ppt"]})
@@ -249,9 +255,10 @@ def test_status_sees_newer_releases_and_stale_outputs(tmp_path, monkeypatch):
 # ---------- interruption and resume ----------
 
 def outputs(out):
-    with xr.open_dataset(out / "ppt_800m_daily_clip.nc") as ds:
+    with xr.open_dataset(out / "daily" / "ppt_800m_daily_clip.nc") as ds:
         cube = ds.ppt.values.copy(), list(ds.release.values)
-    rows = [(r["date"], r["release"], r["basin_mean_mm"]) for r in csv.DictReader(open(out / "daily_basin_summary.csv"))]
+    rows = [(r["date"], r["release"], r["basin_mean_mm"])
+            for r in csv.DictReader(open(out / "daily" / "daily_basin_summary.csv"))]
     return cube, rows
 
 
@@ -263,8 +270,7 @@ def test_interrupted_run_resumes(tmp_path):
     run, the interruption recorded, nothing half-written left behind."""
     b = basin(tmp_path)
     clean, cut = tmp_path / "clean", tmp_path / "cut"
-    for out in (clean, cut):
-        seed(out / "raw_zips", DAYS)
+    seed(zips(clean), DAYS)  # clean and cut share the default store next to them
     assert watershed(clean, b, "2026-10-15", "2026-10-26").returncode == 0
     proc = subprocess.Popen([sys.executable, str(SCRIPT), "--start", "2026-10-15", "--end", "2026-10-26", "--boundary",
                              str(b), "--out", str(cut), "--pause", "0"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -276,8 +282,8 @@ def test_interrupted_run_resumes(tmp_path):
     _, err = proc.communicate(timeout=120)
     assert proc.returncode == 130 and "Interrupted." in err and "To continue, rerun" in err
     assert manifest.read_runs(cut)[-1]["status"] == "interrupted"
-    assert len(list((cut / "clipped").glob("*.tif"))) < len(DAYS)
-    assert not (cut / ".lock").exists() and not list(cut.rglob("*.part"))
+    assert len(list((cut / "daily" / "clipped").glob("*.tif"))) < len(DAYS)
+    assert not (cut / "run" / ".lock").exists() and not list(cut.rglob("*.part"))
     assert watershed(cut, b, "2026-10-15", "2026-10-26").returncode == 0
     (c_cube, c_rel), c_rows = outputs(clean)
     (k_cube, k_rel), k_rows = outputs(cut)
@@ -289,53 +295,62 @@ def test_leftovers_from_a_crash_are_recovered(tmp_path):
     doesn't stop or corrupt the next run."""
     b = basin(tmp_path)
     out = tmp_path / "run"
-    seed(out / "raw_zips", DAYS[:3])
+    raw = zips(out)
+    seed(raw, DAYS[:3])
     assert watershed(out, b, "2026-10-15", "2026-10-17").returncode == 0
     before = outputs(out)
-    (out / ".lock").write_text(json.dumps({"pid": 999999, "host": os.uname().nodename, "command": "gone"}))
-    (out / "clipped" / "ppt_800m_20261016_clip.tif").write_bytes(b"II*\x00truncated")
-    (out / "extracted" / ".unzip-abc").mkdir()
-    (out / "ppt_800m_daily_clip.nc.part").write_bytes(b"half")
+    (out / "run" / ".lock").write_text(json.dumps({"pid": 999999, "host": os.uname().nodename, "command": "gone"}))
+    (out / "daily" / "clipped" / "ppt_800m_20261016_clip.tif").write_bytes(b"II*\x00truncated")
+    unzip = tmp_path / "prism_store" / "extracted" / "us" / "800m" / "ppt" / ".unzip-abc"
+    unzip.mkdir()
+    os.utime(unzip, (time.time() - 7200, time.time() - 7200))  # old: no other run is still unzipping into it
+    fresh = unzip.with_name(".unzip-def")
+    fresh.mkdir()  # might be another basin's unzip in progress: left alone
+    (out / "daily" / "ppt_800m_daily_clip.nc.part").write_bytes(b"half")
     make_zip(tmp_path, "20261017", 99.0)  # a truncated copy of a zip, as a crash mid-download would leave
-    (out / "raw_zips" / "prism_ppt_us_30s_20261017.zip").write_bytes(
-        (tmp_path / "prism_ppt_us_30s_20261017.zip").read_bytes()[:200])
+    (raw / "prism_ppt_us_30s_20261017.zip").write_bytes((tmp_path / "prism_ppt_us_30s_20261017.zip").read_bytes()[:200])
     res = watershed(out, b, "2026-10-15", "2026-10-17")
     assert "Traceback" not in res.stderr
-    assert not (out / "extracted" / ".unzip-abc").exists() and not (out / ".lock").exists()
-    assert (out / "raw_zips" / "prism_ppt_us_30s_20261017.zip.bad").exists()  # set aside; downloaded next run
-    (out / "raw_zips" / "prism_ppt_us_30s_20261017.zip.bad").unlink()
-    seed(out / "raw_zips", DAYS[:3])  # what the next download would bring back
+    assert not unzip.exists() and fresh.exists() and not (out / "run" / ".lock").exists()
+    assert (raw / "prism_ppt_us_30s_20261017.zip.bad").exists()  # set aside; downloaded next run
+    (raw / "prism_ppt_us_30s_20261017.zip.bad").unlink()
+    seed(raw, DAYS[:3])  # what the next download would bring back
     assert watershed(out, b, "2026-10-15", "2026-10-17").returncode == 0
     after = outputs(out)
     assert np.array_equal(before[0][0], after[0][0], equal_nan=True) and before[1] == after[1]
 
 
-# ---------- shared cache ----------
+# ---------- shared store ----------
 
-def test_shared_cache(tmp_path):
-    """Two basins share one zip cache: each folder links the shared zips, and a newer release one basin brought
-    in is picked up by the other without a download (its older zip archived)."""
-    cache = tmp_path / "cache"
-    seed(cache, ["20261021", "20261022"])
+def test_shared_store(tmp_path):
+    """Basins share one PRISM store: no basin keeps zips of its own; a newer release one basin's refresh brought
+    in reaches another on its next run without a download, and until then that basin keeps reading the release
+    its own outputs were made from (unzipped again from the archived zip when needed)."""
+    from layout import Layout
+    from storm_total import prism_day_files
+    store = tmp_path / "store"
+    zdir = store / "zips" / "us" / "800m" / "ppt"
+    seed(zdir, ["20261021", "20261022"])
     b = basin(tmp_path)
     a_out, b_out = tmp_path / "a", tmp_path / "b"
     for out in (a_out, b_out):
-        res = watershed(out, b, "2026-10-21", "2026-10-22", "--cache", str(cache))
+        res = watershed(out, b, "2026-10-21", "2026-10-22", "--store", str(store))
         assert res.returncode == 0, res.stdout + res.stderr
-        assert "request failed" not in res.stdout
-        z = out / "raw_zips" / "prism_ppt_us_30s_20261022.zip"
-        assert os.path.samefile(z, cache / z.name)
-    tmp = tmp_path / "newer"
-    seed(tmp, ["20261022"], release=3, value=33.0)
-    (tmp / "prism_ppt_us_30s_20261022.zip").replace(cache / "prism_ppt_us_30s_20261022.zip")  # basin A's refresh
-    res = watershed(b_out, b, "2026-10-21", "2026-10-22", "--cache", str(cache))
-    assert "release 3 from the shared cache" in res.stdout and "release 2 -> 3" in res.stdout
-    assert (b_out / "raw_zips" / "releases" / "prism_ppt_us_30s_20261022_r2.zip").exists()
+        assert "request failed" not in res.stdout and not (out / "raw_zips").exists()
+    day = dt.date(2026, 10, 22)
 
-    own = tmp_path / "own"  # a folder's own zips are added to the cache
-    seed(own / "raw_zips", ["20261023"])
-    assert watershed(own, b, "2026-10-23", "2026-10-23", "--cache", str(cache)).returncode == 0
-    assert (cache / "prism_ppt_us_30s_20261023.zip").exists()
+    def release_read(out):
+        return prism_day_files(Layout(out, store=store), "ppt", "800m", day)[0].parent.name.rsplit("_r", 1)[1]
+    z = zdir / "prism_ppt_us_30s_20261022.zip"  # basin A's refresh: release 2 archived, release 3 current
+    archived = Layout(a_out, store=store).store.archived_zip(z, 2)
+    archived.parent.mkdir(exist_ok=True)
+    z.replace(archived)
+    seed(zdir, ["20261022"], release=3, value=33.0)
+    assert release_read(b_out) == "2"                    # not refreshed yet: still its own release
+    res = watershed(b_out, b, "2026-10-21", "2026-10-22", "--store", str(store))
+    assert "release 2 -> 3" in res.stdout and "request failed" not in res.stdout
+    assert release_read(b_out) == "3"
+    assert release_read(a_out) == "2"                    # unzipped again from releases/ for basin A
 
 
 # ---------- network robustness ----------
@@ -400,7 +415,7 @@ def test_recheck_provisional_flow(tmp_path):
     result = {"run_key": key, "status": "ok", "checked_utc": "2026-10-31T00:00:00+00:00",
               "flow": {"approval_status": {"Provisional": 900}}}
     (tmp_path / "runoff_1.json").write_text(json.dumps(result))
-    gpd.GeoDataFrame(geometry=[box(0, 0, 1, 1)], crs=4326).to_file(tmp_path / "runoff_1_basin.geojson")
+    gpd.GeoDataFrame(geometry=[box(0, 0, 1, 1)], crs=4326).to_file(tmp_path / "1_basin.geojson")
     soon, late = dt.datetime(2026, 11, 5, tzinfo=utc), dt.datetime(2026, 12, 5, tzinfo=utc)
     assert load_cached(tmp_path, "1", key, now=late) is not None                   # not asked to recheck
     assert load_cached(tmp_path, "1", key, now=soon, recheck_days=30) is not None
@@ -439,17 +454,14 @@ def test_check_endpoints_reports_failures_without_raising(monkeypatch):
 def test_gauge_results_are_kept_per_window(tmp_path):
     """Running another storm doesn't throw away a gauge's saved result for the first one."""
     from validate_runoff import load_cached, save_result
-    gpd.GeoDataFrame(geometry=[box(0, 0, 1, 1)], crs=4326).to_file(tmp_path / "runoff_1_basin.geojson")
+    gpd.GeoDataFrame(geometry=[box(0, 0, 1, 1)], crs=4326).to_file(tmp_path / "1_basin.geojson")
     k1 = {"start": "2026-10-20", "end": "2026-10-27", "after_days": 3}
     k2 = {"start": "2026-11-01", "end": "2026-11-03", "after_days": 7}
     save_result(tmp_path, "1", {"run_key": k1, "status": "ok", "n": 1}, "2026-10-20", "2026-10-27")
     save_result(tmp_path, "1", {"run_key": k2, "status": "ok", "n": 2}, "2026-11-01", "2026-11-03")
     assert load_cached(tmp_path, "1", k1)[0]["n"] == 1 and load_cached(tmp_path, "1", k2)[0]["n"] == 2
-    assert json.loads((tmp_path / "runoff_1.json").read_text())["n"] == 2  # the plain name is the latest
-    (tmp_path / "runoff_1_20261020_20261027.json").unlink()
-    (tmp_path / "runoff_1_20261101_20261103.json").unlink()                  # as saved before per-window files
-    assert load_cached(tmp_path, "1", k1) is None and load_cached(tmp_path, "1", k2)[0]["n"] == 2
-    assert json.loads((tmp_path / "runoff_1_20261101_20261103.json").read_text())["n"] == 2  # copy kept from now on
+    assert sorted(p.name for p in tmp_path.glob("runoff_1*.json")) == [  # one file per window, no "latest" copy
+        "runoff_1_20261020_20261027.json", "runoff_1_20261101_20261103.json"]
 
 
 def test_report_gauge_names():

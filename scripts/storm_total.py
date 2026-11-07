@@ -2,9 +2,8 @@
 """
 Total precipitation depth and water volume over a basin for any date range.
 
-Reads the daily cube that prism_watershed.py writes next to its other
-outputs (<out>/ppt_<res>_daily_clip.nc): one layer per PRISM day, clipped to
-the basin, plus the area of every grid cell.
+Reads the daily cube that prism_watershed.py writes (<out>/daily/ppt_<res>_daily_clip.nc): one layer
+per PRISM day, clipped to the basin, plus the area of every grid cell.
 
 Cell areas are computed on the GRS80 ellipsoid (NAD83) for each row of the
 native 1/120-degree grid, so volumes need no reprojection or resampling.
@@ -12,13 +11,13 @@ native 1/120-degree grid, so volumes need no reprojection or resampling.
 Dates are PRISM day labels: the grid for Oct 23 covers 12:00 UTC Oct 22 to
 12:00 UTC Oct 23 (6 AM to 6 AM Mountain Daylight Time).
 
-The report also lists each day's PRISM release and, when <out>/<var>_<res>_release_history.csv
+The report also lists each day's PRISM release and, when <out>/daily/<var>_<res>_release_history.csv
 holds earlier releases, how much the window volume has changed since the first release recorded
-for each day. If the national grids in <out>/extracted and the basin boundary are present, it
+for each day. If the national grids are in the PRISM store and the basin boundary is present, it
 also reports boundary sensitivity: the window volume counting cells by center (the cube's rule),
 any cell touching the basin, and each cell weighted by its share inside the basin.
 
-Rain and snow: if <out>/tmean_<res>_daily_clip.nc exists (prism_watershed.py --var tmean
+Rain and snow: if <out>/daily/tmean_<res>_daily_clip.nc exists (prism_watershed.py --var tmean
 for the same basin and days), each cell's daily precipitation is split by its PRISM daily
 mean temperature: all snow at or below --all-snow-c (default 0 °C), all rain at or above
 --all-rain-c (default 3 °C), linear between (equal values give a single threshold). Snow
@@ -38,18 +37,17 @@ volume NetCDF holds the same per day (`volume`) plus the window total (`volume_t
 Uncertainty: the report ends with the volume's components of uncertainty (gauge comparison
 from validate_stations.py for the same window, basin boundary, PRISM revisions so far; other
 products not yet assessed) and a bounding range, saved to
-<out>/ppt_<res>_uncertainty_<start>_<end>.json. With a tmean cube, the rain volume is also
+<out>/events/<event>/totals/ppt_<res>_uncertainty_<start>_<end>.json (layout.py). With a tmean cube, the rain volume is also
 given across --ramp-alternatives. Method: docs/UNCERTAINTY.md.
 
 Each run ends with QC checks for the window (qc.py; --qc-strict turns warnings into
 failures, and any failure gives exit status 1) and appends a record of the run to
-<out>/run_manifest.json. With <out>/storm.toml, the window defaults to its first event (--event
+<out>/run/run_manifest.json. With <out>/storm.toml, the window defaults to its first event (--event
 for another) and the rain/snow ramp comes from its [rain_snow] section.
 """
 import argparse
 import csv
 import datetime as dt
-import json
 import sys
 from pathlib import Path
 
@@ -73,10 +71,8 @@ import manifest
 import qc
 import runtime
 import uncertainty
+from layout import RES_CODES, Layout  # noqa: F401  (RES_CODES: 30s = 800 m, 25m = 4 km)
 from runtime import EXIT_QC, die
-
-# PRISM file names carry a resolution code instead of the resolution: 30s = 800 m, 25m = 4 km.
-RES_CODES = {"800m": "30s", "4km": "25m"}
 GRS80_A = 6378137.0
 GRS80_F = 1 / 298.257222101
 M3_PER_ACRE_FT = 1233.48184
@@ -126,11 +122,31 @@ def cell_area_m2(transform, height):
     return np.abs(np.radians(transform.a) * b2 / 2 * (q(top) - q(bottom)))
 
 
-def prism_day_files(extracted, var, res, day):
-    """(grid path, stn.csv path or None) for one PRISM day and resolution in <out>/extracted."""
-    ymd = day.strftime("%Y%m%d")
-    folders = sorted(Path(extracted).glob(f"*{var}*{RES_CODES[res]}*{ymd}*"))
-    grids = [p for f in folders if f.is_dir() for p in f.iterdir() if p.suffix.lower() in GRID_SUFFIXES]
+def clip_release(path):
+    """The PRISM release a clipped tif was made from (its PRISM_DATASET_RELEASE_NUMBER tag), else None."""
+    try:
+        with rasterio.open(path) as src:
+            r = src.tags().get("PRISM_DATASET_RELEASE_NUMBER", "")
+    except (rasterio.errors.RasterioIOError, OSError):
+        return None
+    return int(r) if str(r).isdigit() else None
+
+
+def prism_day_files(lay, var, res, day, release=None):
+    """(grid path, stn.csv path or None) of the national grid for one PRISM day in the store: the release
+    the folder's clipped day was made from (so a refresh in another basin doesn't change this one), else
+    the newest the store has. lay is a Layout, or a folder path."""
+    if not isinstance(lay, Layout):
+        lay = Layout(lay)
+    if release is None:
+        release = clip_release(lay.clip_tif(var, res, day))
+    folders = lay.store.day_folders(var, res, lay.region, day)  # {(format, release): folder}
+    want = release or max((r for _, r in folders), default=None)
+    picked = [f for (_, r), f in folders.items() if r == want]
+    if not picked:  # not unzipped (yet, or any more): unzip the current or archived zip of that release
+        f = lay.store.day_folder(var, res, lay.region, day, release)
+        picked = [f] if f else []
+    grids = [p for f in picked for p in f.iterdir() if p.suffix.lower() in GRID_SUFFIXES]
     if not grids:
         return None, None
     grid = min(grids, key=lambda p: GRID_SUFFIXES.index(p.suffix.lower()))
@@ -359,7 +375,7 @@ def rain_snow(daily_mm, tmean, all_snow_c=0.0, all_rain_c=3.0):
 
 def partition_window(out, res, ds, r, all_snow_c, all_rain_c):
     """Rain and snow for a window_total result r, from the tmean cube in out, or a note why not."""
-    tnc = Path(out) / f"tmean_{res}_daily_clip.nc"
+    tnc = Layout(out, settings={}).cube("tmean", res)
     if not tnc.exists():
         return f"skipped: no {tnc.name} (run prism_watershed.py --var tmean for the same basin and days)"
     daily = r["daily_mm"]
@@ -392,6 +408,7 @@ def with_attrs(da, **attrs):
 
 def write_rain_snow_nc(ds, part, path, all_snow_c, all_rain_c):
     """Daily rain, snow and snow fraction plus window totals (mm) to NetCDF."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     grid = {"grid_mapping": "crs", "cell_measures": "area: cell_area"}
     bnds, t_attrs = cf_extras(ds, part["rain_mm"])
     out = xr.Dataset(
@@ -459,6 +476,7 @@ def zone_totals(ds, geoms, start, end, var="ppt"):
 
 def write_tif(grid, crs_wkt, path, units):
     """Write a (lat, lon) DataArray to a float32 GeoTIFF (nodata -9999)."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     lat, lon = grid.lat.values, grid.lon.values
     dx, dy = lon[1] - lon[0], lat[0] - lat[1]
     transform = from_origin(lon[0] - dx / 2, lat[0] + dy / 2, dx, dy)
@@ -472,6 +490,7 @@ def write_tif(grid, crs_wkt, path, units):
 
 def write_volume_nc(ds, r, path):
     """Write daily and window-total water volume per cell (m³) to NetCDF."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     grid = {"units": "m3", "grid_mapping": "crs", "cell_measures": "area: cell_area"}
     bnds, t_attrs = cf_extras(ds, r["daily_mm"])
     out = xr.Dataset(
@@ -505,7 +524,7 @@ def main():
     ap.add_argument("--volume-nc",
                     help="also write daily and total water volume per cell (m³) to this NetCDF")
     ap.add_argument("--boundary",
-                    help="basin polygon for the boundary check (default: the wbd_huc*.geojson in --out)")
+                    help="basin polygon for the boundary check (default: the basin in --out/basin)")
     ap.add_argument("--all-snow-c", type=float, default=0.0,
                     help="daily mean temperature at or below which precipitation is all snow (default 0 °C)")
     ap.add_argument("--all-rain-c", type=float, default=3.0,
@@ -522,8 +541,9 @@ def main():
     a = config.parse_args(ap)
     run = manifest.start_run("storm_total.py", a)
     runtime.attach(a.out, run, a)
+    lay = Layout(a.out)
 
-    nc = Path(a.out) / f"ppt_{a.res}_daily_clip.nc"
+    nc = lay.cube("ppt", a.res)
     if not nc.exists():
         die(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
     with xr.open_dataset(nc) as ds:
@@ -531,6 +551,7 @@ def main():
         start = a.start or str(days.min())
         end = a.end or str(days.max())
         r = window_total(ds, start, end)
+        lay.prepare_event(start, end)  # the window's folder (and what the pipeline's output paths point into)
         if a.tif:
             write_tif(r["total_mm"], ds.crs.attrs["crs_wkt"], a.tif, "mm")
         if a.volume_tif:
@@ -539,7 +560,7 @@ def main():
             write_volume_nc(ds, r, a.volume_nc)
         gap = ds.attrs.get("basin_without_prism_pct", 0)
         basin_km2 = ds.attrs.get("basin_area_km2")
-        bounds = boundary_check(Path(a.out), a.res, a.boundary, ds, start, r["days"])
+        bounds = boundary_check(lay, a.res, a.boundary, ds, start, r["days"])
         part = partition_window(a.out, a.res, ds, r, a.all_snow_c, a.all_rain_c)
         if isinstance(part, str) and (a.rain_tif or a.snow_tif or a.rain_snow_nc):
             die(f"Rain/snow outputs requested but the partition was {part}")
@@ -578,7 +599,7 @@ def main():
     if any(rel < 8 for rel in r["releases"]):
         print("             Release 8 is final; earlier releases change for about 6 months. To pick up revisions, "
               "re-run prism_watershed.py with --refresh.")
-    history_csv = Path(a.out) / f"ppt_{a.res}_release_history.csv"
+    history_csv = lay.release_history("ppt", a.res)
     rc = None
     if history_csv.exists():
         with open(history_csv, newline="") as f:
@@ -607,13 +628,11 @@ def main():
         spread = f"{(hi - lo) / vols['weighted'] * 100:.2f}%" if vols["weighted"] else "n/a"
         print(f"Boundary:    cell centers {vols['centers'] / 1e9:.4f} km³, area-weighted {vols['weighted'] / 1e9:.4f}, "
               f"any cell touched {vols['touched'] / 1e9:.4f} (range {spread} of area-weighted)")
-    stations_json = Path(a.out) / "validation" / "stations_summary.json"
-    sj = runtime.window_json(stations_json, start, end)
+    sj = runtime.window_json(lay.validation_file("stations_summary.json", start, end), start, end)
     event_totals = sj.get("event_totals") if sj else None
-    if sj is None and stations_json.exists():
-        other = json.loads(stations_json.read_text()).get("window", {})
-        print(f"Gauges:      not in the uncertainty: validate_stations.py was last run for {other.get('start')} to "
-              f"{other.get('end')}; run it for {start} to {end}, then this again")
+    if sj is None:
+        print(f"Gauges:      not in the uncertainty: no validate_stations.py results for {start} to {end}; "
+              "run it for this window, then this again")
     components = [uncertainty.gauge_component(event_totals),
                   uncertainty.boundary_component(None if isinstance(bounds, str) else bounds["volumes"], v),
                   uncertainty.revision_component(rc, r["releases"]),
@@ -630,7 +649,8 @@ def main():
         print(f"  rain       {min(rains) / 1e9:.3f}-{max(rains) / 1e9:.3f} km³ across ramps "
               f"{a.all_snow_c:g},{a.all_rain_c:g} (used) and {', '.join(alt_rain)} °C; shifts water between rain "
               "and snow, not the total")
-    unc_json = Path(a.out) / f"ppt_{a.res}_uncertainty_{start.replace('-', '')}_{end.replace('-', '')}.json"
+    unc_json = lay.uncertainty_json(a.res, start, end)
+    unc_json.parent.mkdir(parents=True, exist_ok=True)
     runtime.write_json(unc_json, unc)
     if a.tif:
         print(f"Total depth raster: {a.tif}")
@@ -662,7 +682,7 @@ def main():
     if a.qc_strict:
         checks = qc.apply_strict(checks)
     print("\n" + "\n".join(qc.report(checks)))
-    tnc = Path(a.out) / f"tmean_{a.res}_daily_clip.nc"
+    tnc = lay.cube("tmean", a.res)
     run.update(window={"start": start, "end": end},
                inputs=manifest.files_entry([nc] + ([tnc] if not isinstance(part, str) else []), a.out),
                results={"area_km2": r["area_m2"] / 1e6, "mean_mm": r["mean_mm"], "max_mm": r["max_mm"],
@@ -679,17 +699,17 @@ def main():
         die("QC failed (see above).", EXIT_QC)
 
 
-def boundary_check(out, res, boundary, ds, start, n_days):
+def boundary_check(lay, res, boundary, ds, start, n_days):
     """{"volumes": boundary_volumes, "grid_km2": area of the cells counted by center, "polygon_km2"} for the
-    window from the national grids in <out>/extracted, or a note saying why it was skipped."""
+    window from the national grids in the PRISM store, or a note saying why it was skipped."""
     import geopandas as gpd
-    files = [Path(boundary)] if boundary else (sorted(out.glob("wbd_huc*.geojson")) or sorted(out.glob("boundary.geojson")))
+    files = [Path(boundary)] if boundary else lay.boundary_files()
     if len(files) != 1:
-        return "skipped: pass --boundary (no single wbd_huc*.geojson or boundary.geojson in --out)"
+        return "skipped: pass --boundary (no single wbd_huc*.geojson or boundary.geojson in basin/)"
     days = [dt.date.fromisoformat(start) + dt.timedelta(days=i) for i in range(n_days)]
-    grids = [prism_day_files(out / "extracted", "ppt", res, d)[0] for d in days]
+    grids = [prism_day_files(lay, "ppt", res, d)[0] for d in days]
     if None in grids:
-        return "skipped: national grids for the window are not all in extracted/"
+        return f"skipped: national grids for the window are not all in the PRISM store ({lay.store.root})"
     geom = gpd.read_file(files[0]).to_crs(4269).union_all()
     total, transform = national_window_total(grids, ds)
     centers = features.geometry_mask([geom], total.shape, transform, invert=True)

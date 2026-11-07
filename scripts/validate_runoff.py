@@ -7,7 +7,7 @@ the study basin (the basin --out was built for) with a 15-minute discharge recor
 covering the window.
 
 For each gauge, its drainage basin comes from USGS NLDI; PRISM precipitation over it is
-taken from the national daily grids in <out>/extracted, so a gauge basin may extend past
+taken from the national daily grids in the PRISM store, so a gauge basin may extend past
 the study basin (only the gauge itself must be inside it). Discharge comes from the gauge's 15-minute
 record, which can survive when daily values are withheld (for example around an
 equipment problem at the flood peak). Gaps are filled by linear interpolation and
@@ -20,7 +20,7 @@ minus baseflow, bracketed two ways:
                (smaller runoff; the recession is still above pre-storm flow at the end)
 Precipitation includes snow, which at high elevations stays on the ground, so ratios
 from mountain basins understate rain-driven runoff. When PRISM tmean grids for the window
-are in <out>/extracted (prism_watershed.py --var tmean), each gauge also gets a rain-only
+are in the PRISM store (prism_watershed.py --var tmean), each gauge also gets a rain-only
 ratio (runoff / rain volume), with rain split from snow by daily mean temperature as in
 storm_total.py (--all-snow-c, --all-rain-c).
 
@@ -37,14 +37,14 @@ transbasin diversions are not distinguished.
 Flow window: 12:00 UTC the day before --start (the start of the first PRISM day) to
 12:00 UTC --after-days after --end, to catch the recession (capped at the current time).
 
-Outputs in <out>/validation/:
-    validation.gpkg  layers 'gauge_basins' (basins with volumes, ratios, regulation),
-                     'gauges' (every gauge considered, with status) and 'dams' (NID dams in
-                     the study basin), with default QGIS styles
-    runoff_summary.csv (one row per gauge), runoff_<site>.json, runoff_<site>_flow.csv; each also as
-    <name>_<start>_<end>.<ext>, so a folder keeps results for several windows: a gauge's saved result
-    for one storm is reused for that storm even after another storm has run (the plain names hold the
-    latest run)
+Outputs in the window's <out>/events/<event>/validation/ (layout.py), named for the window:
+    validation.gpkg  layers 'gauge_basins_<start>_<end>' (basins with volumes, ratios, regulation) and
+                     'gauges_<start>_<end>' (every gauge considered, with status), with default QGIS styles
+    runoff_summary_<start>_<end>.csv (one row per gauge)
+    runoff/runoff_<site>_<start>_<end>.json and runoff_<site>_flow_<start>_<end>.csv: each gauge's saved
+                     result, reused by later runs for the same window and settings
+and for the whole basin: <out>/basin/gauges/<site>_basin.geojson (each gauge's NLDI basin) and
+<out>/basin/dams.gpkg (layer 'dams', NID dams in the study basin).
 
 Stopping at the USGS rate limit exits with status 3: rerun the same command to continue. USGS
 revises provisional discharge when it approves it; --recheck-provisional-days N re-fetches gauges
@@ -75,6 +75,7 @@ import xarray as xr
 import config
 import manifest
 import runtime
+from layout import Layout
 from runtime import die
 from storm_total import M3_PER_ACRE_FT, area_grid, prism_day_files, snow_fraction, utm_crs
 from validate_stations import load_basin, write_layer
@@ -99,7 +100,7 @@ class GaugeSkipped(Exception):
 def basin_precip(grids, basin, max_missing_pct=1.0, tmean=None, all_snow_c=0.0, all_rain_c=3.0):
     """Daily precipitation over a gauge basin from PRISM's national daily grids.
 
-    grids: [(day, path)] of national grids (the ones in <out>/extracted), so a gauge basin may
+    grids: [(day, path)] of national grids (from the PRISM store), so a gauge basin may
     extend past the study basin. Cells count when their centers fall inside the basin; cell areas
     are ellipsoidal per row. Cells with no PRISM data (outside PRISM coverage, for example in
     Canada or Mexico) are filled with the basin-average depth, up to max_missing_pct of the basin
@@ -248,22 +249,21 @@ def basin_share_inside(basin, study_poly):
 
 
 def upsert_layer(gdf, gpkg, layer, key, values, window=None):
-    """Replace these gauges' rows in a GeoPackage layer (and its window-named copy), keeping other gauges."""
-    names = [layer] + ([f"{layer}_{runtime.span(*window)}"] if window else [])
-    for name in names:
-        new = gdf
-        if Path(gpkg).exists():
-            try:
-                old = gpd.read_file(gpkg, layer=name)
-                new = pd.concat([old[~old[key].isin(values)].to_crs(gdf.crs), gdf], ignore_index=True)
-            except Exception:
-                pass
-        write_layer(gpd.GeoDataFrame(new, crs=gdf.crs), gpkg, name, style=layer)
+    """Replace these gauges' rows in a GeoPackage layer (window-named with window), keeping other gauges."""
+    name = f"{layer}_{runtime.span(*window)}" if window else layer
+    new = gdf
+    if Path(gpkg).exists():
+        try:
+            old = gpd.read_file(gpkg, layer=name)
+            new = pd.concat([old[~old[key].isin(values)].to_crs(gdf.crs), gdf], ignore_index=True)
+        except Exception:
+            pass
+    write_layer(gpd.GeoDataFrame(new, crs=gdf.crs), gpkg, name, style=layer)
 
 
 # ---------- one gauge ----------
 
-def run_gauge(site_no, site, grids, study_poly, dams_for, a, vdir, tmean=None):
+def run_gauge(site_no, site, grids, study_poly, dams_for, a, rdir, basins, tmean=None):
     """Compare one gauge. Returns (result dict, basin GeoDataFrame); raises GaugeSkipped.
 
     dams_for(bounds) returns NID dams covering at least those lon/lat bounds (the gauge basin may extend
@@ -327,14 +327,13 @@ def run_gauge(site_no, site, grids, study_poly, dams_for, a, vdir, tmean=None):
         "notes": ["Precipitation includes snow; high-elevation snow does not run off within the window.",
                   "Discharge is provisional unless approval_status says otherwise.",
                   "Regulated gauges: reservoir storage and releases, not just precipitation, set the flow."]}
-    save_result(vdir, site_no, result, start, end)
-    with runtime.atomic_path(vdir / f"runoff_{site_no}_basin.geojson") as tmp:
+    save_result(rdir, site_no, result, start, end)
+    Path(basins).mkdir(parents=True, exist_ok=True)
+    with runtime.atomic_path(gauge_basin_file(basins, site_no)) as tmp:
         basin.to_crs(4269).to_file(tmp, driver="GeoJSON")
-    flow_csv = vdir / f"runoff_{site_no}_flow.csv"
-    with runtime.atomic_path(flow_csv) as tmp:
+    with runtime.atomic_path(flow_file(rdir, site_no, start, end)) as tmp:
         pd.DataFrame({"q_cfs": q.round(1), "interpolated": interp, "baseflow_constant_cfs": np.round(base_c, 1),
                       "baseflow_line_cfs": np.round(base_l, 1)}).rename_axis("time_utc").to_csv(tmp)
-    runtime.keep_window_copy(flow_csv, start, end)
     return result, basin
 
 
@@ -450,21 +449,32 @@ def flow_approved(result):
     return bool(statuses) and all("approved" in str(s).lower() for s in statuses)
 
 
-def result_paths(vdir, site_no, start=None, end=None):
-    """Where a gauge's saved result for a window may be: runoff_<site>_<start>_<end>.json, then
-    runoff_<site>.json (the latest run, and every run before results were kept per window)."""
-    plain = Path(vdir) / f"runoff_{site_no}.json"
-    return ([runtime.windowed(plain, start, end)] if start and end else []) + [plain]
+def result_paths(rdir, site_no, start=None, end=None):
+    """Where a gauge's saved result for a window is: [<rdir>/runoff_<site>_<start>_<end>.json]."""
+    plain = Path(rdir) / f"runoff_{site_no}.json"
+    return [runtime.windowed(plain, start, end)] if start and end else [plain]
 
 
-def save_result(vdir, site_no, result, start, end):
-    """Save a gauge's result (or skip) for the window, and as the latest."""
-    for path in result_paths(vdir, site_no, start, end):
+def flow_file(rdir, site_no, start, end):
+    """A gauge's 15-minute flow and baseflow for the window: <rdir>/runoff_<site>_flow_<start>_<end>.csv."""
+    return runtime.windowed(Path(rdir) / f"runoff_{site_no}_flow.csv", start, end)
+
+
+def gauge_basin_file(basins, site_no):
+    """A gauge's NLDI basin, kept for every window: <basins>/<site>_basin.geojson."""
+    return Path(basins) / f"{site_no}_basin.geojson"
+
+
+def save_result(rdir, site_no, result, start, end):
+    """Save a gauge's result (or skip) for the window."""
+    Path(rdir).mkdir(parents=True, exist_ok=True)
+    for path in result_paths(rdir, site_no, start, end):
         runtime.write_json(path, result)
 
 
-def load_cached(vdir, site_no, key, target=None, now=None, recheck_days=None):
+def load_cached(rdir, site_no, key, target=None, now=None, recheck_days=None, basins=None):
     """(result, basin, None) or (None, skip reason, gauge) from an earlier run with the same settings, else None.
+    rdir holds the saved results (runoff_<site>_<start>_<end>.json), basins the gauge basins (default rdir).
 
     Results saved with other PRECIP_KEYS are returned too, with a run_key that differs from key, so the
     caller can recompute their precipitation (update_precip); skips caused by precipitation are not reused
@@ -472,7 +482,7 @@ def load_cached(vdir, site_no, key, target=None, now=None, recheck_days=None):
     With recheck_days, results with provisional flow fetched that many days ago or more are not reused.
     """
     found = []  # (modified, path, result) for each saved copy made with these settings
-    for candidate in result_paths(vdir, site_no, (key or {}).get("start"), (key or {}).get("end")):
+    for candidate in result_paths(rdir, site_no, (key or {}).get("start"), (key or {}).get("end")):
         try:
             saved = json.loads(candidate.read_text())
         except (OSError, ValueError):  # missing or unreadable: try the next, else fetch again
@@ -481,10 +491,7 @@ def load_cached(vdir, site_no, key, target=None, now=None, recheck_days=None):
             found.append((candidate.stat().st_mtime, candidate, saved))
     if not found:
         return None
-    _, path, cached = max(found, key=lambda x: x[0])  # the newest, if both copies match
-    first = result_paths(vdir, site_no, (key or {}).get("start"), (key or {}).get("end"))[0]
-    if path != first:  # saved before results were kept per window: keep this window's copy from now on
-        runtime.write_json(first, cached)
+    _, path, cached = max(found, key=lambda x: x[0])
     now = now or dt.datetime.now(dt.timezone.utc)
     if recheck_days is not None and cached.get("status", "ok") == "ok" and not flow_approved(cached):
         checked = cached.get("checked_utc")
@@ -500,7 +507,7 @@ def load_cached(vdir, site_no, key, target=None, now=None, recheck_days=None):
         if cached.get("stage") == "precip" and cached.get("run_key") != key:
             return None
         return None, cached["status"], cached.get("gauge")
-    basin_file = vdir / f"runoff_{site_no}_basin.geojson"
+    basin_file = gauge_basin_file(basins or rdir, site_no)
     if not basin_file.exists():
         return None
     return cached, gpd.read_file(basin_file), None
@@ -532,7 +539,7 @@ def main():
     which.add_argument("--gauge", nargs="+", help="USGS site number(s), e.g. 09342500 09361500")
     which.add_argument("--all-gauges", action="store_true",
                        help="every USGS stream gauge in the study basin with 15-minute discharge for the window")
-    ap.add_argument("--boundary", help="study basin polygon (default: the wbd_huc*.geojson in --out)")
+    ap.add_argument("--boundary", help="study basin polygon (default: the basin in --out/basin)")
     ap.add_argument("--start", help="first PRISM day (default: first day in the cube)")
     ap.add_argument("--end", help="last PRISM day (default: last day in the cube)")
     ap.add_argument("--after-days", type=int, default=7, help="days of flow after --end to include (default 7)")
@@ -561,14 +568,12 @@ def main():
     observations.MAX_WAIT_S = a.max_wait_min * 60
 
     out = Path(a.out)
-    nc = out / f"ppt_{a.res}_daily_clip.nc"
+    lay = Layout(out)
+    nc = lay.cube("ppt", a.res)
     if not nc.exists():
         die(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
     study = load_basin(out, a.boundary)
     study_poly = study.geometry.iloc[0]
-    vdir = out / "validation"
-    vdir.mkdir(exist_ok=True)
-    gpkg = vdir / "validation.gpkg"
 
     with xr.open_dataset(nc) as ds:
         have = ds.time.values.astype("datetime64[D]").astype(object)
@@ -578,20 +583,24 @@ def main():
         missing = [d for d in days if d not in set(have)]
         if missing:
             die(f"Cube has no data for {', '.join(map(str, missing))}.")
+        lay.prepare_event(start, end)
+        vdir, rdir, basins_dir = lay.validation_dir(start, end), lay.runoff_dir(start, end), lay.gauges_dir
+        rdir.mkdir(parents=True, exist_ok=True)
+        gpkg = lay.validation_gpkg(start, end)
         grids = []
         for d in days:
-            grid, _ = prism_day_files(out / "extracted", "ppt", a.res, d)
+            grid, _ = prism_day_files(lay, "ppt", a.res, d)
             if grid is None:
-                die(f"No extracted PRISM grid for {d} in {out / 'extracted'}; run prism_watershed.py for it.")
+                die(f"No national PRISM grid for {d} in the PRISM store ({lay.store.root}); run prism_watershed.py for it.")
             grids.append((d, grid))
-        tmean = {d: prism_day_files(out / "extracted", "tmean", a.res, d)[0] for d in days}
+        tmean = {d: prism_day_files(lay, "tmean", a.res, d)[0] for d in days}
         if None in tmean.values():
             tmean = None
-            print("No PRISM tmean grids for every day in extracted/; rain-only ratios skipped "
+            print("No PRISM tmean grids for every day in the PRISM store; rain-only ratios skipped "
                   "(run prism_watershed.py --var tmean for the window).")
         rain_snow = [a.all_snow_c, a.all_rain_c] if tmean else None
         tmean_releases = []
-        tnc = out / f"tmean_{a.res}_daily_clip.nc"
+        tnc = lay.cube("tmean", a.res)
         if tmean and tnc.exists():
             with xr.open_dataset(tnc) as tds:
                 if "release" in tds:
@@ -634,8 +643,8 @@ def main():
         started = time.monotonic()
         for i, site_no in enumerate(sites):
             n_of = f"[{i + 1}/{len(sites)}]"
-            cached = None if a.refresh else load_cached(vdir, site_no, key, target,
-                                                        recheck_days=a.recheck_provisional_days)
+            cached = None if a.refresh else load_cached(rdir, site_no, key, target,
+                                                        recheck_days=a.recheck_provisional_days, basins=basins_dir)
             try:
                 if cached and cached[0] is None:
                     raise GaugeSkipped(cached[1], cached[2])
@@ -645,25 +654,25 @@ def main():
                         result = update_precip(result, basin, grids, a, tmean)
                         result["run_key"] = key
                         result["flow_complete"] = dt.datetime.fromisoformat(result["flow_window_utc"]["end"]) >= target
-                        save_result(vdir, site_no, result, start, end)
+                        save_result(rdir, site_no, result, start, end)
                         cached = "precipitation recomputed (new PRISM releases or rain/snow settings)"
                 else:
                     try:
                         site = meta.get(site_no) or usgs_site(site_no)
-                        result, basin = run_gauge(site_no, site, grids, study_poly, dams_for, a, vdir, tmean)
+                        result, basin = run_gauge(site_no, site, grids, study_poly, dams_for, a, rdir, basins_dir, tmean)
                     except RateLimited:
                         raise
                     except requests.RequestException as e:
                         raise GaugeSkipped(f"request failed: {e.__class__.__name__} "
                                            f"{getattr(e.response, 'status_code', '')}".strip(), meta.get(site_no))
                     except GaugeSkipped as e:
-                        save_result(vdir, site_no, {"run_key": key, "status": str(e), "gauge": e.site, "stage": e.stage,
+                        save_result(rdir, site_no, {"run_key": key, "status": str(e), "gauge": e.site, "stage": e.stage,
                                                     "checked_utc": dt.datetime.now(dt.timezone.utc).isoformat()},
                                     start, end)
                         raise
                     result["run_key"] = key
                     result["flow_complete"] = dt.datetime.fromisoformat(result["flow_window_utc"]["end"]) >= target
-                    save_result(vdir, site_no, result, start, end)
+                    save_result(rdir, site_no, result, start, end)
             except GaugeSkipped as e:
                 rows.append(summary_row(site_no, site=e.site, reason=str(e)))
                 if not (a.all_gauges and str(e) == "gauge is outside the study basin"):
@@ -693,8 +702,7 @@ def main():
     this_run = list(rows)
     if a.all_gauges:  # keep only gauges in the study basin
         rows = [r for r in rows if r["status"] != "gauge is outside the study basin"]
-    summary = vdir / "runoff_summary.csv"
-    write_summary(runtime.windowed(summary, start, end), rows, keep_others=not a.all_gauges)
+    summary = lay.validation_file("runoff_summary.csv", start, end)
     rows = write_summary(summary, rows, keep_others=not a.all_gauges)
 
     ok = [r for r in rows if r["status"] == "ok"]
@@ -718,14 +726,14 @@ def main():
     if dams:
         dg = pd.DataFrame(dams).drop(columns=["_af"], errors="ignore")
         dg["storage_af"] = dg["normal_storage_af"].fillna(dg["nid_storage_af"])
-        write_layer(gpd.GeoDataFrame(dg, geometry=gpd.points_from_xy(dg.lon, dg.lat), crs=4269), gpkg, "dams")
+        write_layer(gpd.GeoDataFrame(dg, geometry=gpd.points_from_xy(dg.lon, dg.lat), crs=4269), lay.dams_gpkg, "dams")
 
     counts = pd.Series([r["regulation"] for r in ok]).value_counts().to_dict()
     print(f"PRISM days {start} to {end}: {len(ok)} gauges compared {counts}; "
-          f"{len(rows) - len(ok)} skipped (reasons in runoff_summary.csv)")
+          f"{len(rows) - len(ok)} skipped (reasons in {summary.name})")
     print(f"Outputs in {vdir.resolve()}")
     run.update(window={"start": str(start), "end": str(end)},
-               outputs=manifest.files_entry([vdir / "runoff_summary.csv", vdir / "validation.gpkg"], out))
+               outputs=manifest.files_entry([summary, gpkg] + ([lay.dams_gpkg] if dams else []), out))
     manifest.append_run(out, run)
 
 

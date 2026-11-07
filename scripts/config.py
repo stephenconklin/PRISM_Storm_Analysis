@@ -14,7 +14,9 @@ Keys (all optional except the basin and the download window):
     huc = "1408"                 # or boundary = "basin.gpkg" (relative to this file)
     res = "800m"                 # or "4km"
     region = "us"
-    prism_cache = "~/prism_cache"   # shared national zip cache (or the PRISM_CACHE variable)
+    prism_store = "../prism_store"  # national PRISM data shared by every basin (relative to this file; default
+                                 # prism_store/ next to the folder, or the PRISM_STORE variable). The older
+                                 # name prism_cache is still read
 
     [download]                   # PRISM days to download: the events padded by a day each side
     start = 2026-10-20
@@ -109,6 +111,16 @@ def boundary_path(s):
     return str(p if p.is_absolute() else (base / p).resolve())
 
 
+def store_setting(s):
+    """prism_store (or the older prism_cache) as an absolute path, resolved relative to storm.toml; None if unset."""
+    v = (s or {}).get("prism_store") or (s or {}).get("prism_cache")
+    if not v:
+        return None
+    p = Path(v).expanduser()
+    base = Path(s["_path"]).parent if s.get("_path") else Path.cwd()
+    return str(p if p.is_absolute() else (base / p).resolve())
+
+
 def check(s):
     """Problems that would stop a run, as a list of messages ([] if none)."""
     problems = []
@@ -143,7 +155,7 @@ def defaults_for(s, role, event_name=None, window=None):
     the download window and basin; role 'event' takes an event's window and its own settings (after_days).
     window=(start, end) from the command line picks the event with those dates for its own settings."""
     rs, val = s.get("rain_snow") or {}, s.get("validation") or {}
-    out = {"res": s.get("res"), "region": s.get("region"), "cache": s.get("prism_cache"),
+    out = {"res": s.get("res"), "region": s.get("region"), "store": store_setting(s),
            "all_snow_c": rs.get("all_snow_c"), "all_rain_c": rs.get("all_rain_c"),
            "buffer_km": val.get("buffer_km"), "after_days": val.get("after_days"),
            "max_gap_hours": val.get("max_gap_hours"),
@@ -244,7 +256,8 @@ def render(s):
     lines = ["# PRISM Storm Analysis settings for this folder (see scripts/config.py).",
              "# Every script reads these for its defaults; command-line flags override them.", ""]
     for key, note in (("name", ""), ("huc", "WBD hydrologic unit code"), ("boundary", "polygon file instead of huc"),
-                      ("res", "800m or 4km"), ("region", ""), ("prism_cache", "shared national zip cache")):
+                      ("res", "800m or 4km"), ("region", ""),
+                      ("prism_store", "national PRISM data shared by every basin")):
         if s.get(key) not in (None, ""):
             lines.append(f"{key} = {toml_value(s[key])}" + (f"   # {note}" if note else ""))
     d = s["download"]

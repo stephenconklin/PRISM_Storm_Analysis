@@ -5,8 +5,9 @@ Run-time support shared by the PRISM Storm Analysis scripts (standard library on
 - run_main(main): every script's entry point. A run that fails, is interrupted (Ctrl-C) or is cancelled
   still gets a run_manifest.json entry with its status; network errors get a clear message and exit 4;
   Ctrl-C says what was kept and how to continue.
-- attach(out, run, args): takes the folder's lock (<out>/.lock), starts the run's log file in <out>/logs/,
-  and registers the manifest entry for run_main to complete.
+- attach(out, run, args): takes the folder's lock (<out>/run/.lock), starts the run's log file in
+  <out>/run/logs/, and registers the manifest entry for run_main to complete. A folder still in the old
+  layout (layout.py) stops with the command that migrates it.
 - write_atomic(), atomic_open(), atomic_path(): write to <name>.part and rename it into place, so an
   interrupted run never leaves a half-written file under the real name.
 - confirm(), interactive(), countdown(), eta(): command-line interaction. Prompts appear only when stdin
@@ -27,6 +28,9 @@ import sys
 import time
 import traceback
 from pathlib import Path
+
+import layout
+from layout import span  # noqa: F401  (re-exported: '<YYYYMMDD>_<YYYYMMDD>' for a window)
 
 EXIT_OK, EXIT_QC, EXIT_USAGE, EXIT_INCOMPLETE, EXIT_NETWORK, EXIT_ERROR, EXIT_INTERRUPTED = 0, 1, 2, 3, 4, 5, 130
 STATUS = {EXIT_OK: "ok", EXIT_QC: "qc_fail", EXIT_USAGE: "input_error", EXIT_INCOMPLETE: "incomplete",
@@ -99,27 +103,16 @@ def write_json(path, obj):
     write_atomic(path, json.dumps(obj, indent=2, default=str))
 
 
-def span(start, end):
-    """'<YYYYMMDD>_<YYYYMMDD>' for a window: the suffix of every per-window file and layer name."""
-    return f"{str(start).replace('-', '')}_{str(end).replace('-', '')}"
-
-
 def windowed(path, start, end):
-    """<stem>_<YYYYMMDD>_<YYYYMMDD><suffix>: the copy of a validation output kept for one window."""
+    """<stem>_<YYYYMMDD>_<YYYYMMDD><suffix>: a per-window output's name."""
     path = Path(path)
     return path.with_name(f"{path.stem}_{span(start, end)}{path.suffix}")
 
 
-def keep_window_copy(path, start, end):
-    """Copy path to its window-named name, so a folder can hold results for several windows."""
-    path = Path(path)
-    write_atomic(windowed(path, start, end), path.read_bytes())
-
-
 def window_json(path, start, end):
-    """A summary JSON for the window start..end: its window-named copy, else path itself when its "window"
-    matches; None otherwise."""
-    for p in (windowed(path, start, end), Path(path)):
+    """A summary JSON for the window start..end: path, or its window-named form, when its "window" matches;
+    None otherwise."""
+    for p in (Path(path), windowed(path, start, end)):
         if p.exists():
             try:
                 js = json.loads(p.read_text())
@@ -145,9 +138,13 @@ def _alive(pid):
     return True
 
 
-def lock_holder(out):
+def lock_path(out):
+    return layout.Layout(out, settings={}).lock_file
+
+
+def lock_holder(out, path=None):
     """The lock file's contents ({pid, host, command, started}) if another live run holds out, else None."""
-    path = Path(out) / ".lock"
+    path = Path(path) if path else lock_path(out)
     try:
         info = json.loads(path.read_text())
     except (OSError, ValueError):
@@ -158,24 +155,26 @@ def lock_holder(out):
 
 
 class FolderLock:
-    """<out>/.lock: one run writes to a folder at a time. A lock left by a run that is gone is taken over.
+    """<out>/run/.lock: one run writes to a folder at a time. A lock left by a run that is gone is taken over.
     A step started by pipeline.py shares the pipeline's lock (LOCK_ENV)."""
 
     def __init__(self, out):
-        self.path = Path(out) / ".lock"
+        self.out = Path(out)
+        self.path = lock_path(out)
         self.owned = False
 
     def acquire(self):
         held = os.environ.get(LOCK_ENV)
-        if held and Path(held).resolve() == self.path.resolve() and lock_holder(self.path.parent):
+        if held and Path(held).resolve() == self.path.resolve() and lock_holder(self.out):
             return self  # inside a pipeline that holds this folder
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         for _ in range(3):
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
-                info = lock_holder(self.path.parent)
+                info = lock_holder(self.out)
                 if info:
-                    die(f"{self.path.parent} is in use by another run (pid {info.get('pid')} on {info.get('host')}, "
+                    die(f"{self.out} is in use by another run (pid {info.get('pid')} on {info.get('host')}, "
                         f"started {info.get('started')}): {info.get('command')}\nWait for it to finish; if that run "
                         f"is gone, delete {self.path}.")
                 self.path.unlink(missing_ok=True)  # left behind by a run that stopped without cleaning up
@@ -228,12 +227,12 @@ class Tee:
 
 
 def start_log(out, script, verbose=False, quiet=False, path=None):
-    """Copy this run's output to <out>/logs/<time>-<script>.log (or the file pipeline.py chose) and send
+    """Copy this run's output to <out>/run/logs/<time>-<script>.log (or the file pipeline.py chose) and send
     the 'prism_storm' logger's records there (DEBUG and up) and to the terminal (INFO and up; DEBUG with
     verbose; WARNING and up with quiet). Returns the log path."""
     if _state["log"]:
         return _state["log"]
-    path = Path(path or os.environ.get(LOG_ENV) or Path(out) / "logs" /
+    path = Path(path or os.environ.get(LOG_ENV) or layout.Layout(out, settings={}).logs_dir /
                 f"{dt.datetime.now():%Y%m%d-%H%M%S}-{Path(script).stem}.log")
     path.parent.mkdir(parents=True, exist_ok=True)
     f = open(path, "a", encoding="utf-8", buffering=1)
@@ -284,10 +283,13 @@ def add_common_args(ap):
 
 def attach(out, run=None, args=None, lock=True, log_path=None):
     """Lock the output folder, start the run's log, and register its manifest entry. Does nothing for a
-    folder that doesn't exist yet (the script will stop on its missing inputs)."""
+    folder that doesn't exist yet (the script will stop on its missing inputs). Stops on a folder in the
+    old layout."""
     out = Path(out)
     if not out.is_dir():
         return None
+    if layout.legacy(out):
+        die(layout.migrate_hint(out))
     _state["out"] = out
     if lock and not _state["lock"]:
         _state["lock"] = FolderLock(out).acquire()

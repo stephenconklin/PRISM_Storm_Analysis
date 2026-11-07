@@ -2,11 +2,12 @@
 """
 Storm precipitation depth and water volume for the whole basin and for each subbasin.
 
-Reads the daily cube in --out and writes <out>/totals.gpkg with two layers:
-    basin_total  the study basin with its storm totals (area, mean and max depth, volume)
-    subbasins    each USGS Watershed Boundary Dataset unit inside the basin at one HUC level,
-                 with depth, volume, share of the basin's volume, and PRISM coverage
-plus subbasin_totals.csv. Both layers carry default QGIS styles.
+Reads the daily cube in --out and writes, in the window's <out>/events/<event>/subbasins/ (layout.py),
+totals.gpkg with two layers named for the window:
+    basin_total_<start>_<end>  the study basin with its storm totals (area, mean and max depth, volume)
+    subbasins_<start>_<end>    each USGS Watershed Boundary Dataset unit inside the basin at one HUC
+                               level, with depth, volume, share of the basin's volume, and PRISM coverage
+plus subbasin_totals_<start>_<end>.csv. Both layers carry default QGIS styles.
 
 Subbasin level: --digits, or by default the first HUC level below the study basin with at
 least 20 units (for example HUC10 inside a HUC4, HUC12 inside a HUC8). With --boundary (no
@@ -33,6 +34,7 @@ import xarray as xr
 import config
 import manifest
 import runtime
+from layout import Layout
 from runtime import die
 from storm_total import M3_PER_ACRE_FT, zone_totals
 from validate_stations import load_basin, write_layer
@@ -72,7 +74,7 @@ def main():
     ap.add_argument("--start", help="first PRISM day (default: first day in the cube)")
     ap.add_argument("--end", help="last PRISM day (default: last day in the cube)")
     ap.add_argument("--digits", type=int, choices=[4, 6, 8, 10, 12, 14, 16], help="subbasin HUC level")
-    ap.add_argument("--boundary", help="study basin polygon (default: the wbd_huc*.geojson in --out)")
+    ap.add_argument("--boundary", help="study basin polygon (default: the basin in --out/basin)")
     ap.add_argument("--res", default="800m", choices=["800m", "4km"])
     runtime.add_common_args(ap)
     a = config.parse_args(ap)
@@ -80,11 +82,12 @@ def main():
     runtime.attach(a.out, run, a)
 
     out = Path(a.out)
-    nc = out / f"ppt_{a.res}_daily_clip.nc"
+    lay = Layout(out)
+    nc = lay.cube("ppt", a.res)
     if not nc.exists():
         die(f"No cube at {nc}. Run prism_watershed.py with --out {a.out} first.")
     basin = load_basin(out, a.boundary)
-    wbd = sorted(out.glob("wbd_huc*.geojson"))
+    wbd = sorted(lay.basin_dir.glob("wbd_huc*.geojson"))
     huc = re.search(r"wbd_huc(\d+)", wbd[0].name).group(1) if wbd and not a.boundary else None
     name = "Study basin"
     if wbd and not a.boundary:
@@ -126,11 +129,12 @@ def main():
     for r in rows:
         r.update(prism_start=start, prism_end=end)
 
-    gpkg = out / "totals.gpkg"
+    lay.prepare_event(start, end)
+    gpkg, csv_path = lay.totals_gpkg(start, end), lay.subbasin_csv(start, end)
     write_layer(gpd.GeoDataFrame([total_row], geometry=[basin.geometry.iloc[0]], crs=4269), gpkg, "basin_total",
                 window=(start, end))
     write_layer(gpd.GeoDataFrame(rows, geometry=list(ugdf.geometry), crs=4269), gpkg, "subbasins", window=(start, end))
-    with runtime.atomic_open(out / "subbasin_totals.csv", "w", newline="") as f:
+    with runtime.atomic_open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=rows[0].keys())
         w.writeheader()
         w.writerows(sorted(rows, key=lambda r: r["rank"]))
@@ -150,9 +154,9 @@ def main():
     if low:
         print(f"{len(low)} subbasins are partly without PRISM data (coverage < 99%), "
               "usually outside the contiguous US or at the basin edge.")
-    print(f"Outputs: {gpkg}, {out / 'subbasin_totals.csv'}")
+    print(f"Outputs: {gpkg}, {csv_path}")
     run.update(window={"start": str(start), "end": str(end)},
-               outputs=manifest.files_entry([out / "totals.gpkg", out / "subbasin_totals.csv"], out))
+               outputs=manifest.files_entry([gpkg, csv_path], out))
     manifest.append_run(out, run)
 
 

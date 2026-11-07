@@ -45,10 +45,20 @@ def make_zip(raw_dir, ymd, value, release=2, var="ppt"):
     info.unlink()
 
 
+def zips(out, var="ppt", res="800m"):
+    """The zip folder of a basin folder's default PRISM store (prism_store/ next to it), made if needed."""
+    d = Path(out).parent / "prism_store" / "zips" / "us" / res / var
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def daily(out):
+    return Path(out) / "daily"
+
+
 def test_pipeline(tmp_path):
     out = tmp_path / "run"
-    raw = out / "raw_zips"
-    raw.mkdir(parents=True)
+    raw = zips(out)
     make_zip(raw, "20261021", 10.0)
     make_zip(raw, "20261022", 30.0)
     boundary = tmp_path / "basin.geojson"
@@ -57,14 +67,14 @@ def test_pipeline(tmp_path):
     subprocess.run([sys.executable, str(SCRIPT), "--start", "2026-10-21", "--end", "2026-10-22",
                     "--boundary", str(boundary), "--out", str(out), "--pause", "0"], check=True)
 
-    rows = list(csv.DictReader(open(out / "daily_basin_summary.csv")))
+    rows = list(csv.DictReader(open(daily(out) / "daily_basin_summary.csv")))
     assert [r["basin_mean_mm"] for r in rows] == ["10.0", "30.0"]
     assert all(r["release"] == "2" for r in rows)
-    with rasterio.open(out / "ppt_800m_total_20261021_20261022.tif") as src:
+    with rasterio.open(daily(out) / "ppt_800m_total_20261021_20261022.tif") as src:
         data = src.read(1, masked=True)
     assert np.isclose(data.mean(), 40.0)
 
-    with xr.open_dataset(out / "ppt_800m_daily_clip.nc") as ds:
+    with xr.open_dataset(daily(out) / "ppt_800m_daily_clip.nc") as ds:
         assert ds.sizes["time"] == 2
         assert list(ds.release.values) == [2, 2]
         # CF: day-label time stamps are the midpoints of their 12:00-to-12:00 UTC bounds
@@ -88,13 +98,13 @@ def test_pipeline(tmp_path):
                          check=True, capture_output=True, text=True)
     assert "30.0 mm" in res.stdout
     assert "r2 Oct 22" in res.stdout and "--refresh" in res.stdout
-    assert "Boundary:    cell centers" in res.stdout  # national grids are in extracted/
+    assert "Boundary:    cell centers" in res.stdout  # national grids are in the PRISM store
     with rasterio.open(tif) as src:
         assert np.isclose(src.read(1, masked=True).mean(), 30.0)
     with rasterio.open(vol_tif) as src:
         assert src.units == ("m3",)
         cells = src.read(1, masked=True)
-    window = window_total(xr.open_dataset(out / "ppt_800m_daily_clip.nc"), "2026-10-22", "2026-10-22")
+    window = window_total(xr.open_dataset(daily(out) / "ppt_800m_daily_clip.nc"), "2026-10-22", "2026-10-22")
     assert np.isclose(float(cells.sum()), window["volume_m3"], rtol=1e-5)
     with xr.open_dataset(tmp_path / "volume.nc") as vol:
         assert vol.volume.sizes["time"] == 1 and vol.volume.attrs["units"] == "m3"
@@ -110,8 +120,7 @@ def test_pipeline(tmp_path):
 def test_new_release_replaces_day_and_keeps_history(tmp_path):
     """A newer zip for a day (as --refresh leaves it) is re-extracted, re-clipped and logged with the old one."""
     out = tmp_path / "run"
-    raw = out / "raw_zips"
-    raw.mkdir(parents=True)
+    raw = zips(out)
     make_zip(raw, "20261021", 10.0, release=1)
     make_zip(raw, "20261022", 30.0, release=1)
     boundary = tmp_path / "basin.geojson"
@@ -120,23 +129,23 @@ def test_new_release_replaces_day_and_keeps_history(tmp_path):
            "--boundary", str(boundary), "--out", str(out), "--pause", "0"]
     subprocess.run(cmd, check=True, capture_output=True)
 
-    make_zip(raw, "20261022", 33.0, release=2)  # extracted/ still holds release 1 of this day
+    make_zip(raw, "20261022", 33.0, release=2)  # the store still holds release 1 of this day, unzipped
     res = subprocess.run(cmd, check=True, capture_output=True, text=True)
     assert "2026-10-22: release 1 -> 2: 30.0 -> 33.0 mm" in res.stdout
 
-    rows = list(csv.DictReader(open(out / "daily_basin_summary.csv")))
+    rows = list(csv.DictReader(open(daily(out) / "daily_basin_summary.csv")))
     assert [(r["release"], r["basin_mean_mm"]) for r in rows] == [("1", "10.0"), ("2", "33.0")]
 
     one_day = cmd[:3] + ["2026-10-22", "--end", "2026-10-22"] + cmd[6:]  # earlier days stay in the summary
     subprocess.run(one_day, check=True, capture_output=True)
-    rows = list(csv.DictReader(open(out / "daily_basin_summary.csv")))
+    rows = list(csv.DictReader(open(daily(out) / "daily_basin_summary.csv")))
     assert [r["date"] for r in rows] == ["2026-10-21", "2026-10-22"]
-    history = list(csv.DictReader(open(out / "ppt_800m_release_history.csv")))
+    history = list(csv.DictReader(open(daily(out) / "ppt_800m_release_history.csv")))
     assert [(r["date"], r["release"], r["basin_mean_mm"]) for r in history] == [
         ("2026-10-21", "1", "10.0"), ("2026-10-22", "1", "30.0"), ("2026-10-22", "2", "33.0")]
     v1, v2 = (float(r["basin_volume_m3"]) for r in history[1:])
     assert np.isclose(v2 / v1, 1.1, rtol=1e-4)
-    with xr.open_dataset(out / "ppt_800m_daily_clip.nc") as ds:
+    with xr.open_dataset(daily(out) / "ppt_800m_daily_clip.nc") as ds:
         assert list(ds.release.values) == [1, 2]
         assert np.isclose(window_total(ds, "2026-10-22", "2026-10-22")["mean_mm"], 33.0)
 
@@ -146,7 +155,7 @@ def test_stale_totals(tmp_path):
     for name in ("ppt_800m_total_20261020_20261027.tif", "ppt_800m_total_20261028_20261031.tif",
                  "ppt_800m_total_20261026_20261027.tif", "tmean_800m_total_20261020_20261027.tif"):
         (tmp_path / name).write_bytes(b"x")
-    assert stale_totals(tmp_path, "ppt", "800m", [dt.date(2026, 10, 26)], "ppt_800m_total_20261026_20261027.tif") == [
+    assert stale_totals([tmp_path], "ppt", "800m", [dt.date(2026, 10, 26)], "ppt_800m_total_20261026_20261027.tif") == [
         "ppt_800m_total_20261020_20261027.tif"]
 
 
@@ -198,8 +207,7 @@ def test_refresh_day_archives_superseded_zip(tmp_path):
 def test_refresh_skips_recent_zips(tmp_path):
     """--refresh makes no request for a zip downloaded within --refresh-age (the offline pipeline still runs)."""
     out = tmp_path / "run"
-    raw = out / "raw_zips"
-    raw.mkdir(parents=True)
+    raw = zips(out)
     make_zip(raw, "20261022", 30.0, release=2)
     boundary = tmp_path / "basin.geojson"
     gpd.GeoDataFrame(geometry=[box(-108.4, 37.5, -108.0, 37.7)], crs="EPSG:4326").to_file(boundary)
@@ -249,22 +257,21 @@ def test_snow_fraction():
 def test_rain_snow_with_tmean_cube(tmp_path):
     """A tmean run in the same folder gets its own summary and cube; storm_total splits rain from snow."""
     out = tmp_path / "run"
-    raw = out / "raw_zips"
-    raw.mkdir(parents=True)
+    raw = zips(out)
     for ymd, p, t in (("20261021", 10.0, -4.0), ("20261022", 30.0, 1.5)):  # all snow, then half snow
         make_zip(raw, ymd, p)
-        make_zip(raw, ymd, t, var="tmean")
+        make_zip(zips(out, "tmean"), ymd, t, var="tmean")
     boundary = tmp_path / "basin.geojson"
     gpd.GeoDataFrame(geometry=[box(-108.4, 37.5, -108.0, 37.7)], crs="EPSG:4326").to_file(boundary)
     base = [sys.executable, str(SCRIPT), "--start", "2026-10-21", "--end", "2026-10-22",
             "--boundary", str(boundary), "--out", str(out), "--pause", "0"]
     subprocess.run(base, check=True, capture_output=True)
     subprocess.run(base + ["--var", "tmean"], check=True, capture_output=True)
-    rows = list(csv.DictReader(open(out / "daily_basin_summary.csv")))
+    rows = list(csv.DictReader(open(daily(out) / "daily_basin_summary.csv")))
     assert [r["basin_mean_mm"] for r in rows] == ["10.0", "30.0"]  # untouched by the tmean run
-    trows = list(csv.DictReader(open(out / "tmean_800m_daily_basin_summary.csv")))
+    trows = list(csv.DictReader(open(daily(out) / "tmean_800m_daily_basin_summary.csv")))
     assert [(r["basin_mean"], r["units"]) for r in trows] == [("-4.0", "degC"), ("1.5", "degC")]
-    assert not list(out.glob("tmean_*_total_*.tif"))
+    assert not list(daily(out).glob("tmean_*_total_*.tif"))
 
     nc = tmp_path / "rs.nc"
     res = subprocess.run([sys.executable, str(SCRIPTS / "storm_total.py"), "--out", str(out), "--boundary",
@@ -292,40 +299,38 @@ def run_watershed(out, boundary, start, end, *extra):
 def test_clip_keeps_the_right_cells(tmp_path):
     """A gradient raster and a cell-aligned basin: the clip must keep exactly the cells inside."""
     out = tmp_path / "run"
-    (out / "raw_zips").mkdir(parents=True)
     grad = np.arange(100 * 100, dtype="float32").reshape(100, 100) / 100  # unique value per cell
-    make_zip(out / "raw_zips", "20261021", grad)
+    make_zip(zips(out), "20261021", grad)
     rows, cols = slice(10, 30), slice(20, 50)  # 20 x 30 cells
     geom = box(-108.5 + 20 / 120, 37.8 - 30 / 120, -108.5 + 50 / 120, 37.8 - 10 / 120)
     res = run_watershed(out, basin_file(tmp_path, geom), "2026-10-21", "2026-10-21")
     assert res.returncode == 0, res.stdout + res.stderr
     area = np.repeat(cell_area_m2(GRID, 100)[:, None], 100, axis=1)
     expected_m3 = float((grad[rows, cols] / 1000 * area[rows, cols]).sum())
-    with xr.open_dataset(out / "ppt_800m_daily_clip.nc") as ds:
+    with xr.open_dataset(daily(out) / "ppt_800m_daily_clip.nc") as ds:
         assert int(ds.ppt.notnull().sum()) == 600
         assert np.isclose(window_total(ds, "2026-10-21", "2026-10-21")["volume_m3"], expected_m3, rtol=1e-6)
-    row = next(csv.DictReader(open(out / "daily_basin_summary.csv")))
+    row = next(csv.DictReader(open(daily(out) / "daily_basin_summary.csv")))
     weighted = float((grad[rows, cols] * area[rows, cols]).sum() / area[rows, cols].sum())
     assert float(row["basin_mean_mm"]) == pytest.approx(weighted, abs=0.006)  # area-weighted, rounded to 0.01
-    assert (out / "boundary.geojson").exists()  # --boundary is copied into the folder
+    assert (out / "basin" / "boundary.geojson").exists()  # --boundary is copied into the folder
 
 
 def test_cube_coverage_uses_every_day(tmp_path):
     """A cell missing on one day is not 'outside PRISM coverage'; a cell missing on every day is."""
     out = tmp_path / "run"
-    (out / "raw_zips").mkdir(parents=True)
     day1 = np.full((100, 100), 5.0, dtype="float32")
     day1[20:30, 30:40] = -9999          # no data on every day: 100 cells
     day2 = day1.copy()
     day2[40:45, 30:40] = -9999          # one-day gap: 50 more cells
-    make_zip(out / "raw_zips", "20261021", day1)
-    make_zip(out / "raw_zips", "20261022", day2)
+    make_zip(zips(out), "20261021", day1)
+    make_zip(zips(out), "20261022", day2)
     geom = box(-108.5 + 20 / 120, 37.8 - 50 / 120, -108.5 + 60 / 120, 37.8 - 10 / 120)  # 40 x 40 cells
     res = run_watershed(out, basin_file(tmp_path, geom), "2026-10-21", "2026-10-22")
     assert "WARN  nodata_inside" in res.stdout or "FAIL  nodata_inside" in res.stdout
     area = np.repeat(cell_area_m2(GRID, 100)[:, None], 100, axis=1)
     expected = float(area[20:30, 30:40].sum() / area[10:50, 20:60].sum() * 100)
-    with xr.open_dataset(out / "ppt_800m_daily_clip.nc") as ds:
+    with xr.open_dataset(daily(out) / "ppt_800m_daily_clip.nc") as ds:
         assert ds.attrs["basin_without_prism_pct"] == pytest.approx(expected, abs=0.01)
 
 
@@ -344,15 +349,14 @@ def test_coverage_counts_basin_beyond_grid_edge():
 def test_dry_window_and_missing_day(tmp_path):
     """Zero precipitation must not crash storm_total; a missing day fails QC and skips the event total."""
     out = tmp_path / "run"
-    (out / "raw_zips").mkdir(parents=True)
-    make_zip(out / "raw_zips", "20261021", 0.0)
-    make_zip(out / "raw_zips", "20261022", 0.0)
+    make_zip(zips(out), "20261021", 0.0)
+    make_zip(zips(out), "20261022", 0.0)
     boundary = basin_file(tmp_path, box(-108.4, 37.5, -108.0, 37.7))
     res = run_watershed(out, boundary, "2026-10-21", "2026-10-23")  # Oct 23 can't be downloaded
     assert res.returncode == 1 and "Traceback" not in res.stderr
     assert "2026-10-23" in res.stdout and "request failed" in res.stdout
     assert "Event total not written: 1 of 3 days missing" in res.stdout
-    assert "FAIL  completeness" in res.stdout and not list(out.glob("ppt_800m_total_*.tif"))
+    assert "FAIL  completeness" in res.stdout and not list(daily(out).glob("ppt_800m_total_*.tif"))
     dry = subprocess.run([sys.executable, str(SCRIPTS / "storm_total.py"), "--out", str(out), "--boundary",
                           str(boundary)], capture_output=True, text=True)
     assert dry.returncode == 0, dry.stderr
@@ -363,8 +367,7 @@ def test_refresh_with_corrupt_files(tmp_path):
     """A corrupt cached zip is set aside instead of crashing --refresh; a corrupt refreshed download is discarded."""
     from prism_watershed import refresh_day, zip_release
     out = tmp_path / "run"
-    raw = out / "raw_zips"
-    raw.mkdir(parents=True)
+    raw = zips(out)
     make_zip(raw, "20261021", 10.0)
     (raw / "prism_ppt_us_30s_20261022.zip").write_bytes(b"truncated")
     old = dt.datetime(2026, 10, 1).timestamp()
@@ -382,8 +385,7 @@ def test_refresh_with_corrupt_files(tmp_path):
 
 def test_tiny_basin_exits_cleanly(tmp_path):
     out = tmp_path / "run"
-    (out / "raw_zips").mkdir(parents=True)
-    make_zip(out / "raw_zips", "20261021", 5.0)
+    make_zip(zips(out), "20261021", 5.0)
     tiny = box(-108.5 + 10.1 / 120, 37.8 - 10.4 / 120, -108.5 + 10.3 / 120, 37.8 - 10.1 / 120)  # misses every center
     res = run_watershed(out, basin_file(tmp_path, tiny), "2026-10-21", "2026-10-21")
     assert res.returncode == 2 and "covers no PRISM cell center" in res.stderr and "Traceback" not in res.stderr

@@ -16,8 +16,8 @@ script caches every zip and never re-requests one it already has, unless --refre
 
 PRISM revises each daily grid up to 8 times over ~6 months (release 1 at D+1, 2 at D+5,
 then about monthly; 8 is final). --refresh re-downloads cached days below --target-release
-that were last downloaded at least --refresh-age days ago. A superseded zip is kept in
-raw_zips/releases/<name>_r<release>.zip, and <var>_<res>_release_history.csv keeps each
+that were last downloaded at least --refresh-age days ago. A superseded zip is kept in the store's
+releases/<name>_r<release>.zip, and daily/<var>_<res>_release_history.csv keeps each
 day's basin mean and volume for every release seen, so the folder can be refreshed over time.
 
 The basin boundary comes from the USGS Watershed Boundary Dataset (WBD) REST
@@ -31,20 +31,24 @@ Usage examples:
     python prism_watershed.py --boundary my_basin.gpkg --start 2026-10-20 --end 2026-10-27
     python prism_watershed.py --huc 1408 --start 2026-10-20 --end 2026-10-27 --out /data/my_basin --refresh
 
-Also writes <out>/<var>_<res>_daily_clip.nc, a NetCDF stack of every clipped day
-in --out; storm_total.py reads it to total depth and volume for any date range.
+Writes <out>/basin/ (the boundary), <out>/daily/clipped/<var>_<res>_<YYYYMMDD>_clip.tif,
+daily/<var>_<res>_daily_clip.nc (a NetCDF stack of every clipped day in --out; storm_total.py reads it
+to total depth and volume for any date range), the daily summary and release history, and for ppt the
+download window's total. Folder layout: layout.py.
 
 Each run ends with QC checks (qc.py; --qc-strict turns warnings into failures, and any
 failure gives exit status 1) and appends a record of the run, with per-day zip checksums,
-releases and info.txt fields, to <out>/run_manifest.json. Output goes to the terminal and to
-<out>/logs/; exit codes are listed in runtime.py.
+releases and info.txt fields, to <out>/run/run_manifest.json. Output goes to the terminal and to
+<out>/run/logs/; exit codes are listed in runtime.py.
 
 Settings: with <out>/storm.toml (pipeline.py init), --out alone is enough: the basin, download
 window and resolution come from it, and flags override it.
 
-Shared cache: --cache DIR (or PRISM_CACHE, or prism_cache in storm.toml) keeps the national zips in
-one folder for every basin, hard-linked into each raw_zips/, so basins over the same dates download
-each file once and a refresh made for one basin is picked up by the others without a download.
+Shared store: national zips and unzipped grids go to the PRISM store (--store DIR, else prism_store in
+storm.toml, else PRISM_STORE, else prism_store/ next to --out), shared by every basin folder, so basins
+over the same dates download each file once and a refresh made for one basin is picked up by the others
+without a download. Unzipped grids are kept per release, so a basin keeps reading the release it used
+until it is refreshed itself.
 
 Interrupted runs: zips, clipped tifs, CSVs and the cube are written to a .part file and renamed, and
 zips are unzipped into a temporary folder, so rerunning the same command picks up where it stopped.
@@ -55,10 +59,6 @@ import argparse
 import csv
 import datetime as dt
 import logging
-import os
-import shutil
-import sys
-import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -78,8 +78,9 @@ import config
 import manifest
 import qc
 import runtime
+from layout import Layout, folder_release, parse_release, zip_info, zip_name, zip_release  # noqa: F401
 from runtime import EXIT_NETWORK, EXIT_QC, die
-from storm_total import RES_CODES, VAR_UNITS, area_grid, build_cube, geodesic_km2, utm_crs
+from storm_total import VAR_UNITS, area_grid, build_cube, geodesic_km2, utm_crs
 
 try:
     # Use the OS trust store: services.nacse.org chains to emSign Root CA - G1,
@@ -104,12 +105,13 @@ def daterange(start, end):
         d += dt.timedelta(days=1)
 
 
-def get_boundary(huc, boundary_file, out_dir):
-    """Return a GeoDataFrame for the basin (dissolved to one polygon)."""
+def get_boundary(huc, boundary_file, lay):
+    """Return a GeoDataFrame for the basin (dissolved to one polygon). The basin is kept in <out>/basin/."""
+    lay.basin_dir.mkdir(parents=True, exist_ok=True)
     if boundary_file:
         gdf = gpd.read_file(boundary_file)
     else:
-        cache = out_dir / f"wbd_huc{huc}.geojson"
+        cache = lay.wbd(huc)
         if not cache.exists():
             layer = len(huc) // 2          # WBD layers: 1=HUC2, 2=HUC4, 3=HUC6, 4=HUC8, 5=HUC10, 6=HUC12
             field = f"huc{len(huc)}"
@@ -128,18 +130,8 @@ def get_boundary(huc, boundary_file, out_dir):
         print(f"Basin: {', '.join(gdf.get('name', gdf.iloc[:, 0]).astype(str))}")
     basin = gdf.dissolve()
     if boundary_file:  # keep a copy, so later steps and the QGIS project find the basin in the folder
-        basin.to_crs(4269).to_file(out_dir / "boundary.geojson", driver="GeoJSON")
+        basin.to_crs(4269).to_file(lay.boundary_copy, driver="GeoJSON")
     return basin
-
-
-def zip_name(var, res, region, day, fmt=""):
-    """Cache file name for one daily zip, unique per variable, resolution, region, date and format.
-
-    Matches PRISM's own name for the default COG (prism_ppt_us_30s_20261020.zip); other formats
-    get a suffix so they never collide with it.
-    """
-    suffix = f"_{fmt}" if fmt else ""
-    return f"prism_{var}_{region}_{RES_CODES[res]}_{day.strftime('%Y%m%d')}{suffix}.zip"
 
 
 def fetch_zip(var, res, region, day, fmt, path, session, errors=None, retry_wait=10.0):
@@ -196,79 +188,6 @@ def release_number(zpath):
     return int(r) if r.isdigit() else 0
 
 
-def link_into(src, dst):
-    """Hard-link src at dst (copy if they are on different file systems), replacing dst atomically."""
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = runtime.part_path(dst)
-    tmp.unlink(missing_ok=True)
-    try:
-        os.link(src, tmp)
-    except OSError:
-        shutil.copy2(src, tmp)
-    os.replace(tmp, dst)
-
-
-def archive_zip(zpath, release):
-    """Move a superseded zip to releases/<name>_r<release>.zip beside it (kept if already archived)."""
-    archive = zpath.parent / "releases" / f"{zpath.stem}_r{release or 'unknown'}.zip"
-    archive.parent.mkdir(exist_ok=True)
-    if archive.exists():
-        zpath.unlink()
-    else:
-        zpath.replace(archive)
-
-
-def sync_with_cache(local, shared):
-    """Bring a folder's zip (raw_zips/<name>) in step with the shared cache's copy of the same file.
-
-    The folder takes the shared copy when it has none or an older release (its older zip is archived in
-    raw_zips/releases/); the shared cache takes the folder's copy when it has none or an older one. A
-    corrupt shared zip is set aside as .bad. Returns a note for the day's line, or ''.
-    """
-    if shared.exists() and zip_problem(shared):
-        shared.replace(shared.with_name(shared.name + ".bad"))
-    local_ok = local.exists() and not zip_problem(local)
-    if not shared.exists():
-        if local_ok:
-            link_into(local, shared)
-        return ""
-    if local.exists() and os.path.samefile(local, shared):
-        return ""
-    if local_ok:
-        mine, theirs = release_number(local), release_number(shared)
-        if mine > theirs:
-            archive_zip(shared, theirs)
-            link_into(local, shared)
-            return ""
-        if mine < theirs:
-            archive_zip(local, mine)
-    link_into(shared, local)
-    return f"release {release_number(local) or '?'} from the shared cache"
-
-
-def parse_release(text):
-    """PRISM_DATASET_RELEASE_NUMBER (1-8) from an info.txt, as a string ('' if absent)."""
-    for line in text.splitlines():
-        key, _, value = line.partition(":")
-        if key.strip() == "PRISM_DATASET_RELEASE_NUMBER":
-            return value.strip()
-    return ""
-
-
-def zip_info(zpath):
-    """Text of a PRISM zip's info.txt ('' if none)."""
-    with zipfile.ZipFile(zpath) as z:
-        for name in z.namelist():
-            if "info" in Path(name).name and name.endswith(".txt"):
-                return z.read(name).decode(errors="ignore")
-    return ""
-
-
-def zip_release(zpath):
-    """Release number recorded in a PRISM zip's info.txt ('' if none)."""
-    return parse_release(zip_info(zpath))
-
-
 def zip_problem(zpath):
     """'' if the zip opens and its members' CRCs check out, else what is wrong."""
     try:
@@ -277,13 +196,6 @@ def zip_problem(zpath):
         return f"corrupt member {bad}" if bad else ""
     except zipfile.BadZipFile as e:
         return f"not a valid zip ({e})"
-
-
-def folder_release(folder):
-    """Release number in an extracted folder's info.txt ('' if none)."""
-    for info in Path(folder).rglob("*info*.txt"):
-        return parse_release(info.read_text(errors="ignore"))
-    return ""
 
 
 def available_releases(var, res, region, start, end, session):
@@ -327,7 +239,7 @@ def due_for_refresh(release, last_downloaded, today, target, age_days, available
 def refresh_day(var, res, region, day, fmt, raw_dir, session, errors=None):
     """Re-download a cached zip. Returns (old release, new release), or None if nothing came back.
 
-    If the release changed, the old zip moves to raw_zips/releases/<name>_r<old>.zip; if not, the new
+    If the release changed, the old zip moves to releases/<name>_r<old>.zip beside it; if not, the new
     download replaces it, so the file's date records when it was last checked.
     """
     path = raw_dir / zip_name(var, res, region, day, fmt)
@@ -352,25 +264,13 @@ def refresh_day(var, res, region, day, fmt, raw_dir, session, errors=None):
     return old, new
 
 
-def extract_grid(zpath, extract_dir):
-    """Unzip and return (raster path, release number string or '')."""
+def extract_grid(zpath, store):
+    """Unzip into the store (once per day and release) and return (raster path, release number string or '')."""
     # PRISM releases each daily grid 8 times over ~6 months (D+1, D+5, then ~monthly);
     # info.txt records which one this is as PRISM_DATASET_RELEASE_NUMBER (1-8).
     release = zip_release(zpath)
-    dest = extract_dir / zpath.stem
-    if dest.exists() and folder_release(dest) != release:
-        shutil.rmtree(dest)  # unzipped from an earlier release of this day
-    if not dest.exists():
-        # Unzip into a temporary folder (its name doesn't match prism_day_files) and rename it into place,
-        # so an interrupted unzip never leaves a partial grid under the day's name.
-        tmp = Path(tempfile.mkdtemp(prefix=".unzip-", dir=extract_dir))
-        try:
-            with zipfile.ZipFile(zpath) as z:
-                z.extractall(tmp)
-            tmp.rename(dest)
-        except BaseException:
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise
+    dest = store.extract(zpath, release)
+    store.prune_extracted(zpath, release)  # older releases are unzipped again if a basin still needs one
     grids = [p for p in dest.rglob("*") if p.suffix.lower() in (".tif", ".bil", ".nc", ".asc")]
     if not grids:
         raise FileNotFoundError(f"No raster in {zpath}")
@@ -414,7 +314,7 @@ def day_stats(arr, transform, var="ppt"):
 def summary_name(var, res):
     """daily_basin_summary.csv for 800 m precipitation (its original name); <var>_<res>_daily_basin_summary.csv
     for anything else, so a folder can hold several variables and resolutions."""
-    return "daily_basin_summary.csv" if (var, res) == ("ppt", "800m") else f"{var}_{res}_daily_basin_summary.csv"
+    return Layout(".", settings={}).summary_csv(var, res).name
 
 
 def clipped_day(path, summary_csv, var="ppt"):
@@ -437,10 +337,10 @@ def clipped_day(path, summary_csv, var="ppt"):
     return release, day_stats(arr, transform, var)
 
 
-def stale_totals(out, var, res, revised, current):
-    """Event-total rasters in out (other than current) whose window includes a revised day."""
+def stale_totals(folders, var, res, revised, current):
+    """Total rasters in folders (other than current) whose window includes a revised day."""
     stale = []
-    for tif in sorted(Path(out).glob(f"{var}_{res}_total_*.tif")):
+    for tif in sorted((t for f in folders for t in Path(f).glob(f"{var}_{res}_total_*.tif")), key=lambda t: t.name):
         span = tif.stem.rsplit("_", 2)[-2:]
         if tif.name == current or len(span) != 2 or not all(x.isdigit() for x in span):
             continue
@@ -510,8 +410,9 @@ def main():
     ap.add_argument("--format", default="", help="blank = COG GeoTIFF (default); or nc, bil, asc")
     ap.add_argument("--out", help="output folder (default data/huc<code> or data/<boundary name>)")
     ap.add_argument("--pause", type=float, default=2.0, help="seconds between requests")
-    ap.add_argument("--cache", help="shared folder of national PRISM zips for every basin (default: PRISM_CACHE, "
-                                    "else none: each folder keeps its own raw_zips/)")
+    ap.add_argument("--store", "--cache", dest="store",
+                    help="the PRISM store: national zips and unzipped grids shared by every basin (default: "
+                         "prism_store in storm.toml, else PRISM_STORE, else prism_store/ next to --out)")
     ap.add_argument("--refresh", action="store_true",
                     help="re-download cached days that PRISM has a newer release of (up to --target-release)")
     ap.add_argument("--target-release", type=int, default=8, help="release to refresh up to (default 8, final)")
@@ -534,22 +435,20 @@ def main():
     start = dt.date.fromisoformat(a.start)
     end = min(dt.date.fromisoformat(a.end), dt.date.today() - dt.timedelta(days=1))
     out = Path(a.out or default_out(a))
-    raw, ext, clipped = out / "raw_zips", out / "extracted", out / "clipped"
-    for d in (raw, ext, clipped):
-        d.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
     runtime.attach(out, run, a)
-    for leftover in ext.glob(".unzip-*"):  # from an unzip that was interrupted
-        shutil.rmtree(leftover, ignore_errors=True)
-    cache = a.cache or os.environ.get("PRISM_CACHE")
-    shared = Path(cache).expanduser() if cache else None
-    if shared:
-        shared.mkdir(parents=True, exist_ok=True)
-        run["shared_cache"] = str(shared.resolve())
+    lay = Layout(out, store=a.store)
+    raw, clipped = lay.store.zips_dir(a.var, a.res, a.region), lay.clipped_dir
+    for d in (raw, clipped):
+        d.mkdir(parents=True, exist_ok=True)
+    lay.store.clean_leftovers(a.var, a.res, a.region)  # unzips that were interrupted
+    run["store"] = str(lay.store.root.resolve())
+    print(f"PRISM store: {lay.store.root}")
 
-    basin = get_boundary(a.huc, a.boundary, out)
+    basin = get_boundary(a.huc, a.boundary, lay)
     run["basin"] = ({"huc": a.huc, "wbd_layer_url": WBD_URL.format(layer=len(a.huc) // 2),
                      "where": f"huc{len(a.huc)}='{a.huc}'",
-                     "cached_file": manifest.files_entry(sorted(out.glob(f"wbd_huc{a.huc}.geojson")), out)}
+                     "cached_file": manifest.files_entry([lay.wbd(a.huc)], out)}
                     if a.huc else {"boundary": str(Path(a.boundary).resolve()),
                                    "sha256": manifest.sha256(a.boundary)})
     utm = utm_crs(basin)
@@ -558,7 +457,7 @@ def main():
     session.headers["User-Agent"] = "prism-storm-analysis"
     available = available_releases(a.var, a.res, a.region, start, end, session)
 
-    summary_csv = out / summary_name(a.var, a.res)
+    summary_csv = lay.summary_csv(a.var, a.res)
     ppt = a.var == "ppt"
     today, recorded = dt.date.today(), dt.datetime.now().isoformat(timespec="seconds")
     rows, history, changes, total, meta = [], [], [], None, None
@@ -566,11 +465,8 @@ def main():
     inside = area = always_missing = grid_bounds = None
     newer_available = []  # cached days that are due for a refresh
     requested = list(daterange(start, end))
-    notes = {}
-    for day in requested:  # first pass, no downloads: what the shared cache has, and what is due for a refresh
+    for day in requested:  # first pass, no downloads: what is due for a refresh
         cached = raw / zip_name(a.var, a.res, a.region, day, a.format)
-        if shared:
-            notes[day] = sync_with_cache(cached, shared / cached.name)
         if cached.exists() and not zip_problem(cached) and due_for_refresh(
                 zip_release(cached), dt.date.fromtimestamp(cached.stat().st_mtime), today,
                 a.target_release, a.refresh_age, None if available is None else available.get(day, 0)):
@@ -588,23 +484,18 @@ def main():
         ymd = day.strftime("%Y%m%d")
         step = f"[{i}/{len(requested)}]"
         cached = raw / zip_name(a.var, a.res, a.region, day, a.format)
-        clip_path = clipped / f"{a.var}_{a.res}_{ymd}_clip.tif"
+        clip_path = lay.clip_tif(a.var, a.res, day)
         before = clipped_day(clip_path, summary_csv, a.var)  # what this folder held before this run
         if before:
             history.append({"date": day.isoformat(), "release": before[0], **before[1], "recorded": recorded})
         if a.refresh and day in newer_available:
-            change = refresh_day(a.var, a.res, a.region, day, a.format, shared or raw, session, errors)
-            if shared:
-                sync_with_cache(cached, shared / cached.name)
+            change = refresh_day(a.var, a.res, a.region, day, a.format, raw, session, errors)
             time.sleep(a.pause)
             if change:
                 print(f"  {step} {ymd}: " + (f"release {change[0] or '?'} -> {change[1]}" if change[0] != change[1]
                                              else f"still release {change[1]}"))
         had_zip = cached.exists()
-        zpath = download_day(a.var, a.res, a.region, day, a.format, shared or raw, session, errors, 5 * a.pause)
-        if zpath is not None and shared:
-            notes[day] = sync_with_cache(cached, zpath) or notes.get(day, "")
-            zpath = cached
+        zpath = download_day(a.var, a.res, a.region, day, a.format, raw, session, errors, 5 * a.pause)
         if not had_zip:
             time.sleep(a.pause)
             if zpath is not None:
@@ -620,7 +511,7 @@ def main():
             print(f"  {ymd}: {errors[day]}")
             downloads.append({"date": day, "error": errors[day]})
             continue
-        grid, release = extract_grid(zpath, ext)
+        grid, release = extract_grid(zpath, lay.store)
         try:
             arr, meta = clip(grid, basin, clip_path, release)
         except ValueError as e:  # rasterio: "Input shapes do not overlap raster."
@@ -662,13 +553,12 @@ def main():
             changes.append((day, before, release, stats))
         print(f"  {step} {ymd}: " + (f"mean {stats['basin_mean_mm']} mm, max {stats['basin_max_mm']} mm" if ppt else
                                      f"mean {stats['basin_mean']}, min {stats['basin_min']}, max {stats['basin_max']} "
-                                     f"{VAR_UNITS.get(a.var, '')}") + f" [release {release or 'n/a'}]"
-              + (f" ({notes[day]})" if notes.get(day) else ""))
+                                     f"{VAR_UNITS.get(a.var, '')}") + f" [release {release or 'n/a'}]")
 
     if not rows:
         die("No data downloaded.", EXIT_NETWORK if errors else runtime.EXIT_USAGE)
 
-    history_csv = out / f"{a.var}_{a.res}_release_history.csv"
+    history_csv = lay.release_history(a.var, a.res)
     update_history(history_csv, history)
     if changes:
         print("\nRevised by PRISM since the last run (basin mean" + (" / volume):" if ppt else "):"))
@@ -700,8 +590,7 @@ def main():
         w.writeheader()
         w.writerows(sorted(kept + rows, key=lambda r: r["date"]))
 
-    tag = f"{rows[0]['date']}_{rows[-1]['date']}".replace("-", "")
-    total_tif = out / f"{a.var}_{a.res}_total_{tag}.tif"
+    total_tif = lay.download_total(a.var, a.res, rows[0]["date"], rows[-1]["date"])
     complete = len(rows) == len(requested)
     if ppt and complete:  # a sum only means something for precipitation, and only over every day
         meta.update(dtype="float32")
@@ -714,7 +603,7 @@ def main():
         print(f"\nEvent total not written: {len(requested) - len(rows)} of {len(requested)} days missing.")
     # The cube holds every clipped day in this --out folder, not just this run's window. Its coverage note
     # comes from all of them: a cell is outside PRISM coverage only if it has no data on any day.
-    cube = build_cube(clipped, a.var, a.res, out / f"{a.var}_{a.res}_daily_clip.nc")
+    cube = build_cube(clipped, a.var, a.res, lay.cube(a.var, a.res))
     with xr.open_dataset(cube) as ds:
         has_data = ds[a.var].notnull().any("time").values
     missing_pct, missing_km2, basin_km2 = prism_coverage(np.ma.masked_array(np.zeros(has_data.shape), mask=~has_data),
@@ -725,7 +614,8 @@ def main():
         print(f"WARNING: {missing_pct:.1f}% of the basin ({missing_km2:,.0f} of {basin_km2:,.0f} km²) has no PRISM "
               "data, usually because it lies outside the contiguous US. Totals and volumes cover only the rest.")
     print(f"Daily cube: {cube.name} (use storm_total.py for any date range)")
-    for name in stale_totals(out, a.var, a.res, [c[0] for c in changes], total_tif.name):
+    for name in stale_totals([lay.daily_dir] + [d / "totals" for d in lay.event_dirs()], a.var, a.res,
+                             [c[0] for c in changes], total_tif.name):
         span = name.rsplit("_", 2)[-2:]
         print(f"Out of date (covers a revised day): {name}; rerun with --start {span[0][:4]}-{span[0][4:6]}-"
               f"{span[0][6:]} --end {span[1][:4]}-{span[1][4:6]}-{span[1][6:]} to update it")
@@ -761,8 +651,7 @@ def main():
     run.update(window={"start": str(start), "end": str(end)}, days=downloads, qc=checks,
                available_releases=None if available is None else {str(d): r for d, r in available.items()},
                outputs=manifest.files_entry([cube, total_tif, summary_csv, history_csv]
-                                            + [clipped / f"{a.var}_{a.res}_{d.strftime('%Y%m%d')}_clip.tif"
-                                               for d in run_days], out))
+                                            + [lay.clip_tif(a.var, a.res, d) for d in run_days], out))
     print(f"Run recorded in {manifest.append_run(out, run).name}")
     if qc.worst_level(checks) == "fail":
         die("QC failed (see above).", EXIT_QC)

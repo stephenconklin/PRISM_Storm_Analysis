@@ -2,9 +2,9 @@
 """
 Build an organized, styled QGIS project from a PRISM Storm Analysis output folder.
 
-Finds the outputs in --out by their standard names (prism_watershed.py, storm_total.py and its
-uncertainty file, subbasin_totals.py, validate_stations.py, validate_runoff.py, validate_snow.py) and
-writes <out>/QGIS/<folder name>.qgz with:
+Finds the outputs in --out by their standard places and names (layout.py: basin/, daily/, events/<event>/;
+prism_watershed.py, storm_total.py and its uncertainty file, subbasin_totals.py, validate_stations.py,
+validate_runoff.py, validate_snow.py) and writes <out>/qgis/<folder name>.qgz with:
     - one group per storm window: the events in storm.toml, else every window storm_total.py analyzed
       (its uncertainty files). Each holds that window's basin label (volume and range), depth, volume,
       rain, snow and percent-of-normal rasters, subbasins, and validation layers (the window-named
@@ -44,6 +44,8 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import layout
 
 STYLE_DIR = Path(__file__).resolve().parents[1] / "styles"
 # Anaconda sets these to its own GDAL/PROJ/PDAL, which break QGIS's bundled libraries.
@@ -151,24 +153,28 @@ def window_label(start, end):
 
 
 def discover(out):
-    """Find the standard outputs in a PRISM Storm Analysis folder.
+    """Find the standard outputs in a PRISM Storm Analysis folder (layout.py).
 
     Only precipitation is mapped (not tmean etc.), at one resolution: 800m if present, else 4km;
-    "other_res" lists resolutions left out.
+    "other_res" lists resolutions left out. Totals are the events' totals/ rasters plus the download
+    window's total in daily/; other_tifs are the events' other rasters (volume, rain, snow, percent of
+    normal) and any rasters put at the top of the folder by hand.
     """
     out = Path(out)
-    have = sorted({m.group(1) for p in out.glob("clipped/ppt_*_clip.tif")
+    lay = layout.Layout(out)
+    totals_all = lay.all_totals("ppt_*_total_*.tif") + sorted(lay.daily_dir.glob("ppt_*_total_*.tif"))
+    have = sorted({m.group(1) for p in lay.clipped_dir.glob("ppt_*_clip.tif")
                    if (m := re.match(r"ppt_(800m|4km)_\d{8}_clip\.tif$", p.name))}
-                  | {m.group(1) for p in out.glob("ppt_*_total_*.tif") if (m := re.match(r"ppt_(800m|4km)_", p.name))})
+                  | {m.group(1) for p in totals_all if (m := re.match(r"ppt_(800m|4km)_", p.name))})
     res = "800m" if "800m" in have or not have else have[0]
-    found = {"out": out, "res": res, "other_res": [r for r in have if r != res],
-             "wbd": sorted(out.glob("wbd_huc*.geojson")) or sorted(out.glob("boundary.geojson")),
-             "totals": sorted(out.glob(f"ppt_{res}_total_*.tif")),
-             "daily": sorted(out.glob(f"clipped/ppt_{res}_*_clip.tif")),
-             "summary": out / ("daily_basin_summary.csv" if res == "800m" else f"ppt_{res}_daily_basin_summary.csv"),
-             "gpkg": out / "validation" / "validation.gpkg",
-             "totals_gpkg": out / "totals.gpkg",
-             "other_tifs": [p for p in sorted(out.glob("*.tif")) if "_total_" not in p.name]}  # volume, rain, snow
+    found = {"out": out, "layout": lay, "res": res, "other_res": [r for r in have if r != res],
+             "wbd": lay.boundary_files(),
+             "totals": sorted((p for p in totals_all if p.name.startswith(f"ppt_{res}_total_")), key=lambda p: p.name),
+             "daily": sorted(lay.clipped_dir.glob(f"ppt_{res}_*_clip.tif")),
+             "summary": lay.summary_csv("ppt", res),
+             "dams_gpkg": lay.dams_gpkg,
+             "other_tifs": [p for p in lay.all_totals("*.tif") + sorted(out.glob("*.tif"))
+                            if "_total_" not in p.name]}
     dates = []
     for p in found["daily"]:
         m = re.search(r"_(\d{8})_clip\.tif$", p.name)
@@ -184,8 +190,9 @@ def volume_range_km3(out, start, end, res=None, volume_m3=None):
     Without res, the file whose volume matches volume_m3 (within 0.1%) is used, so a label never shows
     another resolution's range.
     """
-    span = f"{str(start).replace('-', '')}_{str(end).replace('-', '')}"
-    files = sorted(Path(out).glob(f"ppt_{res}_uncertainty_{span}.json" if res else f"ppt_*_uncertainty_{span}.json"))
+    span = layout.span(start, end)
+    tdir = layout.Layout(out).totals_dir(start, end)
+    files = sorted(tdir.glob(f"ppt_{res}_uncertainty_{span}.json" if res else f"ppt_*_uncertainty_{span}.json"))
     for f in files:
         u = json.loads(f.read_text())
         if res or (volume_m3 and abs(u["volume_m3"] - volume_m3) <= 1e-3 * abs(volume_m3)):
@@ -214,9 +221,6 @@ SPAN_RE = re.compile(r"_(\d{8})_(\d{8})$")
 # Layers each storm window gets, by GeoPackage: validation.gpkg and totals.gpkg.
 VALIDATION_LAYERS = ("gauges", "stations", "station_days", "gauge_basins", "snotel")
 TOTALS_LAYERS = ("basin_total", "subbasins")
-# Untagged layers written before window-named copies existed: which summary file gives their window.
-LAYER_SUMMARY = {"stations": "stations_summary.json", "station_days": "stations_summary.json",
-                 "snotel": "snotel_summary.json"}
 
 
 def stem_window(stem):
@@ -285,49 +289,42 @@ def plan_events(f):
     """The storm windows to map and what each has. Returns (events, other_rasters).
 
     Windows come from storm.toml's events, else from the storm_total.py uncertainty files (one per window
-    analyzed), else, for folders made before either, the one event total primary_total picks. Each event:
-    {"name", "start", "end", "span", "label", "rasters": {kind: path}, "layers": {layer: (gpkg, table)},
-    "uncertainty": path or None}. A window's layer is the window-named copy (<layer>_<span>), else the
-    plain layer when it was made for that window. Rasters whose window matches no event are returned as
-    other_rasters [(kind, path)]; rasters with no recognizable content are left out (and reported).
+    analyzed), else the one total primary_total picks. Each event: {"name", "start", "end", "span", "label",
+    "rasters": {kind: path}, "layers": {layer: (gpkg, table)}, "uncertainty": path or None}. A window's
+    layers are the window-named tables (<layer>_<span>) in the GeoPackages of its event folder. Rasters
+    whose window matches no event are returned as other_rasters [(kind, path)]; rasters with no
+    recognizable content are left out (and reported).
     """
-    out, res = Path(f["out"]), f["res"]
+    out, res, lay = Path(f["out"]), f["res"], f.get("layout") or layout.Layout(f["out"])
     windows = [(n, s, e) for n, s, e in settings_events(out)]
     if not windows:
-        for u in sorted(out.glob(f"ppt_{res}_uncertainty_*.json")):
+        for u in lay.all_totals(f"ppt_{res}_uncertainty_*.json"):
             w = stem_window(u.stem)
             if w:
                 windows.append((None, *w))
     rasters = [(("depth" if "_total_" in p.name else tif_kind(p.stem)), p) for p in f["totals"] + f["other_tifs"]]
     rasters = [(k, p) for k, p in rasters if k]
-    legacy = not windows
-    if legacy:
-        shown = primary_total(f["totals"], *(gpkg_window(f["totals_gpkg"], "basin_total")
-                                             if "basin_total" in gpkg_layers(f["totals_gpkg"]) else (None, None)))
+    if not windows:
+        shown = primary_total(f["totals"])
         w = total_window(shown) if shown else None
         windows = [(None, *w)] if w else []
-    vlayers, tlayers = gpkg_layers(f["gpkg"]), gpkg_layers(f["totals_gpkg"])
-
-    def untagged_window(gpkg, layer):
-        summary = LAYER_SUMMARY.get(layer)
-        return json_window(out / "validation" / summary) if summary else gpkg_window(gpkg, layer)
 
     events, used = [], set()
     for name, s0, s1 in windows:
         sp = f"{s0:%Y%m%d}_{s1:%Y%m%d}"
+        unc = lay.uncertainty_json(res, s0, s1)
         ev = {"name": name, "start": s0, "end": s1, "span": sp, "rasters": {}, "layers": {},
               "label": (f"{name} — {window_label(s0, s1)}" if name else f"PRISM days {window_label(s0, s1)}"),
-              "uncertainty": next(iter(out.glob(f"ppt_{res}_uncertainty_{sp}.json")), None)}
+              "uncertainty": unc if unc.exists() else None}
         for kind, p in rasters:
             if stem_window(p.stem) == (s0, s1) and kind not in ev["rasters"]:
                 ev["rasters"][kind] = p
                 used.add(p)
-        for gpkg, names, present in ((f["gpkg"], VALIDATION_LAYERS, vlayers), (f["totals_gpkg"], TOTALS_LAYERS, tlayers)):
+        for gpkg, names in ((lay.validation_gpkg(s0, s1), VALIDATION_LAYERS), (lay.totals_gpkg(s0, s1), TOTALS_LAYERS)):
+            present = gpkg_layers(gpkg)
             for layer in names:
                 if f"{layer}_{sp}" in present:
                     ev["layers"][layer] = (gpkg, f"{layer}_{sp}")
-                elif layer in present and (legacy or untagged_window(gpkg, layer) == (s0, s1)):
-                    ev["layers"][layer] = (gpkg, layer)
         if ev["rasters"] or ev["layers"] or ev["uncertainty"]:
             events.append(ev)
     other = [(k, p) for k, p in rasters if p not in used]
@@ -439,6 +436,8 @@ def _build_project(a):
     from osgeo import gdal
     gdal.UseExceptions()
 
+    if layout.legacy(a.out):
+        sys.exit(layout.migrate_hint(a.out))
     f = discover(a.out)
     out = f["out"].resolve()
     if not f["days"] and not f["totals"]:
@@ -446,7 +445,7 @@ def _build_project(a):
     if f["other_res"]:
         print(f"Mapping {f['res']} precipitation; {', '.join(f['other_res'])} outputs in the folder are left out.")
     name = a.name or out.name
-    qdir = out / "QGIS"
+    qdir = f["layout"].qgis_dir
     qdir.mkdir(exist_ok=True)
     qgz = qdir / f"{name}.qgz"
     if qgz.exists():
@@ -876,8 +875,8 @@ def _build_project(a):
         basin_lyr.setRenderer(QgsSingleSymbolRenderer(outline))
         tag(basin_lyr, "study_basin", "USGS Watershed Boundary Dataset polygon (or your boundary) used to clip PRISM.")
         add(basin_lyr, g_bnd, True)
-    if "dams" in gpkg_layers(f["gpkg"]):
-        vec((f["gpkg"], "dams"), "dams", "Dams (NID), size = storage", "dams",
+    if "dams" in gpkg_layers(f["dams_gpkg"]):
+        vec((f["dams_gpkg"], "dams"), "dams", "Dams (NID), size = storage", "dams",
             "National Inventory of Dams in the study basin.", g_bnd, False, None)
     osm = QgsRasterLayer(OSM_URL, "OpenStreetMap", "wms")
     if osm.isValid():

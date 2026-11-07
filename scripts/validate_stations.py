@@ -3,7 +3,7 @@
 Compare PRISM daily precipitation with gauge observations in and around a basin.
 
 Stations and daily totals come from RCC-ACIS (COOP, CoCoRaHS, ASOS/first-order,
-SNOTEL). PRISM values are sampled from the full national grids in <out>/extracted/,
+SNOTEL). PRISM values are sampled from the full national grids in the PRISM store (layout.py),
 so stations in the buffer outside the basin are compared too.
 
 Day alignment: a PRISM day ends at 12:00 UTC on its date. Each station day ends at
@@ -17,12 +17,11 @@ In-sample flag: PRISM lists the stations it used each day in *.stn.csv. A gauge
 within --match-km of a listed station is marked in_sample; comparisons against those
 gauges are optimistic because PRISM was fitted to them.
 
-Outputs in <out>/validation/ (each CSV and JSON also as <name>_<start>_<end>.<ext>, so a folder keeps
-results for several windows; the GeoPackage layers hold the latest run):
-    validation.gpkg   layers 'stations' (event totals) and 'station_days' (per day,
-                      with UTC start/end fields for the QGIS Temporal Controller),
-                      each with a default QGIS style
-    stations.csv, station_days.csv, stations_summary.json
+Outputs in the window's folder, <out>/events/<event>/validation/ (layout.py), named for the window:
+    validation.gpkg   layers 'stations_<start>_<end>' (event totals) and 'station_days_<start>_<end>'
+                      (per day, with UTC start/end fields for the QGIS Temporal Controller), each with a
+                      default QGIS style
+    stations_<start>_<end>.csv, station_days_<start>_<end>.csv, stations_summary_<start>_<end>.json
 
 Usage examples:
     python validate_stations.py --out data/huc14080104
@@ -43,6 +42,7 @@ from shapely.geometry import Point
 import config
 import manifest
 import runtime
+from layout import Layout
 from runtime import die
 from storm_total import prism_day_files, utm_crs
 
@@ -228,15 +228,15 @@ def write_default_style(gpkg, layer, qml_path):
 
 
 def write_layer(gdf, gpkg, layer, window=None, style=None):
-    """Write a GeoPackage layer with its default QGIS style (styles/<layer>.qml). With window=(start, end),
-    also write it as <layer>_<YYYYMMDD>_<YYYYMMDD> (same style), so a folder keeps every storm's layers:
-    the plain name holds the latest run, the window-named one stays for that window. style names the .qml
-    when layer is itself a window-named copy."""
+    """Write a GeoPackage layer with its default QGIS style (styles/<layer>.qml). With window=(start, end)
+    the layer is named <layer>_<YYYYMMDD>_<YYYYMMDD>, the name the QGIS builder maps for that window.
+    style names the .qml when it differs from layer."""
     qml = STYLE_DIR / f"{style or layer}.qml"
-    for name in [layer] + ([f"{layer}_{runtime.span(*window)}"] if window else []):
-        gdf.to_file(gpkg, layer=name, driver="GPKG")
-        if qml.exists():
-            write_default_style(gpkg, name, qml)
+    name = f"{layer}_{runtime.span(*window)}" if window else layer
+    Path(gpkg).parent.mkdir(parents=True, exist_ok=True)
+    gdf.to_file(gpkg, layer=name, driver="GPKG")
+    if qml.exists():
+        write_default_style(gpkg, name, qml)
 
 
 # ---------- main ----------
@@ -244,16 +244,16 @@ def write_layer(gdf, gpkg, layer, window=None, style=None):
 def load_basin(out, boundary):
     if boundary:
         return gpd.read_file(boundary).to_crs(4269).dissolve()
-    wbd = sorted(Path(out).glob("wbd_huc*.geojson")) or sorted(Path(out).glob("boundary.geojson"))
+    wbd = Layout(out, settings={}).boundary_files()
     if len(wbd) != 1:
-        die("Pass --boundary: expected exactly one wbd_huc*.geojson (or boundary.geojson) in --out.")
+        die("Pass --boundary: expected exactly one wbd_huc*.geojson (or boundary.geojson) in --out/basin.")
     return gpd.read_file(wbd[0]).to_crs(4269).dissolve()
 
 
 def cube_days(out, var, res):
     """PRISM days present in the cube, used as the default window."""
     import xarray as xr
-    nc = Path(out) / f"{var}_{res}_daily_clip.nc"
+    nc = Layout(out, settings={}).cube(var, res)
     if not nc.exists():
         die(f"No cube at {nc}. Run prism_watershed.py with --out {out} first.")
     with xr.open_dataset(nc) as ds:
@@ -268,7 +268,7 @@ def main():
     ap.add_argument("--out", required=True, help="folder prism_watershed.py wrote to")
     ap.add_argument("--start", help="first PRISM day (default: first day in the cube)")
     ap.add_argument("--end", help="last PRISM day (default: last day in the cube)")
-    ap.add_argument("--boundary", help="basin polygon (default: the wbd_huc*.geojson in --out)")
+    ap.add_argument("--boundary", help="basin polygon (default: the basin in --out/basin)")
     ap.add_argument("--buffer-km", type=float, default=10.0, help="also compare stations this far outside the basin (default 10)")
     ap.add_argument("--max-offset", type=float, default=6.0,
                     help="hours between station and PRISM day ends allowed in the statistics (default 6)")
@@ -280,6 +280,7 @@ def main():
     runtime.attach(a.out, run, a)
 
     out = Path(a.out)
+    lay = Layout(out)
     c0, c1 = cube_days(out, "ppt", a.res)
     start = dt.date.fromisoformat(a.start) if a.start else c0
     end = dt.date.fromisoformat(a.end) if a.end else c1
@@ -287,9 +288,9 @@ def main():
 
     grids = {}
     for d in days:
-        g, s = prism_day_files(out / "extracted", "ppt", a.res, d)
+        g, s = prism_day_files(lay, "ppt", a.res, d)
         if g is None:
-            die(f"No extracted PRISM grid for {d} in {out / 'extracted'}; run prism_watershed.py for it.")
+            die(f"No national PRISM grid for {d} in the PRISM store ({lay.store.root}); run prism_watershed.py for it.")
         grids[d] = (g, s)
 
     basin = load_basin(out, a.boundary)
@@ -378,23 +379,22 @@ def main():
                   "in_sample stations were PRISM inputs; their agreement is optimistic.",
                   "Gauges undercatch, especially snow and wind-driven rain at high elevation."]}
 
-    vdir = out / "validation"
-    vdir.mkdir(exist_ok=True)
-    gpkg = vdir / "validation.gpkg"
+    lay.prepare_event(start, end)
+    vdir = lay.validation_dir(start, end)
+    vdir.mkdir(parents=True, exist_ok=True)
+    gpkg = lay.validation_gpkg(start, end)
     for name, rows in (("stations", st_rows), ("station_days", day_rows)):
-        with runtime.atomic_open(vdir / f"{name}.csv", "w", newline="") as f:
+        with runtime.atomic_open(lay.validation_file(f"{name}.csv", start, end), "w", newline="") as f:
             wcsv = csv.DictWriter(f, fieldnames=rows[0].keys())
             wcsv.writeheader()
             wcsv.writerows(rows)
-        runtime.keep_window_copy(vdir / f"{name}.csv", start, end)
         gdf = gpd.GeoDataFrame(rows, geometry=gpd.points_from_xy([r["lon"] for r in rows], [r["lat"] for r in rows]),
                                crs=4269)
         if name == "station_days":
             for c in ("period_start", "period_end"):
                 gdf[c] = gpd.pd.to_datetime(gdf[c], utc=True)
         write_layer(gdf, gpkg, name, window=(start, end))
-    runtime.write_json(vdir / "stations_summary.json", summary)
-    runtime.keep_window_copy(vdir / "stations_summary.json", start, end)
+    runtime.write_json(lay.validation_file("stations_summary.json", start, end), summary)
 
     def line(label, s):
         if not s.get("n"):
@@ -416,8 +416,9 @@ def main():
     print(f"Excluded from event stats: {dict(Counter(r['status'] for r in st_rows if not r['in_stats']))}")
     print(f"Outputs in {vdir.resolve()} (open validation.gpkg in QGIS)")
     run.update(window={"start": str(start), "end": str(end)},
-               outputs=manifest.files_entry([vdir / "stations.csv", vdir / "station_days.csv",
-                                             vdir / "stations_summary.json", vdir / "validation.gpkg"], out))
+               outputs=manifest.files_entry([lay.validation_file(n, start, end) for n in
+                                             ("stations.csv", "station_days.csv", "stations_summary.json")]
+                                            + [gpkg], out))
     manifest.append_run(out, run)
 
 
