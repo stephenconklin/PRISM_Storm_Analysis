@@ -472,3 +472,32 @@ def test_report_gauge_names():
     assert gauge_name("MCELMO CREEK NEAR BLUFF, UTAH") == "McElmo Creek near Bluff, Utah"
     assert gauge_name("LA PLATA RIVER AT HESPERUS") == "La Plata River at Hesperus"
     assert gauge_name("PIEDRA RIVER NEAR ARBOLES, CO.") == "Piedra River near Arboles, CO"
+
+
+def test_event_folder_follows_storm_toml(tmp_path):
+    """An event's folder follows storm.toml: renamed (even only in case) it keeps its files; redated, the old
+    window's files move to a folder named for that window."""
+    from layout import Layout
+    out = settings(tmp_path, basin(tmp_path))
+    lay = Layout(out)
+    d = lay.prepare_event("2026-10-21", "2026-10-22")
+    assert d.name == "one"
+    (d / "totals").mkdir()
+    (d / "totals" / "x_20261021_20261022.json").write_text("1")
+    s = config.load(out)
+    s.pop("_path")
+    s["events"][0]["name"] = "One"  # only the case changes
+    (out / "storm.toml").write_text(config.render(s))
+    d = Layout(out).prepare_event("2026-10-21", "2026-10-22")
+    assert [p.name for p in Layout(out).event_dirs()] == ["One"] and (d / "totals" / "x_20261021_20261022.json").exists()
+    s["events"][0]["name"] = "first"
+    (out / "storm.toml").write_text(config.render(s))
+    d = Layout(out).prepare_event("2026-10-21", "2026-10-22")
+    assert d.name == "first" and (d / "totals" / "x_20261021_20261022.json").exists()
+    s["events"][0]["end"] = dt.date(2026, 10, 23)  # redated
+    (out / "storm.toml").write_text(config.render(s))
+    lay = Layout(out)
+    d = lay.prepare_event("2026-10-21", "2026-10-23")
+    assert d.name == "first" and not (d / "totals").exists()
+    assert (out / "events" / "20261021_20261022" / "totals" / "x_20261021_20261022.json").exists()
+    assert lay.event_dir("2026-10-21", "2026-10-22").name == "20261021_20261022"

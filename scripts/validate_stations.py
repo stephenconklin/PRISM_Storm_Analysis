@@ -205,8 +205,12 @@ def prism_input_flags(stn_csv, lonlat, match_km):
 # ---------- GeoPackage styles ----------
 
 def write_default_style(gpkg, layer, qml_path):
-    """Store a QML style in the GeoPackage's layer_styles table as the layer's default."""
-    qml = Path(qml_path).read_text()
+    """Store a QML style file in the GeoPackage's layer_styles table as the layer's default."""
+    store_style(gpkg, layer, Path(qml_path).read_text())
+
+
+def store_style(gpkg, layer, qml):
+    """Store QML text in the GeoPackage's layer_styles table as the layer's default."""
     con = sqlite3.connect(gpkg)
     row = con.execute("SELECT column_name FROM gpkg_geometry_columns WHERE table_name = ?", (layer,)).fetchone()
     geom_col = row[0] if row else "geom"

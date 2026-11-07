@@ -165,8 +165,15 @@ def move(src, dst):
 
 def merge_tree(src, dst):
     """Move every file under src into dst at the same relative path; where both have a file, the newer one
-    is kept. src is removed. event.json files are not carried over (the caller writes dst's)."""
+    is kept. src is removed. event.json files are not carried over (the caller writes dst's). If src and dst
+    are the same folder (names differing only in case, on a case-insensitive disk), it is renamed instead."""
     src, dst = Path(src), Path(dst)
+    if dst.exists() and os.path.samefile(src, dst):
+        if src.name != dst.name:
+            tmp = src.with_name(src.name + ".renaming")
+            os.replace(src, tmp)
+            os.replace(tmp, dst)
+        return
     for f in sorted(p for p in src.rglob("*") if p.is_file()):
         rel = f.relative_to(src)
         if rel == Path("event.json"):

@@ -661,6 +661,42 @@ def cmd_update(a):
     return code
 
 
+def cmd_migrate(a):
+    """Move a folder in the old layout (everything at the top) to the current one (layout.py)."""
+    import migrate
+    out = Path(a.out)
+    if not out.is_dir():
+        die(f"No folder {out}")
+    if not layout.legacy(out):
+        print(f"{out} already uses the current folder layout; nothing to move.")
+        return EXIT_OK
+    plan = migrate.Plan(out, a.store).build()
+    plan.print(a.verbose)
+    if a.dry_run:
+        print("\nDry run: nothing was changed. Run again without --dry-run to move the files.")
+        return EXIT_OK
+    runtime.confirm_or_stop(f"\nMove the files in {out} as listed (renames; nothing is downloaded)?", a.yes)
+    lock = runtime.FolderLock(out).acquire()
+    try:
+        run = manifest.start_run("pipeline.py", a)
+        done = plan.execute()
+        kept = migrate.carry_over_state(out)
+        run.update(migration={"layout": layout.VERSION, "store": str(plan.lay.store.root), **done,
+                              "pipeline_steps_kept": kept, "not_recognized": [str(p) for p in plan.unknown]})
+        run["status"] = "ok"
+        manifest.append_run(out, run)
+    finally:
+        lock.release()
+    print(f"\nMoved {done['moved']}, removed {done['deleted']} duplicates or leftovers, "
+          f"{done['store_deduplicated']} already in the store, {done['set_aside']} set aside in run/pre_migration/, "
+          f"{done['layers']} GeoPackage layers copied per window; {kept} finished pipeline steps stay finished.")
+    if layout.legacy(out):
+        print("Some old-layout items remain (listed above as not recognized); move or delete them, then rerun.")
+    if not a.no_qgis and plan.lay.qgis_dir.exists():
+        print(migrate.rebuild_qgis(out, a.qgis_python))
+    return EXIT_OK
+
+
 def ask(prompt, default=None, check=None):
     while True:
         try:
@@ -816,6 +852,15 @@ def main():
     p.add_argument("--check", action="store_true", help="only show what would be updated (for scheduled jobs)")
     p.add_argument("--notify", action="store_true", help="with --check: a desktop notification when there is something to do")
     p.set_defaults(func=cmd_update, dry_run=False)
+
+    p = sub.add_parser("migrate", help="move a folder made before 7 Nov 2026 to the current folder layout (offline)")
+    common(p)
+    p.add_argument("--dry-run", action="store_true", help="list the moves; change nothing")
+    p.add_argument("--store", help="the PRISM store to move the national data into (default: prism_store in "
+                                   "storm.toml, else PRISM_STORE, else prism_store/ next to the folder)")
+    p.add_argument("--no-qgis", action="store_true", help="don't rebuild the QGIS project afterwards")
+    p.add_argument("--qgis-python", help="QGIS's Python for the rebuild (else found automatically)")
+    p.set_defaults(func=cmd_migrate)
 
     a = ap.parse_args()
     sys.exit(a.func(a))
