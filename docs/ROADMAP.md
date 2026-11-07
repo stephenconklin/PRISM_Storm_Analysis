@@ -59,6 +59,8 @@ gauges whose basins lie mostly outside the study basin are skipped; `--gauge` ru
 7. ~~**Workflow and pipeline** (9)~~ — built 5 Nov 2026.
 8. **Engineering** (8). Git, a first tag and a CI workflow are in place (CI runs once the repo has a GitHub
    remote); packaging and logging as the tool grows.
+9. **Output folder layout** (10): one folder per storm, a shared national PRISM store, and an offline
+   `pipeline.py migrate`. Do it before more basins are run, since each new folder is one more to migrate.
 
 ---
 
@@ -585,7 +587,99 @@ matching `--start`/`--end`); validation and subbasin GeoPackage layers are also 
 - Batch: several basins from one list (each folder already has its own settings; a loop over folders
   with the shared cache is the remaining piece).
 
+## 10. Output folder layout — L
+
+**Goal:** A basin folder that a person can read at a glance: one folder per storm, national PRISM data
+kept once for all basins, and pipeline bookkeeping out of the way. Existing folders move to the new
+layout with one offline command: no downloads, no refetching, no reruns other than the QGIS project.
+
+**Why:** The San Juan folder (7 Nov 2026) has about 60 files at its top level. For each of 7 windows there
+are depth, rain, snow, volume and percent-of-normal rasters plus uncertainty and normals JSON. Three of
+those windows (Oct 20–31, Oct 28–31, Oct 20–Nov 4) are no longer events in `storm.toml`, and nothing marks
+them as such. `validation/` holds 274 files: 247 of them per-gauge runoff JSON and flow CSVs, alongside
+"latest" copies that repeat the window-named ones. National grids take 2.2 GB per basin (`raw_zips/`
+and `extracted/`, each 1.1 GB at 800 m) and are repeated in every basin folder that covers the same days;
+the shared zip cache is optional and wasn't used here, and it doesn't cover `extracted/`. Pipeline state,
+the 0.5 MB manifest, logs and the lock sit next to the results.
+
+**Proposed layout:**
+```
+<store>/                              national PRISM data, shared by every basin folder
+  zips/<region>/<res>/<var>/          as zip_name(); superseded releases in releases/
+  extracted/<region>/<res>/<var>/     one folder per day and release: <stem>_r<n>/
+  normals/<region>/<res>/<var>/       zips and extracted grids
+<out>/                                one basin
+  storm.toml
+  basin/                              wbd_huc*.geojson or boundary.geojson; gauges/<site>_basin.geojson
+  daily/                              clipped/, <var>_<res>_daily_clip.nc, daily summaries, release histories
+  events/<name>/                      everything for one storm window
+    totals/                           depth, rain, snow, volume, pct-of-normal rasters; uncertainty and normals JSON
+    subbasins/                        totals.gpkg, subbasin_totals.csv
+    validation/                       station, SNOTEL and runoff tables; validation.gpkg; runoff/<site>_*.json|csv
+    report/                           storm_report_*.html, figures/, history/, web/
+  events/<start>_<end>/               a window run with --start/--end that matches no event
+  qgis/                               <name>.qgz
+  run/                                pipeline_state.json, run_manifest.json, logs/, .lock
+```
+
+**Design decisions (recommended):**
+- **File names keep `_<start>_<end>`.** The folder groups the files; the name still says which window a
+  file covers once it's copied out of the folder, and window discovery (`plan_events`,
+  `runtime.window_json`, the runoff cache keys) keeps working as it does. This is the change that keeps
+  the rest of the work small.
+- **Events are folders named after the `storm.toml` event**, with an `event.json` (name, window, settings
+  fingerprint). If an event's dates change, the pipeline moves its old files to `events/<old start>_<old
+  end>/` instead of mixing two windows in one folder. `status` lists window folders that match no event,
+  and a `pipeline.py tidy` command can archive or delete them after asking.
+- **No "latest" copies.** Each event folder holds only its own window, so `runoff_<site>.json`,
+  `snotel.csv` and the other unwindowed copies, and `window_json`'s fallback to them, go away.
+- **The national store is keyed by release.** A refresh in one basin adds a new release to the store and
+  must not change another basin's inputs without that basin's own refresh. Each basin reads the release
+  recorded in its release history. Scripts read grids from the store directly instead of hard-linking
+  them, which also works when the store is on another volume.
+- **Gauge basins are per basin folder, not per event** (`basin/gauges/`): a gauge's upstream area doesn't
+  change between storms, so it is fetched once.
+
+**Approach:**
+1. **One module for every path.** Add `scripts/layout.py` (stdlib only, pure): `Layout(out)` with a
+   method for each kind of output (`total_tif(var, res, window)`, `validation_dir(window)`, `state()`,
+   …), plus `classify(path)`, which names the kind of any file in a folder. Route all the scripts' path
+   building (about 100 places, plus the globs in `build_qgis_project.py`, `prism_watershed.py`,
+   `storm_total.py`, `subbasin_totals.py`, `validate_stations.py`, `manifest.py` and `pipeline.py`) through
+   it, **with the current layout**. No output changes; the tests stay green. Add a test that runs the
+   offline pipeline and requires `classify` to recognize every file it writes, so a new output can't
+   bypass the module.
+2. **Switch to the new layout in `layout.py`** in one commit. Record `layout = 2` in
+   `run/pipeline_state.json`. Scripts that meet an old folder stop with exit 2 and the migrate command to
+   run.
+3. **`pipeline.py migrate --out DIR [--dry-run]`**: renames only (no copies) on the same volume, offline,
+   idempotent. A journal in `run/` lets an interrupted migration resume. It moves the runoff caches so no
+   gauge is refetched and rewrites `pipeline_state.json` fingerprints for the new paths so steps stay
+   done. It also adds a manifest entry for the migration; older entries keep their old paths as history.
+   It rebuilds the QGIS project (project layers point at files) and keeps the old `.qgz` as `.bak`.
+   `.aux.xml` sidecars move with their rasters. Windows that match no event go to `events/<start>_<end>/`.
+4. **Shared national store**, after steps 1–3: `prism_store` in `storm.toml`, else `PRISM_STORE`. It
+   replaces `prism_cache`/`--cache` and keeps the old setting as an alias. `migrate --store` moves zips,
+   extracted grids and normals into the store, checking SHA-256 when two folders hold the same day, and
+   archives a duplicate at a different release rather than overwriting it. Locking: a store-level lock
+   only for writes (download, extract), so basins can run side by side.
+5. Update the README output sections, CLAUDE.md, the skills (`storm-run`, `storm-update`, `report-check`)
+   and the report's links.
+
+**Tests:** a v1 fixture built from the San Juan folder's file list (names, small placeholder contents)
+migrated with `--dry-run` and for real, then the offline pipeline run on the result with no step
+rerunning except `qgis`; interrupt-and-resume of `migrate`; two basin folders sharing a store with one
+refreshed to a newer release while the other keeps its own.
+
+**Done when:** the four folders in `PRISM_data/` (San Juan, Upper Skagit, Elkhorn, Upper St. Johns) are
+migrated with network access blocked; `pipeline.py status` shows the same ✓ marks before and after;
+regenerated reports differ only in their timestamp line; each basin folder's top level has at most
+seven entries; and the national data for days shared between basins is stored once.
+
 ## Open questions
+- Output layout (10): where should the shared national store live by default? Recommended: a
+  `prism_store/` folder next to the basin folders (here `PRISM_data/prism_store/`), on the same drive as
+  the data rather than in the home folder.
 - Which second precipitation product to support first (Stage IV for timing, AORC for resolution)?
 - Report format: HTML only, or also PDF for distribution?
 - ~~QGIS project builder (7a): which QGIS version to target?~~ Decided: build with QGIS 3.x (3.44 LTR here);

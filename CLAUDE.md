@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # PRISM Storm Analysis
 
 Tools for programmatically downloading Oregon State University PRISM gridded
@@ -75,7 +79,9 @@ That run covered HUC 1408, ppt and tmean for PRISM days Oct 20–31.
 - `docs/ROADMAP.md` — planned features with approach and done-criteria; read it before starting new feature work
   and update it as items land
 - `tests/` — offline only (synthetic rasters; requests go to a closed local port via `OFFLINE` env). `test_offline.py`
-  runs `prism_watershed.py` end to end; `test_build_qgis_project.py` builds a real project when QGIS is installed
+  runs `prism_watershed.py` end to end; `test_pipeline.py` runs the pipeline, interrupts it with Ctrl-C and resumes;
+  `test_build_qgis_project.py` builds a real project when QGIS is installed (skipped otherwise, e.g. in CI:
+  `.github/workflows/tests.yml` runs the suite from `environment.yml` on every push/PR)
 - `data/` — all downloads and outputs (git-ignored; never commit rasters)
 
 `prism_watershed.py` requires `--start`, `--end`, and one of `--huc`/`--boundary` (or a `storm.toml` in `--out`). `--cache`/`PRISM_CACHE` shares national zips between folders (hard links). `--var tmean` (etc.) can share a
@@ -133,7 +139,10 @@ python scripts/subbasin_totals.py --out DIR [--digits 10|12] [--start ... --end 
 python scripts/build_qgis_project.py --out DIR [--name NAME] [--qgis-python PATH]
 python scripts/report.py --out DIR [--start ... --end ...] [--gauges SITE ...]
 python -m pytest tests -q
+python -m pytest tests/test_qc.py -q              # one file
+python -m pytest tests/test_offline.py -k refresh  # tests matching a name
 ```
+There is no linter or build step configured.
 On this Mac the shell sets `PROJ_DATA=/opt/anaconda3/share/proj`, an old `proj.db` that breaks pip
 rasterio ("EPSG code is unknown … comes from another PROJ installation"). Use the activated
 `prism-storm-analysis` env (or `conda run -n prism-storm-analysis`), `.venv`, or prefix with `env -u PROJ_DATA`.
