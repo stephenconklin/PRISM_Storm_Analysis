@@ -439,6 +439,44 @@ as a table and map.
 
 Built from the manifest and outputs, so a report can be regenerated without re-running downloads.
 
+### 7.1 Local time beside UTC in the report — S (idea, not scheduled)
+
+**Today:** the report works in UTC. Precipitation bars are PRISM days (12:00 UTC to 12:00 UTC), the
+timeline axis is UTC, and gauge peaks and tooltips read e.g. "Oct 23 11:30 UTC". The header explains
+PRISM days. Checked 7 Nov 2026: USGS 15-minute times come with an explicit `+00:00` offset and are
+parsed as UTC; rain-gauge and SNOTEL days are aligned from their own clock conventions (local standard
+time, PST), so nothing depends on daylight saving.
+
+**Idea:** keep the UTC axis and add each gauge's local time as a second label on peak markers and flow
+tooltips ("Oct 23 11:30 UTC (5:30 am MDT)"), plus one header line saying what a PRISM day is locally
+("here, 6 am to 6 am MDT; 5 am to 5 am MST after Nov 1").
+
+**Pros**
+- Local readers, media and emergency managers think in local time; "crested 5:30 am" matches what
+  people saw and what the NWS and news reported.
+- Easier to check against outside sources (flood reports, USGS site pages), which use local time.
+- A local description of the PRISM day makes the bars concrete.
+
+**Cons and catches**
+- Daylight saving can end inside a storm window (1 Nov 2026 is inside San Juan's `oct_nov`): labels mix
+  MDT and MST, and a local-time axis would have a 25-hour day. Hence UTC stays the axis.
+- A basin can span zones: Arizona has no daylight saving but the Navajo Nation does (Chinle Creek
+  gauges). Use each gauge's own zone from USGS (`time_zone_abbreviation`, `uses_daylight_savings`,
+  mapped to an IANA zone for `zoneinfo`), never one zone per report.
+- `validate_runoff.py` fetches the zone with the site metadata but does not save it, and the report
+  stays offline. The zone must be saved in the runoff results; existing reports show local time only
+  after the runoff step runs again (UTC-only until then).
+- Rain-gauge and SNOTEL sections gain nothing; their day alignment is already correct.
+- Longer labels; fine in tooltips, a little crowded on peak markers.
+
+**Small related fix:** the precipitation bar tooltip says only "Oct 20: 1.0 mm"; make it
+"PRISM day Oct 20 (12:00 UTC Oct 19 – 12:00 UTC Oct 20): 1.0 mm".
+
+**Done when:** peak labels and flow tooltips show UTC and the gauge's local time (correct across a
+daylight-saving change and for gauges in different zones), the header describes the PRISM day locally,
+the bar tooltip says "PRISM day", charts are checked by screenshot (`report-check`), and a gauge without
+a saved zone falls back to UTC only.
+
 ---
 
 ## 7a. Organized QGIS project (opt-in) — M/L
