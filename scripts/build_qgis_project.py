@@ -490,7 +490,8 @@ def _build_project(a):
     ev_groups = []
     for i, ev in enumerate(events):
         g = top.addGroup(f"Storm: {ev['label']}" if multi or ev["name"] else ev["label"])
-        ev_groups.append([g, g.addGroup("Totals"), g.addGroup("Validation")])
+        g_val = g.addGroup("Validation")  # points first, so they draw above the total rasters
+        ev_groups.append([g, g.addGroup("Totals"), g_val])
         g.setItemVisibilityChecked(i == 0)
         g.setExpanded(i == 0)
     g_other = top.addGroup("Other windows") if other else None
@@ -703,6 +704,7 @@ def _build_project(a):
         root_rule.appendChild(gray_rule)
         lyr.setRenderer(QgsRuleBasedRenderer(root_rule))
 
+    # Layers in each storm's Validation group, top to bottom (polygons last, under the points).
     VAL = {"gauges": ("USGS gauges: runoff ratio, by regulation", True,
                       "USGS stream gauges in the study basin; status, regulation class and runoff ratio range "
                       "from validate_runoff.py."),
@@ -711,11 +713,11 @@ def _build_project(a):
                         "squares: independent gauges."),
            "station_days": ("Rain gauges: PRISM − gauge, daily (Temporal)", False,
                             "PRISM minus gauge per PRISM day; animate with the Temporal Controller."),
-           "gauge_basins": ("Gauge drainage basins", False,
-                            "USGS NLDI drainage basins of compared gauges, colored by regulation."),
            "snotel": ("SNOTEL: PRISM − observed snow share (points)", False,
                       "Snow as a share of precipitation over the window from validate_snow.py: PRISM split minus "
-                      "SNOTEL SWE gain (percentage points). Size = SWE gain. Gray: skipped.")}
+                      "SNOTEL SWE gain (percentage points). Size = SWE gain. Gray: skipped."),
+           "gauge_basins": ("Gauge drainage basins", False,
+                            "USGS NLDI drainage basins of compared gauges, colored by regulation.")}
 
     def vec(source, base, label_text, role, abstract, group, visible, event_key):
         gpkg, table = source

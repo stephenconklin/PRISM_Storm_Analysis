@@ -1,5 +1,6 @@
 """Tests for build_qgis_project.py helpers that don't need QGIS."""
 import datetime as dt
+import re
 import sys
 from pathlib import Path
 
@@ -297,3 +298,5 @@ def test_build_real_project_with_two_storms(tmp_path):
                  "layername=stations_20261024_20261024", "layername=snotel_20261021_20261022",
                  "Boundaries and dams"):
         assert text in qgs, text
+    groups = re.findall(r'<layer-tree-group[^>]* name="([^"]+)"', qgs)
+    assert groups.index("Validation") < groups.index("Totals")  # points draw above the total rasters
